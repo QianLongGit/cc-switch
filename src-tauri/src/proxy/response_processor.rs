@@ -485,6 +485,7 @@ pub(crate) fn create_usage_collector(
         .outbound_model
         .clone()
         .unwrap_or_else(|| ctx.request_model.clone());
+    let vision_routed = ctx.vision_routed;
     // 用 ctx 的 app_type 而不是 parser_config 的：Claude Desktop 流式透传复用
     // CLAUDE_PARSER_CONFIG（app_type_str="claude"），按 parser_config 记账会把
     // claude-desktop 的行错记到 claude 名下，导致供应商计价覆盖解析不到。
@@ -508,6 +509,7 @@ pub(crate) fn create_usage_collector(
                 let session_id = session_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
+                let vision_routed = vision_routed;
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -523,6 +525,7 @@ pub(crate) fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        vision_routed,
                     )
                     .await;
                 });
@@ -534,6 +537,7 @@ pub(crate) fn create_usage_collector(
                 let session_id = session_id.clone();
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
+                let vision_routed = vision_routed;
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -549,6 +553,7 @@ pub(crate) fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        vision_routed,
                     )
                     .await;
                 });
@@ -587,6 +592,7 @@ fn spawn_log_usage(
         .unwrap_or_else(|| ctx.request_model.clone());
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
+    let vision_routed = ctx.vision_routed;
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -602,6 +608,7 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            vision_routed,
         )
         .await;
     });
@@ -635,6 +642,7 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    vision_routed: bool,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -674,6 +682,7 @@ async fn log_usage_internal(
         session_id,
         None, // provider_type
         is_streaming,
+        vision_routed,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
@@ -1107,6 +1116,7 @@ mod tests {
             false,
             200,
             None,
+            false,
         )
         .await;
 
@@ -1177,6 +1187,7 @@ mod tests {
             false,
             200,
             None,
+            false,
         )
         .await;
 
@@ -1257,6 +1268,7 @@ mod tests {
             false,
             200,
             None,
+            false,
         )
         .await;
 

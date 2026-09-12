@@ -118,7 +118,9 @@ export function RequestDetailPanel({
                         {t("usage.requestModel", "请求模型")}
                       </dt>
                       <dd className="font-mono text-xs">
-                        {request.requestModel}
+                        {request.visionRouted
+                          ? t("usage.visionRouteBadge", "[图片]")
+                          : request.requestModel}
                       </dd>
                     </>
                   )}

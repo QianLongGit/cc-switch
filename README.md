@@ -18,6 +18,18 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 
 </div>
 
+## 🔀 About This Fork
+
+> This repository (QianLongGit/cc-switch) is a personal enhanced fork of the official [farion1231/cc-switch](https://github.com/farion1231/cc-switch), kept in sync with upstream updates.
+
+### New Feature: Per-Request Vision Model Routing (v3.20.3-vision.1)
+
+Adds an **Image Request** field (`ANTHROPIC_VISION_MODEL`) to the *Model Mapping* section of provider settings:
+
+- **Request-level routing**: when the latest user message of a Claude Code request carries image data (`Read` tool output or a pasted image), that single request is routed to the configured vision model; all other requests keep the normal tier mapping
+- **Precise trigger**: only the turn where image data actually arrives switches models — a text-only mention of an image path does not trigger it (the model merely decides to call `Read`), and historical images are left to the existing text-only degradation. The vision model only handles the "seeing" turn, keeping cost optimal
+- **Usage visibility**: vision-routed rows show `[Image] → model` in the request log history (database migrates v18 → v19 automatically; existing data is unaffected)
+
 ## ❤️Sponsor
 
 > [Want to appear here?](mailto:farion1231@gmail.com)

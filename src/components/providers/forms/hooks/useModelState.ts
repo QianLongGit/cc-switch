@@ -15,6 +15,7 @@ export type ClaudeModelEnvField =
   | "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"
   | "ANTHROPIC_DEFAULT_FABLE_MODEL"
   | "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"
+  | "ANTHROPIC_VISION_MODEL"
   | "CLAUDE_CODE_SUBAGENT_MODEL";
 
 export const CLAUDE_ONE_M_MARKER = "[1M]";
@@ -86,6 +87,10 @@ function parseModelsFromConfig(settingsConfig: string) {
       typeof env.CLAUDE_CODE_SUBAGENT_MODEL === "string"
         ? env.CLAUDE_CODE_SUBAGENT_MODEL
         : "";
+    const vision =
+      typeof env.ANTHROPIC_VISION_MODEL === "string"
+        ? env.ANTHROPIC_VISION_MODEL
+        : "";
 
     return {
       model,
@@ -98,6 +103,7 @@ function parseModelsFromConfig(settingsConfig: string) {
       fable,
       fableName,
       subagent,
+      vision,
     };
   } catch {
     return {
@@ -111,6 +117,7 @@ function parseModelsFromConfig(settingsConfig: string) {
       fable: "",
       fableName: "",
       subagent: "",
+      vision: "",
     };
   }
 }
@@ -142,6 +149,7 @@ export function useModelState({
     initial.fableName,
   );
   const [subagentModel, setSubagentModel] = useState(initial.subagent);
+  const [visionModel, setVisionModel] = useState(initial.vision);
 
   const isUserEditingRef = useRef(false);
   const lastConfigRef = useRef(settingsConfig);
@@ -173,6 +181,7 @@ export function useModelState({
     setDefaultFableModel(parsed.fable);
     setDefaultFableModelName(parsed.fableName);
     setSubagentModel(parsed.subagent);
+    setVisionModel(parsed.vision);
   }, [settingsConfig]);
 
   const handleModelChange = useCallback(
@@ -196,6 +205,7 @@ export function useModelState({
       if (field === "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME")
         setDefaultFableModelName(value);
       if (field === "CLAUDE_CODE_SUBAGENT_MODEL") setSubagentModel(value);
+      if (field === "ANTHROPIC_VISION_MODEL") setVisionModel(value);
 
       try {
         const currentConfig = latestConfigRef.current
@@ -245,6 +255,8 @@ export function useModelState({
     setDefaultFableModelName,
     subagentModel,
     setSubagentModel,
+    visionModel,
+    setVisionModel,
     handleModelChange,
   };
 }

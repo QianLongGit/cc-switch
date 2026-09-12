@@ -532,6 +532,7 @@ function ProviderFormFull({
     defaultFableModel,
     defaultFableModelName,
     subagentModel,
+    visionModel,
     handleModelChange,
   } = useModelState({
     settingsConfig: form.getValues("settingsConfig"),
@@ -2420,6 +2421,7 @@ function ProviderFormFull({
               defaultFableModel={defaultFableModel}
               defaultFableModelName={defaultFableModelName}
               subagentModel={subagentModel}
+              visionModel={visionModel}
               onModelChange={handleModelChange}
               speedTestEndpoints={speedTestEndpoints}
               apiFormat={localApiFormat}

@@ -48,6 +48,29 @@ pub fn contains_image_blocks(body: &Value) -> bool {
         || gemini_contents_have_image_blocks(body)
 }
 
+/// 请求级图片检测：仅当「最后一条 user 消息」携带图片（含 tool_result 内嵌）
+/// 时命中，服务"单次请求正在看图"的路由语义。
+///
+/// 与全量扫描的 [`contains_image_blocks`] 的关键区别：Claude Code 会话中图片
+/// 一旦读入就常驻 messages 历史，全量扫描会把会话后半程的所有请求都判为
+/// 图片请求；本函数只认尾部最新一轮的 user 消息（覆盖 Read 工具读图的
+/// tool_result 形态与用户直接粘贴图片的 image block 形态），历史图片不触发。
+///
+/// 仅识别 Anthropic messages 格式（Claude / Claude Code 请求体）；Responses
+/// input 与 Gemini contents 结构天然不命中，从而把视觉路由限定在 Claude 侧。
+pub fn latest_user_message_contains_image(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            // 从尾部向前找第一条 user 消息：跳过流式结尾的 assistant 轮
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .is_some_and(|message| message.get("content").is_some_and(content_has_image_blocks))
+}
+
 pub fn replace_image_blocks_with_marker(body: &mut Value) -> usize {
     replace_images_in_body(body)
 }
@@ -454,6 +477,130 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    // ================================================================
+    // 请求级图片检测：latest_user_message_contains_image
+    // 仅当「最后一条 user 消息」携带图片（含 tool_result 内嵌）时命中，
+    // 服务"单次请求正在看图"的路由语义；历史中的图片不触发。
+    // ================================================================
+
+    #[test]
+    fn latest_user_message_contains_image_detects_latest_image() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "hello" }] },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                ]}
+            ]
+        });
+
+        assert!(latest_user_message_contains_image(&body));
+    }
+
+    #[test]
+    fn latest_user_message_contains_image_ignores_history_images() {
+        // 图片在历史消息、最新 user 消息为纯文本 → 不命中（请求级语义的核心）
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                ]},
+                { "role": "assistant", "content": [{ "type": "text", "text": "saw it" }] },
+                { "role": "user", "content": [{ "type": "text", "text": "next" }] }
+            ]
+        });
+
+        assert!(!latest_user_message_contains_image(&body));
+    }
+
+    #[test]
+    fn latest_user_message_contains_image_detects_tool_result_image() {
+        // Read 工具读图的核心形态：图片内嵌在最新 user 消息的 tool_result 里
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "a.png" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": [
+                        { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                    ]}
+                ]}
+            ]
+        });
+
+        assert!(latest_user_message_contains_image(&body));
+    }
+
+    #[test]
+    fn latest_user_message_contains_image_skips_trailing_assistant() {
+        // 尾部是 assistant 时从后往前找第一条 user；图片恰在这条 user 里 → 命中
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                ]},
+                { "role": "assistant", "content": [{ "type": "text", "text": "done" }] }
+            ]
+        });
+
+        assert!(latest_user_message_contains_image(&body));
+    }
+
+    #[test]
+    fn latest_user_message_contains_image_rejects_non_anthropic_shapes() {
+        // 仅识别 Anthropic messages 格式：Responses input / Gemini contents /
+        // 缺失 messages 均不命中，天然把视觉路由限定在 Claude 侧
+        assert!(!latest_user_message_contains_image(&json!({
+            "input": [{ "role": "user", "content": [{ "type": "input_image" }] }]
+        })));
+        assert!(!latest_user_message_contains_image(&json!({
+            "contents": [{ "role": "user", "parts": [{ "inlineData": { "mimeType": "image/png" } }] }]
+        })));
+        assert!(!latest_user_message_contains_image(&json!({})));
+    }
+
+    #[test]
+    fn text_image_path_then_tool_result_image_two_round_flow() {
+        // 提示词含图片路径的真实双轮时序：路径本身只是文本，不含图片数据，
+        // 判定依据是「图片数据是否到货」而非「消息是否提到图片」。
+        //
+        // 轮 1：用户只发了路径文本——模型尚未看到任何像素，这轮的任务仅是
+        // 决定调用 Read 工具，纯文本模型即可胜任，不应触发视觉路由。
+        let round1 = json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "看一下这个图片 ~/xxx.jpg 的内容是什么" }
+                ]}
+            ]
+        });
+        assert!(!latest_user_message_contains_image(&round1));
+
+        // 轮 2：Read 工具把图片以 base64 image block 放入 tool_result——
+        // 真正需要视觉能力的轮次，精确命中视觉路由。
+        let round2 = json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "看一下这个图片 ~/xxx.jpg 的内容是什么" }
+                ]},
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "~/xxx.jpg" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": [
+                        { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "abc" } }
+                    ]}
+                ]}
+            ]
+        });
+        assert!(latest_user_message_contains_image(&round2));
     }
 
     fn large_tool_data_url() -> String {

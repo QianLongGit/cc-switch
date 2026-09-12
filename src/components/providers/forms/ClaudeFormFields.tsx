@@ -135,6 +135,7 @@ interface ClaudeFormFieldsProps {
   defaultFableModel: string;
   defaultFableModelName: string;
   subagentModel: string;
+  visionModel: string;
   onModelChange: (field: ClaudeModelEnvField, value: string) => void;
 
   // Speed Test Endpoints
@@ -211,6 +212,7 @@ export function ClaudeFormFields({
   defaultFableModel,
   defaultFableModelName,
   subagentModel,
+  visionModel,
   onModelChange,
   speedTestEndpoints,
   apiFormat,
@@ -564,7 +566,7 @@ export function ClaudeFormFields({
   };
 
   type ModelRoleRow = {
-    role: "sonnet" | "opus" | "fable" | "haiku" | "subagent";
+    role: "sonnet" | "opus" | "fable" | "haiku" | "subagent" | "vision";
     label: string;
     model: string;
     displayName?: string;
@@ -623,6 +625,17 @@ export function ClaudeFormFields({
       model: subagentModel,
       modelField: "CLAUDE_CODE_SUBAGENT_MODEL",
       inputId: "claudeCodeSubagentModel",
+      supportsOneM: true,
+    },
+    {
+      // 请求级图片路由：最新 user 消息携带图片时优先生效的视觉模型
+      role: "vision",
+      label: t("providerForm.modelRoleVision", {
+        defaultValue: "Vision",
+      }),
+      model: visionModel,
+      modelField: "ANTHROPIC_VISION_MODEL",
+      inputId: "claudeVisionModel",
       supportsOneM: true,
     },
   ];

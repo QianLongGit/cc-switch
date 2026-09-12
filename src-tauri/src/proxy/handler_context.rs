@@ -53,6 +53,11 @@ pub struct RequestContext {
     /// usage 归因的兜底顺序：上游响应回显 → outbound_model → request_model。
     /// 不能直接用 request_model 兜底：接管场景下它是映射前的客户端别名。
     pub outbound_model: Option<String>,
+    /// 本条请求是否走了图片分支（视觉路由）。
+    ///
+    /// forward 成功后按「outbound 命中视觉配置 && 最新 user 消息含图」
+    /// 判定回填，供 usage 日志归因——历史日志据此展示 [图片] 路由标记。
+    pub vision_routed: bool,
     /// 日志标签（如 "Claude"、"Codex"、"Gemini"）
     pub tag: &'static str,
     /// 应用类型字符串（如 "claude"、"codex"、"gemini"）
@@ -165,6 +170,7 @@ impl RequestContext {
             current_provider_id,
             request_model,
             outbound_model: None,
+            vision_routed: false,
             tag,
             app_type_str,
             app_type,

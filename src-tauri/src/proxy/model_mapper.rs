@@ -14,6 +14,9 @@ pub struct ModelMapping {
     pub fable_model: Option<String>,
     pub subagent_model: Option<String>,
     pub default_model: Option<String>,
+    /// 图片请求专用模型：最新 user 消息携带图片（Read 工具读图形态）时
+    /// 优先生效，覆盖层级映射
+    pub vision_model: Option<String>,
 }
 
 impl ModelMapping {
@@ -52,6 +55,11 @@ impl ModelMapping {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from),
+            vision_model: env
+                .and_then(|e| e.get("ANTHROPIC_VISION_MODEL"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
         }
     }
 
@@ -63,6 +71,7 @@ impl ModelMapping {
             || self.fable_model.is_some()
             || self.subagent_model.is_some()
             || self.default_model.is_some()
+            || self.vision_model.is_some()
     }
 
     /// 根据原始模型名称获取映射后的模型
@@ -132,6 +141,18 @@ pub fn apply_model_mapping(
     let original_model = body.get("model").and_then(|m| m.as_str()).map(String::from);
 
     if let Some(ref original) = original_model {
+        // 图片请求优先路由：最新 user 消息携带图片时走视觉模型映射，
+        // 覆盖层级映射——含图请求必须由视觉模型承接，层级语义无意义。
+        // 历史图片不触发（见 latest_user_message_contains_image），
+        // 由 text-only 降级机制（media_sanitizer）接管。
+        if let Some(ref vision) = mapping.vision_model {
+            if super::media_sanitizer::latest_user_message_contains_image(&body) {
+                log::debug!("[ModelMapper] 图片请求路由: {original} → {vision}");
+                body["model"] = serde_json::json!(vision);
+                return (body, Some(original.clone()), Some(vision.clone()));
+            }
+        }
+
         let mapped = mapping.map_model(original);
 
         if mapped != *original {
@@ -142,6 +163,22 @@ pub fn apply_model_mapping(
     }
 
     (body, original_model, None)
+}
+
+/// 判定一次请求是否实际走了图片分支（视觉路由）。
+///
+/// 供 usage 日志归因使用：与 [`apply_model_mapping`] 的 vision 分支触发
+/// 条件保持等价——供应商配置了视觉模型、发往上游的模型与之一致（对齐
+/// `[1M]` 后缀），且原始请求体的最新 user 消息携带图片。三者齐备即视为
+/// 图片分支命中，调用方将其落库为历史日志的路由标记。
+pub fn is_vision_routed(provider: &Provider, body: &Value, outbound_model: &str) -> bool {
+    let outbound = strip_one_m_suffix_for_upstream(outbound_model);
+    ModelMapping::from_provider(provider)
+        .vision_model
+        .as_deref()
+        .map(strip_one_m_suffix_for_upstream)
+        .is_some_and(|vision| vision == outbound)
+        && super::media_sanitizer::latest_user_message_contains_image(body)
 }
 
 /// Claude Code 通过 `[1M]` 后缀声明 100 万上下文能力；上游 API
@@ -216,6 +253,178 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    // ================================================================
+    // 图片请求路由：ANTHROPIC_VISION_MODEL
+    // 最新 user 消息携带图片（Read 工具读图形态）时优先生效，
+    // 覆盖层级映射；历史图片与未配置视觉模型时保持普通映射。
+    // ================================================================
+
+    fn create_provider_with_vision_mapping() -> Provider {
+        Provider {
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "text-model",
+                    "ANTHROPIC_VISION_MODEL": "vision-model"
+                }
+            }),
+            ..create_provider_without_mapping()
+        }
+    }
+
+    fn body_with_latest_tool_result_image() -> Value {
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "a.png" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": [
+                        { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                    ]}
+                ]}
+            ]
+        })
+    }
+
+    fn body_with_history_image_only() -> Value {
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "abc" } }
+                ]},
+                { "role": "assistant", "content": [{ "type": "text", "text": "saw it" }] },
+                { "role": "user", "content": [{ "type": "text", "text": "next" }] }
+            ]
+        })
+    }
+
+    #[test]
+    fn vision_model_routes_latest_image_request() {
+        let provider = create_provider_with_vision_mapping();
+        let (result, original, mapped) =
+            apply_model_mapping(body_with_latest_tool_result_image(), &provider);
+
+        assert_eq!(result["model"], "vision-model");
+        assert_eq!(original, Some("claude-sonnet-4-5".to_string()));
+        assert_eq!(mapped, Some("vision-model".to_string()));
+    }
+
+    #[test]
+    fn vision_model_routes_latest_image_request_over_tier_mapping() {
+        // 图片请求优先于层级映射：即使 sonnet 档已配置也走视觉模型
+        let provider = Provider {
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-text-model",
+                    "ANTHROPIC_VISION_MODEL": "vision-model"
+                }
+            }),
+            ..create_provider_without_mapping()
+        };
+        let (result, _, mapped) =
+            apply_model_mapping(body_with_latest_tool_result_image(), &provider);
+
+        assert_eq!(result["model"], "vision-model");
+        assert_eq!(mapped, Some("vision-model".to_string()));
+    }
+
+    #[test]
+    fn vision_model_ignores_history_images() {
+        // 图片仅在历史消息（非最新 user 轮）→ 不切模型，由 text-only 降级机制接管
+        let provider = create_provider_with_vision_mapping();
+        let (result, _, mapped) = apply_model_mapping(body_with_history_image_only(), &provider);
+
+        assert_eq!(result["model"], "text-model");
+        assert_eq!(mapped, Some("text-model".to_string()));
+    }
+
+    #[test]
+    fn vision_model_not_configured_keeps_normal_mapping() {
+        // 未配置视觉模型：含图请求行为与现状完全一致
+        let provider = create_provider_with_mapping();
+        let (result, _, mapped) =
+            apply_model_mapping(body_with_latest_tool_result_image(), &provider);
+
+        assert_eq!(result["model"], "sonnet-mapped");
+        assert_eq!(mapped, Some("sonnet-mapped".to_string()));
+    }
+
+    #[test]
+    fn vision_model_alone_counts_as_mapping() {
+        // 仅配置视觉模型（无其他映射键）时 has_mapping 仍为真，
+        // 不能因普通映射缺失而提前短路返回
+        let provider = create_provider_with_vision_mapping();
+        let (result, _, _) =
+            apply_model_mapping(json!({ "model": "claude-sonnet-4-5" }), &provider);
+
+        assert_eq!(result["model"], "text-model");
+    }
+
+    // ================================================================
+    // 视觉路由判定：is_vision_routed
+    // 供 usage 日志归因——请求实际走了图片分支时落库标记，
+    // 与 apply_model_mapping 的 vision 分支触发条件保持等价。
+    // ================================================================
+
+    #[test]
+    fn is_vision_routed_true_when_outbound_matches_vision_config() {
+        let provider = create_provider_with_vision_mapping(); // vision = "vision-model"
+        assert!(is_vision_routed(
+            &provider,
+            &body_with_latest_tool_result_image(),
+            "vision-model",
+        ));
+    }
+
+    #[test]
+    fn is_vision_routed_false_for_history_images_only() {
+        let provider = create_provider_with_vision_mapping();
+        assert!(!is_vision_routed(
+            &provider,
+            &body_with_history_image_only(),
+            "vision-model",
+        ));
+    }
+
+    #[test]
+    fn is_vision_routed_false_when_outbound_is_normal_model() {
+        // 走普通映射（outbound 非 vision 配置）→ 未命中图片分支
+        let provider = create_provider_with_vision_mapping();
+        assert!(!is_vision_routed(
+            &provider,
+            &body_with_latest_tool_result_image(),
+            "text-model",
+        ));
+    }
+
+    #[test]
+    fn is_vision_routed_false_without_vision_config() {
+        let provider = create_provider_without_mapping();
+        assert!(!is_vision_routed(
+            &provider,
+            &body_with_latest_tool_result_image(),
+            "sonnet-mapped",
+        ));
+    }
+
+    #[test]
+    fn is_vision_routed_aligns_one_m_suffix() {
+        // 配置值可带 [1M] 声明，outbound 是剥离后的真名 → 去后缀对齐
+        let provider = Provider {
+            settings_config: json!({
+                "env": { "ANTHROPIC_VISION_MODEL": "vision-model[1M]" }
+            }),
+            ..create_provider_without_mapping()
+        };
+        assert!(is_vision_routed(
+            &provider,
+            &body_with_latest_tool_result_image(),
+            "vision-model",
+        ));
     }
 
     #[test]

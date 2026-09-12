@@ -85,6 +85,8 @@ pub struct RequestLog {
     pub is_streaming: bool,
     /// 成本倍数
     pub cost_multiplier: String,
+    /// 是否走了图片分支（视觉路由）——历史日志据此展示 [图片] 前缀
+    pub vision_routed: bool,
 }
 
 /// 使用量记录器
@@ -173,8 +175,8 @@ impl<'a> UsageLogger<'a> {
                 input_token_semantics,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
-                provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                provider_type, is_streaming, cost_multiplier, created_at, vision_routed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
         );
         let affected_rows = conn
             .execute(
@@ -205,6 +207,7 @@ impl<'a> UsageLogger<'a> {
                     log.is_streaming as i64,
                     log.cost_multiplier,
                     created_at,
+                    log.vision_routed as i64,
                 ],
             )
             .map_err(|e| AppError::Database(format!("记录请求日志失败: {e}")))?;
@@ -286,6 +289,7 @@ impl<'a> UsageLogger<'a> {
             provider_type: None,
             is_streaming: false,
             cost_multiplier: "1.0".to_string(),
+            vision_routed: false,
         };
 
         self.log_request(&log)
@@ -327,6 +331,7 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: "1.0".to_string(),
+            vision_routed: false,
         };
 
         self.log_request(&log)
@@ -459,6 +464,7 @@ impl<'a> UsageLogger<'a> {
         session_id: Option<String>,
         provider_type: Option<String>,
         is_streaming: bool,
+        vision_routed: bool,
     ) -> Result<(), AppError> {
         let pricing = self.get_model_pricing(&pricing_model)?;
 
@@ -495,6 +501,7 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: cost_multiplier.to_string(),
+            vision_routed,
         };
 
         self.log_request(&log)
@@ -530,6 +537,7 @@ mod tests {
             provider_type: Some("codex".to_string()),
             is_streaming: true,
             cost_multiplier: "1".to_string(),
+            vision_routed: false,
         }
     }
 
@@ -574,6 +582,7 @@ mod tests {
             None,
             Some("claude".to_string()),
             false,
+            false,
         )?;
 
         // 验证记录已插入
@@ -587,6 +596,50 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_routed_flag_persists_and_reads_back() -> Result<(), AppError> {
+        // 图片分支标记的落库往返：insert 列序正确性与非零读回。
+        // 历史日志的 [图片] 前缀展示依赖此标记，默认行必须为 0。
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+
+        logger.log_with_calculation(
+            "vision-1".to_string(),
+            "provider-1".to_string(),
+            "claude".to_string(),
+            "glm-5.3-flash".to_string(),
+            "LONG".to_string(),
+            "glm-5.3-flash".to_string(),
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: None,
+                message_id: None,
+            },
+            Decimal::from(1),
+            10,
+            None,
+            200,
+            None,
+            None,
+            false,
+            true,
+        )?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (vision,): (i64,) = conn
+            .query_row(
+                "SELECT vision_routed FROM proxy_request_logs WHERE request_id = 'vision-1'",
+                [],
+                |row| Ok((row.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(vision, 1);
         Ok(())
     }
 
@@ -788,6 +841,7 @@ mod tests {
             provider_type: Some("grokbuild".to_string()),
             is_streaming: false,
             cost_multiplier: "1".to_string(),
+            vision_routed: false,
         };
 
         logger.log_request(&log)?;

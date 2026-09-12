@@ -226,6 +226,11 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    // 图片分支归因：命中视觉路由（outbound 走视觉配置且最新消息含图）
+    // 时标记，供 usage 日志在历史记录里展示 [图片] 前缀
+    ctx.vision_routed = ctx.outbound_model.as_deref().is_some_and(|outbound| {
+        super::model_mapper::is_vision_routed(&result.provider, &body, outbound)
+    });
     ctx.provider = result.provider;
     let api_format = result
         .claude_api_format
@@ -309,6 +314,8 @@ struct ClaudeUsageLog {
     latency_ms: u64,
     status_code: u16,
     is_streaming: bool,
+    /// 是否走了图片分支（视觉路由）——历史日志展示 [图片] 前缀
+    vision_routed: bool,
 }
 
 fn prepare_claude_usage_log(
@@ -342,6 +349,7 @@ fn prepare_claude_usage_log(
         latency_ms: ctx.latency_ms(),
         status_code,
         is_streaming,
+        vision_routed: ctx.vision_routed,
     })
 }
 
@@ -359,6 +367,7 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         log.is_streaming,
         log.status_code,
         Some(log.session_id),
+        log.vision_routed,
     )
     .await;
 }
@@ -468,6 +477,7 @@ async fn handle_claude_transform(
             // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
             // "claude" 会把 claude-desktop 的行错记到 claude 名下
             let app_type_str = ctx.app_type_str;
+            let vision_routed = ctx.vision_routed;
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -500,6 +510,7 @@ async fn handle_claude_transform(
                                 true,
                                 status_code,
                                 Some(session_id),
+                                vision_routed,
                             )
                             .await;
                         });
@@ -1293,6 +1304,7 @@ async fn handle_codex_xai_native_responses_rewrite(
                             false,
                             status.as_u16(),
                             Some(session_id),
+                            false,
                         )
                         .await;
                     }
@@ -1405,6 +1417,7 @@ async fn handle_codex_chat_to_responses_transform(
                             true,
                             status.as_u16(),
                             Some(session_id),
+                            false,
                         )
                         .await;
                     });
@@ -1526,6 +1539,7 @@ async fn handle_codex_chat_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    false,
                 )
                 .await;
             }
@@ -1691,6 +1705,7 @@ async fn handle_codex_anthropic_to_responses_transform(
                     false,
                     status.as_u16(),
                     Some(session_id),
+                    false,
                 )
                 .await;
             }
@@ -1778,6 +1793,7 @@ fn build_codex_anthropic_sse_response(
                         true,
                         status.as_u16(),
                         Some(session_id),
+                        false,
                     )
                     .await;
                 });
@@ -2814,6 +2830,7 @@ async fn log_usage(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    vision_routed: bool,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -2849,6 +2866,7 @@ async fn log_usage(
         session_id,
         None, // provider_type
         is_streaming,
+        vision_routed,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }

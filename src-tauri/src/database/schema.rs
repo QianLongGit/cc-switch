@@ -207,7 +207,8 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy'
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            vision_routed INTEGER NOT NULL DEFAULT 0
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -548,6 +549,11 @@ impl Database {
                         log::info!("迁移数据库从 v17 到 v18（会话日志字节游标列）");
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（请求日志图片分支标记列）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1594,6 +1600,23 @@ impl Database {
                 "session_log_sync",
                 "last_tail_fingerprint",
                 "INTEGER",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v18 -> v19：proxy_request_logs 添加 vision_routed 列。
+    ///
+    /// 标记「该请求走了图片分支（视觉路由）」，历史日志 UI 据此展示
+    /// [图片] 前缀。存量行默认 0（非图片分支），展示行为与升级前一致。
+    /// 缺表的库（异常/测试夹具）跳过：create_tables 会以含列的新 DDL 建表。
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "vision_routed",
+                "INTEGER NOT NULL DEFAULT 0",
             )?;
         }
         Ok(())
@@ -3793,6 +3816,41 @@ mod tests {
         )?;
         assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
         assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_adds_vision_routed_to_existing_request_logs() -> Result<(), AppError> {
+        // 真实升级路径：v18 库的 proxy_request_logs 无 vision_routed 列。
+        // 曾因补列加错迁移段导致 SELECT no such column、历史日志整页空白
+        // ——本测试固化「旧库升级后 27 列查询可用、存量行默认 0」。
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE proxy_request_logs (
+                request_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                model TEXT NOT NULL,
+                request_model TEXT,
+                created_at INTEGER NOT NULL
+             );
+             INSERT INTO proxy_request_logs
+             VALUES ('legacy-1', 'p1', 'claude', 'glm-5.3', 'LONG', 1700000000);",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        // 事故复现点：带 vision_routed 的 27 列查询必须可用
+        let (vision_routed, model): (i64, String) = conn.query_row(
+            "SELECT vision_routed, model FROM proxy_request_logs
+             WHERE request_id = 'legacy-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(vision_routed, 0, "存量行必须默认非图片分支");
+        assert_eq!(model, "glm-5.3");
         Ok(())
     }
 }

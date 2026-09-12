@@ -86,6 +86,7 @@ const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
     defaultFableModel: "",
     defaultFableModelName: "",
     subagentModel: "",
+    visionModel: "",
     onModelChange: vi.fn(),
     speedTestEndpoints: [],
     apiFormat: "anthropic",

@@ -217,14 +217,16 @@ export function RequestLogTable({
                             className="truncate"
                             title={
                               log.requestModel && log.requestModel !== log.model
-                                ? `${log.requestModel} → ${log.model}`
+                                ? `${log.visionRouted ? t("usage.visionRouteBadge", "[图片]") : log.requestModel} → ${log.model}`
                                 : log.model
                             }
                           >
                             {log.requestModel &&
                             log.requestModel !== log.model ? (
                               <span>
-                                {log.requestModel}
+                                {log.visionRouted
+                                  ? t("usage.visionRouteBadge", "[图片]")
+                                  : log.requestModel}
                                 <span className="text-muted-foreground">
                                   {" → "}
                                   {log.model}
