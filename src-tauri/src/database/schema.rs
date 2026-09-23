@@ -67,6 +67,7 @@ impl Database {
             enabled_claude BOOLEAN NOT NULL DEFAULT 0, enabled_codex BOOLEAN NOT NULL DEFAULT 0,
             enabled_gemini BOOLEAN NOT NULL DEFAULT 0, enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+            enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0
         )",
             [],
@@ -96,6 +97,7 @@ impl Database {
             enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
             enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+            enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT,
@@ -551,9 +553,25 @@ impl Database {
                         Self::set_user_version(conn, 18)?;
                     }
                     18 => {
-                        log::info!("迁移数据库从 v18 到 v19（请求日志图片分支标记列）");
-                        Self::migrate_v18_to_v19(conn)?;
+                        log::info!(
+                            "迁移数据库从 v18 到 v19（mcp_servers/skills 添加 mcode 启用列）"
+                        );
+                        for table in ["mcp_servers", "skills"] {
+                            if Self::table_exists(conn, table)? {
+                                Self::add_column_if_missing(
+                                    conn,
+                                    table,
+                                    "enabled_mcode",
+                                    "BOOLEAN NOT NULL DEFAULT 0",
+                                )?;
+                            }
+                        }
                         Self::set_user_version(conn, 19)?;
+                    }
+                    19 => {
+                        log::info!("迁移数据库从 v19 到 v20（请求日志图片分支标记列）");
+                        Self::migrate_v19_to_v20(conn)?;
+                        Self::set_user_version(conn, 20)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1605,12 +1623,28 @@ impl Database {
         Ok(())
     }
 
-    /// v18 -> v19：proxy_request_logs 添加 vision_routed 列。
+    /// v19 -> v20：proxy_request_logs 添加 vision_routed 列。
     ///
     /// 标记「该请求走了图片分支（视觉路由）」，历史日志 UI 据此展示
     /// [图片] 前缀。存量行默认 0（非图片分支），展示行为与升级前一致。
+    ///
+    /// 版本撞号说明：官方 v3.20.4 把 v18 -> v19 用于 mcp_servers/skills 的
+    /// enabled_mcode 列，本 fork 早期版本曾把 vision_routed 挂在 v19 上。
+    /// 因此本迁移同时幂等补齐两处列（add_column_if_missing），使官方
+    /// v19 库（有 enabled_mcode、缺 vision_routed）与本 fork 早期 v19 库
+    ///（有 vision_routed、缺 enabled_mcode）都能正确收敛。
     /// 缺表的库（异常/测试夹具）跳过：create_tables 会以含列的新 DDL 建表。
-    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+    fn migrate_v19_to_v20(conn: &Connection) -> Result<(), AppError> {
+        for table in ["mcp_servers", "skills"] {
+            if Self::table_exists(conn, table)? {
+                Self::add_column_if_missing(
+                    conn,
+                    table,
+                    "enabled_mcode",
+                    "BOOLEAN NOT NULL DEFAULT 0",
+                )?;
+            }
+        }
         if Self::table_exists(conn, "proxy_request_logs")? {
             Self::add_column_if_missing(
                 conn,
@@ -2325,16 +2359,16 @@ impl Database {
                 "0.006",
                 "0",
             ),
-            // 🔴 2026-09-14 12:00 北京时间起：官方公告 V4 Pro 有序下线，在 V4.1 Pro 发布前
-            // 所有 deepseek-v4-pro 请求「are all routed to V4.1 Flash and billed at the V4.1
-            // Flash price」→ 本行随之落到 Flash 档，与上方四行同价。V4 Pro 自己的高峰档
-            // 1.32/3.96/0.044 仅在 09-14 前有效（repair 守卫照抄的正是这组旧值）。
+            // V4 Pro 高峰档 1.32/3.96/0.044（CNY 9/27/0.3）。官方 2026-09-12 撤回了「09-14 起
+            // 路由到 V4.1 Flash」的公告，定价页注(2)：9 月 14 日之后继续提供 V4 Pro API，
+            // 计费方式保持不变（2026-09-15 复核）。
+            // 🔴 勿按未生效的厂商公告提前改价：v3.20.3 曾因此发出 0.3/1.2/0.006 错价。
             (
                 "deepseek-v4-pro",
                 "DeepSeek V4 Pro",
-                "0.3",
-                "1.2",
-                "0.006",
+                "1.32",
+                "3.96",
+                "0.044",
                 "0",
             ),
             // Kimi (月之暗面)
@@ -2380,6 +2414,15 @@ impl Database {
             // 腾讯混元 (Tencent Hunyuan)（官方 CNY 1/4/0.25 按 1 USD ≈ 7.14 折算；Hy3 阶梯计价取最低档）
             ("hunyuan-hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
             ("hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
+            // Hy4 preview：官方广州地域 CNY 6/18/0.3（1823/130055，2026-09-11 版）按 7.14 折算，无阶梯
+            (
+                "hy4-preview",
+                "Hunyuan Hy4 Preview",
+                "0.84",
+                "2.52",
+                "0.042",
+                "0",
+            ),
             // MiniMax 系列
             // 2026-09-06 审计：官方按量价页（platform.minimax.io/docs/guides/pricing-paygo）
             // M2 / M2.1 / M2.5 均为 0.3/1.2/0.03/0.375，models.dev 一致；旧值 0.27/0.95 与 0.15 为早期误录。
@@ -2448,6 +2491,14 @@ impl Database {
                 "0.03",
                 "0",
             ),
+            (
+                "glm-5.3-flashx",
+                "GLM-5.3-FlashX",
+                "0.37",
+                "1.25",
+                "0.075",
+                "0",
+            ),
             ("glm-5-turbo", "GLM-5-Turbo", "1.2", "4", "0.24", "0"),
             ("glm-5v-turbo", "GLM-5V-Turbo", "1.2", "4", "0.24", "0"),
             // MiMo (小米)
@@ -2481,6 +2532,17 @@ impl Database {
                 "0.016",
                 "0.20",
             ),
+            // 2026-09-15：开放权重两款，取阿里国际站（新加坡）模型页单价，无阶梯；缓存两列为
+            // 隐式缓存命中价与显式缓存创建价，与 qwen3.8-max 同口径
+            (
+                "qwen3.8-2.4t-a95b",
+                "Qwen3.8 2.4T A95B",
+                "2",
+                "6",
+                "0.25",
+                "2.50",
+            ),
+            ("qwen3.8-27b", "Qwen3.8 27B", "0.50", "3", "0.10", "0.625"),
             ("qwen3.7-max", "Qwen3.7 Max", "2.50", "7.50", "0.25", "0"),
             ("qwen3.7-plus", "Qwen3.7 Plus", "0.40", "1.60", "0.08", "0"),
             (
@@ -2553,8 +2615,9 @@ impl Database {
             ("qwq-32b", "QwQ 32B", "0.20", "0.60", "0", "0"),
             ("qwen3-32b", "Qwen3 32B", "0.16", "0.64", "0", "0"),
             // Grok 系列 (xAI)
-            // 4.5/4.6 均为分档计价：prompt ≥200K 时单价翻倍（4/12，cached 亦翻倍）。
+            // 4.5/4.6/4.7 均为分档计价：prompt ≥200K 时单价翻倍（4/12，cached 亦翻倍）。
             // 本表无档位列，统一取基础档（<200K），与其它分档厂商口径一致
+            ("grok-4.7", "Grok 4.7", "2", "6", "0.50", "0"),
             ("grok-4.6", "Grok 4.6", "2", "6", "0.50", "0"),
             ("grok-4.5", "Grok 4.5", "2", "6", "0.30", "0"),
             // Grok CLI 官方 OAuth 态 modelUsage 上报的内部别名。定价由
@@ -3376,22 +3439,19 @@ impl Database {
                 "0.014",
                 "0",
             ),
-            // 2026-09-14 12:00 北京时间起 deepseek-v4-pro 全部路由到 V4.1 Flash 并按 Flash
-            // 价计费（官方定价页注(2)），本行随之落到 Flash 档。
-            //
-            // 🔴 守卫是 V4 Pro 自己的高峰档 1.32/3.96/0.044，由上方 2026-08-16 那条产出 ——
-            // 本条必须排在它之后，链条：1.68/3.36/0.14 →(2026-07)→ 0.435/0.87/0.003625
-            // →(2026-08-16 峰谷)→ 1.32/3.96/0.044 →(本条)→ 0.3/1.2/0.006。
+            // 2026-09-15：撤销 09-11 提前执行的 V4 Pro → Flash 档回调（官方 09-12 撤回迁移公告，
+            // V4 Pro 继续按原价计费）。v3.20.3 已把老库推到 0.3/1.2/0.006，本条修回高峰档。
+            // 🔴 原 1.32→0.3 条目必须删除而非保留：两条并存会让每次启动都来回改写。
             (
                 "deepseek-v4-pro",
                 "DeepSeek V4 Pro",
-                "0.3",
-                "1.2",
-                "0.006",
-                "0",
                 "1.32",
                 "3.96",
                 "0.044",
+                "0",
+                "0.3",
+                "1.2",
+                "0.006",
                 "0",
             ),
         ];
@@ -3820,10 +3880,10 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v18_to_v19_adds_vision_routed_to_existing_request_logs() -> Result<(), AppError> {
-        // 真实升级路径：v18 库的 proxy_request_logs 无 vision_routed 列。
+    fn migrate_v19_to_v20_adds_vision_routed_to_official_v19_db() -> Result<(), AppError> {
+        // 官方 v3.20.4 升级路径：v19 库带 enabled_mcode、无 vision_routed。
         // 曾因补列加错迁移段导致 SELECT no such column、历史日志整页空白
-        // ——本测试固化「旧库升级后 27 列查询可用、存量行默认 0」。
+        // ——本测试固化「旧库升级后带列查询可用、存量行默认 0」。
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "CREATE TABLE proxy_request_logs (
@@ -3837,12 +3897,12 @@ mod tests {
              INSERT INTO proxy_request_logs
              VALUES ('legacy-1', 'p1', 'claude', 'glm-5.3', 'LONG', 1700000000);",
         )?;
-        Database::set_user_version(&conn, 18)?;
+        Database::set_user_version(&conn, 19)?;
 
         Database::apply_schema_migrations_on_conn(&conn)?;
 
         assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
-        // 事故复现点：带 vision_routed 的 27 列查询必须可用
+        // 事故复现点：带 vision_routed 的查询必须可用
         let (vision_routed, model): (i64, String) = conn.query_row(
             "SELECT vision_routed, model FROM proxy_request_logs
              WHERE request_id = 'legacy-1'",
@@ -3851,6 +3911,34 @@ mod tests {
         )?;
         assert_eq!(vision_routed, 0, "存量行必须默认非图片分支");
         assert_eq!(model, "glm-5.3");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v19_to_v20_converges_early_fork_v19_db() -> Result<(), AppError> {
+        // 本 fork 早期版本（v3.20.3-vision.1）的 v19 库：有 vision_routed、
+        // 缺官方 v18->v19 的 enabled_mcode。迁移后两列必须齐全收敛。
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE proxy_request_logs (
+                request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL, model TEXT NOT NULL, created_at INTEGER NOT NULL
+             );
+             CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT NOT NULL);",
+        )?;
+        Database::set_user_version(&conn, 19)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::has_column(
+            &conn,
+            "proxy_request_logs",
+            "vision_routed"
+        )?);
+        assert!(Database::has_column(&conn, "mcp_servers", "enabled_mcode")?);
+        assert!(Database::has_column(&conn, "skills", "enabled_mcode")?);
         Ok(())
     }
 }
