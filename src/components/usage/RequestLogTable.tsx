@@ -26,6 +26,7 @@ import {
 } from "@/types/usage";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { UsageDateRangePicker } from "./UsageDateRangePicker";
+import { uniqueProjectDirs } from "./projectFilter";
 import {
   formatOutputTokensPerSecond,
   fmtInt,
@@ -33,6 +34,9 @@ import {
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
+
+/** 提取路径 basename（兼容 POSIX / Windows 分隔符）；空段回落原串。 */
+const basenameOf = (dir: string): string => dir.split(/[\\/]/).pop() || dir;
 
 interface RequestLogTableProps {
   range: UsageRangeSelection;
@@ -56,8 +60,9 @@ export function RequestLogTable({
   const { t, i18n } = useTranslation();
 
   // 应用/Provider/模型筛选已上移到 Dashboard 顶栏（全局生效）；
-  // 这里只保留日志特有的状态码筛选。
+  // 这里只保留日志特有的状态码与项目筛选。
   const [statusCode, setStatusCode] = useState<number | undefined>(undefined);
+  const [projectDir, setProjectDir] = useState<string | undefined>(undefined);
   const [page, setPage] = useState(0);
   const [pageInput, setPageInput] = useState("");
   const pageSize = 20;
@@ -70,6 +75,7 @@ export function RequestLogTable({
     providerName,
     model,
     statusCode,
+    projectDir,
   };
 
   const { data: result, isLoading } = useRequestLogs({
@@ -137,6 +143,29 @@ export function RequestLogTable({
             </SelectContent>
           </Select>
 
+          {/* Project（选项派生自当前日志数据；选中值为完整路径，展示 basename） */}
+          <Select
+            value={projectDir ?? "all"}
+            onValueChange={(v) => {
+              setProjectDir(v === "all" ? undefined : v);
+              setPage(0);
+            }}
+          >
+            <SelectTrigger className="h-8 w-[140px] bg-background text-xs">
+              <SelectValue placeholder={t("usage.projectDir")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("common.all")}</SelectItem>
+              {uniqueProjectDirs(logs).map((dir) => (
+                <SelectItem key={dir} value={dir}>
+                  <span className="block truncate" title={dir}>
+                    {basenameOf(dir)}
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
           {onRangeChange && (
             <UsageDateRangePicker
               selection={range}
@@ -160,6 +189,9 @@ export function RequestLogTable({
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
                     {t("usage.provider")}
+                  </TableHead>
+                  <TableHead className="text-center whitespace-nowrap">
+                    {t("usage.projectDir")}
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
                     {t("usage.billingModel")}
@@ -188,7 +220,7 @@ export function RequestLogTable({
                 {logs.length === 0 ? (
                   <TableRow>
                     <TableCell
-                      colSpan={9}
+                      colSpan={10}
                       className="text-center text-muted-foreground"
                     >
                       {t("usage.noData")}
@@ -212,6 +244,20 @@ export function RequestLogTable({
                         </TableCell>
                         <TableCell className="text-center">
                           {log.providerName || t("usage.unknownProvider")}
+                        </TableCell>
+                        <TableCell className="text-center text-xs max-w-[160px]">
+                          {log.projectDir ? (
+                            <div className="truncate" title={log.projectDir}>
+                              {log.projectRouted && (
+                                <span className="text-muted-foreground mr-1">
+                                  {t("usage.projectRouteBadge", "[路由]")}
+                                </span>
+                              )}
+                              {basenameOf(log.projectDir)}
+                            </div>
+                          ) : (
+                            "—"
+                          )}
                         </TableCell>
                         <TableCell className="text-center font-mono text-xs max-w-[200px]">
                           <div

@@ -210,7 +210,9 @@ impl Database {
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
             data_source TEXT NOT NULL DEFAULT 'proxy',
-            vision_routed INTEGER NOT NULL DEFAULT 0
+            vision_routed INTEGER NOT NULL DEFAULT 0,
+            project_dir TEXT,
+            project_routed INTEGER NOT NULL DEFAULT 0
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -433,6 +435,36 @@ impl Database {
             [],
         );
 
+        // 20. Project Routes 表（项目 -> 供应商绑定）
+        // app_type 预留二期扩展，首期恒 'claude'；UNIQUE 保证一个项目
+        // 一种 app 类型至多一条绑定（spec §4.1，DDL 逐字对齐）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_routes (
+            id TEXT PRIMARY KEY,
+            project_path TEXT NOT NULL,
+            app_type TEXT NOT NULL DEFAULT 'claude',
+            provider_id TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(project_path, app_type)
+        )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 21. Settings Local Backup 表（settings.local.json 写前快照）
+        // 每项目单份：主键即 project_path，INSERT OR REPLACE 只保留最近
+        // 一次修改前原文（spec §4.3；不复用 proxy_live_backup，其按 app_type
+        // 单行存储无法区分多项目）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings_local_backup (
+            project_path TEXT PRIMARY KEY,
+            content      TEXT NOT NULL,
+            updated_at   INTEGER NOT NULL
+        )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         Ok(())
     }
 
@@ -572,6 +604,11 @@ impl Database {
                         log::info!("迁移数据库从 v19 到 v20（请求日志图片分支标记列）");
                         Self::migrate_v19_to_v20(conn)?;
                         Self::set_user_version(conn, 20)?;
+                    }
+                    20 => {
+                        log::info!("迁移数据库从 v20 到 v21（请求日志项目归因列）");
+                        Self::migrate_v20_to_v21(conn)?;
+                        Self::set_user_version(conn, 21)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1650,6 +1687,26 @@ impl Database {
                 conn,
                 "proxy_request_logs",
                 "vision_routed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v20 -> v21：proxy_request_logs 添加项目路由归因列。
+    ///
+    /// project_dir 记录请求来源项目路径（NULL = 未识别：无 X-CC-Project
+    /// header 或解码失败），project_routed 标记该请求是否因项目绑定改变
+    /// 路由，历史展示据此做项目归因与筛选。存量行分别置 NULL / 0，展示
+    /// 行为与升级前一致。
+    /// 缺表的库（异常/测试夹具）跳过：create_tables 会以含列的新 DDL 建表。
+    fn migrate_v20_to_v21(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(conn, "proxy_request_logs", "project_dir", "TEXT")?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "project_routed",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
         }

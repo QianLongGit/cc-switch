@@ -1730,6 +1730,10 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
+            // Project routing (per-project provider binding)
+            commands::list_projects,
+            commands::set_project_route,
+            commands::clear_project_route,
         ]);
 
     let app = builder

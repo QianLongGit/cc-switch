@@ -495,6 +495,8 @@ pub(crate) fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let project_dir = ctx.project_dir.clone();
+    let project_routed = ctx.project_routed;
 
     Some(SseUsageCollector::new(
         start_time,
@@ -510,6 +512,7 @@ pub(crate) fn create_usage_collector(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let vision_routed = vision_routed;
+                let project_dir = project_dir.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -526,6 +529,8 @@ pub(crate) fn create_usage_collector(
                         status_code,
                         Some(session_id),
                         vision_routed,
+                        project_dir,
+                        project_routed,
                     )
                     .await;
                 });
@@ -538,6 +543,7 @@ pub(crate) fn create_usage_collector(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let vision_routed = vision_routed;
+                let project_dir = project_dir.clone();
 
                 tokio::spawn(async move {
                     log_usage_internal(
@@ -554,6 +560,8 @@ pub(crate) fn create_usage_collector(
                         status_code,
                         Some(session_id),
                         vision_routed,
+                        project_dir,
+                        project_routed,
                     )
                     .await;
                 });
@@ -593,6 +601,8 @@ fn spawn_log_usage(
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
     let vision_routed = ctx.vision_routed;
+    let project_dir = ctx.project_dir.clone();
+    let project_routed = ctx.project_routed;
 
     tokio::spawn(async move {
         log_usage_internal(
@@ -609,6 +619,8 @@ fn spawn_log_usage(
             status_code,
             Some(session_id),
             vision_routed,
+            project_dir,
+            project_routed,
         )
         .await;
     });
@@ -643,6 +655,8 @@ async fn log_usage_internal(
     status_code: u16,
     session_id: Option<String>,
     vision_routed: bool,
+    project_dir: Option<String>,
+    project_routed: bool,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -683,6 +697,8 @@ async fn log_usage_internal(
         None, // provider_type
         is_streaming,
         vision_routed,
+        project_dir,
+        project_routed,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
@@ -1117,6 +1133,8 @@ mod tests {
             200,
             None,
             false,
+            None,
+            false,
         )
         .await;
 
@@ -1186,6 +1204,8 @@ mod tests {
             None,
             false,
             200,
+            None,
+            false,
             None,
             false,
         )
@@ -1267,6 +1287,8 @@ mod tests {
             None,
             false,
             200,
+            None,
+            false,
             None,
             false,
         )

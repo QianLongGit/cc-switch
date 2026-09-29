@@ -109,6 +109,8 @@ pub struct LogFilters {
     pub status_code: Option<u16>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
+    /// 来源项目路径精确匹配；None = 不筛选（NULL 行仅在不筛选时出现）
+    pub project_dir: Option<String>,
 }
 
 /// 分页请求日志响应
@@ -160,17 +162,23 @@ pub struct RequestLogDetail {
     pub pricing_model: Option<String>,
     /// 是否走了图片分支（视觉路由）——UI 据此在计费模型列展示 [图片] 前缀
     pub vision_routed: bool,
+    /// 来源项目路径（项目绑定路由归因）；None = 未识别或 v21 前历史行
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    /// 是否因项目绑定改变路由——UI 据此展示项目路由标记
+    pub project_routed: bool,
 }
 
-/// 把 27 列的查询结果映射为 `RequestLogDetail`。
+/// 把 29 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 27 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 29 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
 ///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
 ///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
 ///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
 ///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, input_token_semantics, vision_routed`
+///  data_source, pricing_model, input_token_semantics, vision_routed,
+///  project_dir, project_routed`
 ///
 /// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
@@ -204,6 +212,8 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         pricing_model: row.get(24)?,
         input_token_semantics: row.get::<_, i64>(25)?,
         vision_routed: row.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
+        project_dir: row.get(27)?,
+        project_routed: row.get::<_, i64>(28)? != 0,
     })
 }
 
@@ -1596,6 +1606,12 @@ impl Database {
             conditions.push("l.created_at <= ?".to_string());
             params.push(Box::new(end));
         }
+        // 项目归因筛选：精确匹配（=）；NULL 行（未识别/存量行）在 SQL 三值逻辑下
+        // 天然不命中 = 比较，与"未识别不参与项目筛选"语义一致
+        if let Some(ref project_dir) = filters.project_dir {
+            conditions.push("l.project_dir = ?".to_string());
+            params.push(Box::new(project_dir.clone()));
+        }
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1627,7 +1643,7 @@ impl Database {
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics, l.vision_routed
+                    l.input_token_semantics, l.vision_routed, l.project_dir, l.project_routed
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1670,8 +1686,8 @@ impl Database {
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model,
-                    l.input_token_semantics, l.vision_routed
+                    status_code, error_message, l.created_at, l.data_source, l.pricing_model,
+                    l.input_token_semantics, l.vision_routed, l.project_dir, l.project_routed
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1827,7 +1843,8 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model, input_token_semantics, vision_routed
+                        data_source, pricing_model, input_token_semantics, vision_routed,
+                        project_dir, project_routed
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
@@ -4359,6 +4376,234 @@ mod tests {
         let result = find_model_pricing_row(&conn, "unknown-model-123")?;
         assert!(result.is_none(), "不应该匹配不存在的模型");
 
+        Ok(())
+    }
+
+    #[test]
+    fn project_dir_filter_narrows_results() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let ts = local_ts(2026, 9, 29, 10, 0, 0);
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "proj-a",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts,
+                10,
+                1,
+                0,
+                0,
+                200,
+                "0.1",
+            )?;
+            insert_usage_log(
+                &conn,
+                "proj-b",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts + 1,
+                20,
+                2,
+                0,
+                0,
+                200,
+                "0.2",
+            )?;
+            // 第三行 project_dir 保持 NULL：存量行语义，= 筛选下不得命中
+            insert_usage_log(
+                &conn,
+                "proj-null",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts + 2,
+                30,
+                3,
+                0,
+                0,
+                200,
+                "0.3",
+            )?;
+            conn.execute(
+                "UPDATE proxy_request_logs SET project_dir = '/a' WHERE request_id = 'proj-a'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE proxy_request_logs SET project_dir = '/b' WHERE request_id = 'proj-b'",
+                [],
+            )?;
+        }
+
+        // 指定 /a：仅 proj-a 命中；NULL 行不参与 = 匹配（SQL NULL 比较语义天然排除）
+        let narrowed = db.get_request_logs(
+            &LogFilters {
+                project_dir: Some("/a".to_string()),
+                ..Default::default()
+            },
+            0,
+            50,
+        )?;
+        assert_eq!(narrowed.total, 1, "projectDir 筛选应收窄到 1 行");
+        assert_eq!(narrowed.data[0].request_id, "proj-a");
+
+        // 无筛选：全部三行（含 NULL 行）
+        let all = db.get_request_logs(&LogFilters::default(), 0, 50)?;
+        assert_eq!(all.total, 3, "不筛选时应返回全部行");
+        Ok(())
+    }
+
+    #[test]
+    fn detail_row_maps_project_columns() -> Result<(), AppError> {
+        // 27→29 列扩展后行映射不得乱序：project 字段必须取到自己的列。
+        // 存量行（INSERT 未写 project_* 两列）依赖 DEFAULT 0 / NULL 读回。
+        let db = Database::memory()?;
+        let ts = local_ts(2026, 9, 29, 11, 0, 0);
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "proj-new",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts,
+                10,
+                1,
+                0,
+                0,
+                200,
+                "0.1",
+            )?;
+            conn.execute(
+                "UPDATE proxy_request_logs SET project_dir = '/x', project_routed = 1
+                 WHERE request_id = 'proj-new'",
+                [],
+            )?;
+            insert_usage_log(
+                &conn,
+                "proj-legacy",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts + 1,
+                20,
+                2,
+                0,
+                0,
+                200,
+                "0.2",
+            )?;
+        }
+
+        let all = db.get_request_logs(&LogFilters::default(), 0, 50)?;
+        let new_row = all
+            .data
+            .iter()
+            .find(|r| r.request_id == "proj-new")
+            .expect("proj-new 行应存在");
+        assert_eq!(new_row.project_dir.as_deref(), Some("/x"));
+        assert!(new_row.project_routed, "project_routed=1 应读回 true");
+
+        let legacy = all
+            .data
+            .iter()
+            .find(|r| r.request_id == "proj-legacy")
+            .expect("proj-legacy 行应存在");
+        assert_eq!(legacy.project_dir, None, "存量行 project_dir 应为 NULL");
+        assert!(!legacy.project_routed, "存量行 project_routed 应默认 0");
+
+        // 详情查询共用 row_to_request_log_detail，同样验证一遍
+        let detail = db
+            .get_request_detail("proj-new")?
+            .expect("详情应存在");
+        assert_eq!(detail.project_dir.as_deref(), Some("/x"));
+        assert!(detail.project_routed);
+        Ok(())
+    }
+
+    #[test]
+    fn project_fields_serialize_camel_case() -> Result<(), AppError> {
+        // 前端契约：projectDir / projectRouted camelCase；project_dir=None 时
+        // 整键缺席（skip_serializing_if，与 provider_name 同款）；LogFilters
+        // 反序列化接受前端 camelCase projectDir。
+        let db = Database::memory()?;
+        let ts = local_ts(2026, 9, 29, 12, 0, 0);
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "proj-json",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts,
+                10,
+                1,
+                0,
+                0,
+                200,
+                "0.1",
+            )?;
+            insert_usage_log(
+                &conn,
+                "proj-plain",
+                "claude",
+                "p-1",
+                "claude-sonnet-4-5",
+                "proxy",
+                ts + 1,
+                20,
+                2,
+                0,
+                0,
+                200,
+                "0.2",
+            )?;
+            conn.execute(
+                "UPDATE proxy_request_logs SET project_dir = '/y', project_routed = 1
+                 WHERE request_id = 'proj-json'",
+                [],
+            )?;
+        }
+
+        let all = db.get_request_logs(&LogFilters::default(), 0, 50)?;
+        let json_row = all
+            .data
+            .iter()
+            .find(|r| r.request_id == "proj-json")
+            .unwrap();
+        let payload = serde_json::to_value(json_row).expect("RequestLogDetail 应可序列化");
+        assert_eq!(payload["projectDir"], "/y");
+        assert_eq!(payload["projectRouted"], true);
+
+        let plain_row = all
+            .data
+            .iter()
+            .find(|r| r.request_id == "proj-plain")
+            .unwrap();
+        let plain_payload = serde_json::to_value(plain_row).expect("RequestLogDetail 应可序列化");
+        assert!(
+            plain_payload.get("projectDir").is_none(),
+            "None 时 projectDir 键应缺席"
+        );
+        assert_eq!(plain_payload["projectRouted"], false);
+
+        let filters: LogFilters =
+            serde_json::from_str(r#"{"projectDir":"/a"}"#).expect("LogFilters 应可反序列化");
+        assert_eq!(filters.project_dir.as_deref(), Some("/a"));
         Ok(())
     }
 }

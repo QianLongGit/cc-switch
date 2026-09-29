@@ -39,6 +39,19 @@ use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
+/// 成功落位后是否触发全局"当前供应商"切换（4 处判定共用的唯一口径）
+///
+/// - 现状语义：未绑定请求且实际出口与请求开始时的 current 漂移 → true（同步 UI/托盘）
+/// - 绑定路由的请求永不切换：项目绑定是 per-request 的定向出口，不代表全局选择，
+///   改写全局 current 会把其他项目的请求一并带走（spec §5 细则 7）
+pub(crate) fn should_switch_to_provider(
+    current_provider_id_at_start: &str,
+    provider_id: &str,
+    project_routed: bool,
+) -> bool {
+    !project_routed && current_provider_id_at_start != provider_id
+}
+
 fn codex_bearer_access_token(headers: &http::HeaderMap) -> Option<&str> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)?
@@ -188,6 +201,8 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// 请求是否经项目绑定路由（绑定请求不改写全局 current，spec §5 细则 7）
+    project_routed: bool,
 }
 
 impl RequestForwarder {
@@ -255,6 +270,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        project_routed: bool,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -278,6 +294,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            project_routed,
         }
     }
 
@@ -558,8 +575,11 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = should_switch_to_provider(
+                            &self.current_provider_id_at_start,
+                            &provider.id,
+                            self.project_routed,
+                        );
                         if should_switch {
                             status.failover_count += 1;
 
@@ -661,9 +681,11 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = should_switch_to_provider(
+                                            &self.current_provider_id_at_start,
+                                            &provider.id,
+                                            self.project_routed,
+                                        );
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -807,9 +829,11 @@ impl RequestForwarder {
                                             let mut status = self.status.write().await;
                                             status.success_requests += 1;
                                             status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
-                                                    != provider.id.as_str();
+                                            let should_switch = should_switch_to_provider(
+                                                &self.current_provider_id_at_start,
+                                                &provider.id,
+                                                self.project_routed,
+                                            );
                                             if should_switch {
                                                 status.failover_count += 1;
 
@@ -971,9 +995,11 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = should_switch_to_provider(
+                                            &self.current_provider_id_at_start,
+                                            &provider.id,
+                                            self.project_routed,
+                                        );
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -3892,7 +3918,29 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            project_routed: false,
         }
+    }
+
+    #[test]
+    fn should_switch_true_only_for_unbound_drift() {
+        // 未绑定请求：实际出口与开始时 current 漂移 → 触发全局切换（现状语义，
+        // spec §9 回归之二「未绑定请求 failover 后切换行为与现状一致」）
+        assert!(should_switch_to_provider("a", "b", false));
+    }
+
+    #[test]
+    fn should_switch_false_when_same_provider() {
+        // 未绑定 + 出口即 current：无需切换（现状语义）
+        assert!(!should_switch_to_provider("a", "a", false));
+    }
+
+    #[test]
+    fn should_switch_never_when_project_routed() {
+        // 绑定路由的请求永不触发全局"当前供应商"切换，即便出口与 current 漂移
+        // （spec §5 细则 7；spec §9 回归之一「绑定请求成功后全局 current 不变」，
+        // forwarder 全部 4 处判定统一走本函数，此测试即该回归的静态保障锚点）
+        assert!(!should_switch_to_provider("a", "b", true));
     }
 
     #[test]

@@ -18,6 +18,10 @@ export interface RequestLog {
   visionRouted?: boolean;
   /** 写入时实际用于计价的模型名；路由接管 + request 计价模式下可能与 model 不同 */
   pricingModel?: string;
+  /** 来源项目路径（项目绑定路由归因）；undefined = 未识别或 v21 前历史行。camelCase 对齐后端 project_dir */
+  projectDir?: string;
+  /** 是否因项目绑定改变路由——据此展示项目路由标记。camelCase 对齐后端 project_routed */
+  projectRouted?: boolean;
   costMultiplier: string;
   inputTokens: number;
   outputTokens: number;
@@ -138,6 +142,8 @@ export interface LogFilters {
   statusCode?: number;
   startDate?: number;
   endDate?: number;
+  /** 来源项目路径精确匹配（camelCase 对齐后端 project_dir）；undefined = 不筛选 */
+  projectDir?: string;
 }
 
 /**

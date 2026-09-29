@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   Loader2,
   RefreshCw,
+  Route,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -107,6 +108,7 @@ import ToolsPanel from "@/components/openclaw/ToolsPanel";
 import AgentsDefaultsPanel from "@/components/openclaw/AgentsDefaultsPanel";
 import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel from "@/components/hermes/HermesMemoryPanel";
+import { ProjectRoutingPage } from "@/components/projectRouting/ProjectRoutingPage";
 import {
   APP_IDS,
   DEFAULT_VISIBLE_APPS,
@@ -127,7 +129,8 @@ type View =
   | "openclawEnv"
   | "openclawTools"
   | "openclawAgents"
-  | "hermesMemory";
+  | "hermesMemory"
+  | "projectRouting";
 
 interface SyncStatusUpdatedPayload {
   source?: string;
@@ -163,6 +166,7 @@ const VALID_VIEWS: View[] = [
   "openclawTools",
   "openclawAgents",
   "hermesMemory",
+  "projectRouting",
 ];
 
 const getInitialView = (): View => {
@@ -1110,6 +1114,8 @@ function App() {
           return <ToolsPanel />;
         case "openclawAgents":
           return <AgentsDefaultsPanel />;
+        case "projectRouting":
+          return <ProjectRoutingPage />;
         default:
           return (
             <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
@@ -1346,6 +1352,8 @@ function App() {
                   {currentView === "openclawAgents" &&
                     t("openclaw.agents.title")}
                   {currentView === "hermesMemory" && t("hermes.memory.title")}
+                  {currentView === "projectRouting" &&
+                    t("projectRouting.title")}
                 </h1>
               </div>
             ) : (
@@ -1739,6 +1747,17 @@ function App() {
                               >
                                 <History className="flex-shrink-0 w-4 h-4" />
                               </Button>
+                              {sharedFeatureApp === "claude" && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => setCurrentView("projectRouting")}
+                                  className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                                  title={t("projectRouting.title")}
+                                >
+                                  <Route className="flex-shrink-0 w-4 h-4" />
+                                </Button>
+                              )}
                               {hasMcpSupport && (
                                 <Button
                                   variant="ghost"

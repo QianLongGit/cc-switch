@@ -1715,6 +1715,7 @@
     "multiplier": "Multiplier",
     "requestModel": "Request Model",
     "visionRouteBadge": "[Image]",
+    "projectRouteBadge": "[Route]",
     "responseModel": "Response Model",
     "noData": "No data",
     "unknownProvider": "Unknown Provider",
@@ -1786,6 +1787,7 @@
     "displayNamePlaceholder": "e.g., Claude 3.5 Sonnet",
     "appType": "App Type",
     "statusCode": "Status Code",
+    "projectDir": "Project",
     "allSources": "All Sources",
     "allModels": "All Models",
     "filterBySource": "Filter by source",
@@ -3271,5 +3273,30 @@
     "expiredHint": "Run the {{tool}} command to refresh your login",
     "queryFailed": "Query failed",
     "refresh": "Refresh"
+  },
+  "projectRouting": {
+    "title": "Project Routing",
+    "subtitle": "Bind projects to specific providers; bound requests skip the global failover queue and never switch the global current provider",
+    "column": {
+      "project": "Project",
+      "activity": "Last Active",
+      "provider": "Provider",
+      "sync": "Sync Status"
+    },
+    "default": "Default (no binding)",
+    "invalid": "Invalid",
+    "inUse": "In Use",
+    "sync": {
+      "synced": "Synced",
+      "outOfSync": "Out of sync",
+      "orphan": "Inert X-CC-Project header (not routed)",
+      "fix": "Fix",
+      "clear": "Clear"
+    },
+    "empty": "No recent projects detected yet. Open a directory with Claude Code and it will show up here.",
+    "toast": {
+      "saved": "Saved",
+      "failed": "Operation failed: {{error}}"
+    }
   }
 }

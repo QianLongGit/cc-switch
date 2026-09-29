@@ -1715,6 +1715,7 @@
     "multiplier": "倍率",
     "requestModel": "请求模型",
     "visionRouteBadge": "[图片]",
+    "projectRouteBadge": "[路由]",
     "responseModel": "返回模型",
     "noData": "暂无数据",
     "unknownProvider": "未知供应商",
@@ -1786,6 +1787,7 @@
     "displayNamePlaceholder": "例如: Claude 3.5 Sonnet",
     "appType": "应用类型",
     "statusCode": "状态码",
+    "projectDir": "项目",
     "allSources": "全部来源",
     "allModels": "全部模型",
     "filterBySource": "按来源筛选",
@@ -3271,5 +3273,30 @@
     "expiredHint": "请运行 {{tool}} 命令刷新登录",
     "queryFailed": "查询失败",
     "refresh": "刷新"
+  },
+  "projectRouting": {
+    "title": "项目路由",
+    "subtitle": "将项目绑定到指定供应商；绑定请求不进全局故障转移队列，也不会改写全局当前供应商",
+    "column": {
+      "project": "项目",
+      "activity": "最近活跃",
+      "provider": "供应商",
+      "sync": "同步状态"
+    },
+    "default": "默认（不绑定）",
+    "invalid": "已失效",
+    "inUse": "使用中",
+    "sync": {
+      "synced": "已同步",
+      "outOfSync": "未同步",
+      "orphan": "检测到未生效的 X-CC-Project（不参与路由）",
+      "fix": "修复",
+      "clear": "清除"
+    },
+    "empty": "暂未探测到近期活跃的项目。用 Claude Code 打开一个目录后，它会出现在这里。",
+    "toast": {
+      "saved": "已保存",
+      "failed": "操作失败：{{error}}"
+    }
   }
 }

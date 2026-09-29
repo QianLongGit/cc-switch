@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq, Eq)]
+// ============================================================================
+// 语义哈希字段清单（spec §10 风险 1）
+// ----------------------------------------------------------------------------
+// 归因字段（vision_routed / project_dir / project_routed）不参与语义哈希：
+// 它们描述"这条请求从哪来、怎么路由"，而非"这条请求消耗了什么"。
+// 同语义重放仅归因不同 → 幂等短路；若误入哈希会走 collision 回退多插一行。
+// ============================================================================
 struct UsageSemantic {
     app_type: String,
     provider_id: String,
@@ -87,6 +94,11 @@ pub struct RequestLog {
     pub cost_multiplier: String,
     /// 是否走了图片分支（视觉路由）——历史日志据此展示 [图片] 前缀
     pub vision_routed: bool,
+    /// 来源项目路径（项目绑定路由归因）；None = 未识别（无 X-CC-Project header /
+    /// 解码失败 / 非 claude app_type），存量行为 NULL
+    pub project_dir: Option<String>,
+    /// 是否因项目绑定改变路由（绑定请求不改写全局 current，spec §5 细则 7）
+    pub project_routed: bool,
 }
 
 /// 使用量记录器
@@ -175,8 +187,9 @@ impl<'a> UsageLogger<'a> {
                 input_token_semantics,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
-                provider_type, is_streaming, cost_multiplier, created_at, vision_routed
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
+                provider_type, is_streaming, cost_multiplier, created_at, vision_routed,
+                project_dir, project_routed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)"
         );
         let affected_rows = conn
             .execute(
@@ -208,6 +221,8 @@ impl<'a> UsageLogger<'a> {
                     log.cost_multiplier,
                     created_at,
                     log.vision_routed as i64,
+                    log.project_dir,
+                    log.project_routed as i64,
                 ],
             )
             .map_err(|e| AppError::Database(format!("记录请求日志失败: {e}")))?;
@@ -290,6 +305,8 @@ impl<'a> UsageLogger<'a> {
             is_streaming: false,
             cost_multiplier: "1.0".to_string(),
             vision_routed: false,
+            project_dir: None,
+            project_routed: false,
         };
 
         self.log_request(&log)
@@ -332,6 +349,8 @@ impl<'a> UsageLogger<'a> {
             is_streaming,
             cost_multiplier: "1.0".to_string(),
             vision_routed: false,
+            project_dir: None,
+            project_routed: false,
         };
 
         self.log_request(&log)
@@ -465,6 +484,8 @@ impl<'a> UsageLogger<'a> {
         provider_type: Option<String>,
         is_streaming: bool,
         vision_routed: bool,
+        project_dir: Option<String>,
+        project_routed: bool,
     ) -> Result<(), AppError> {
         let pricing = self.get_model_pricing(&pricing_model)?;
 
@@ -502,6 +523,8 @@ impl<'a> UsageLogger<'a> {
             is_streaming,
             cost_multiplier: cost_multiplier.to_string(),
             vision_routed,
+            project_dir,
+            project_routed,
         };
 
         self.log_request(&log)
@@ -538,6 +561,8 @@ mod tests {
             is_streaming: true,
             cost_multiplier: "1".to_string(),
             vision_routed: false,
+            project_dir: None,
+            project_routed: false,
         }
     }
 
@@ -582,6 +607,8 @@ mod tests {
             None,
             Some("claude".to_string()),
             false,
+            false,
+            None,
             false,
         )?;
 
@@ -629,6 +656,8 @@ mod tests {
             None,
             false,
             true,
+            None,
+            false,
         )?;
 
         let conn = crate::database::lock_conn!(db.conn);
@@ -842,6 +871,8 @@ mod tests {
             is_streaming: false,
             cost_multiplier: "1".to_string(),
             vision_routed: false,
+            project_dir: None,
+            project_routed: false,
         };
 
         logger.log_request(&log)?;
@@ -853,6 +884,90 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(semantics, INPUT_TOKEN_SEMANTICS_TOTAL);
+        Ok(())
+    }
+
+    #[test]
+    fn log_request_persists_project_fields() -> Result<(), AppError> {
+        // 归因链路（落库端）：handlers 两侧的 log_usage / log_usage_internal 最终
+        // 都经 log_with_calculation 构造 RequestLog——以同一入口注入 project 字段，
+        // SQL 直查验证两列按 INSERT 尾部 ?27/?28 的列序正确写入。
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+
+        logger.log_with_calculation(
+            "project-1".to_string(),
+            "provider-1".to_string(),
+            "claude".to_string(),
+            "glm-5.3".to_string(),
+            "alias".to_string(),
+            "glm-5.3".to_string(),
+            TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                model: None,
+                message_id: None,
+            },
+            Decimal::from(1),
+            10,
+            None,
+            200,
+            None,
+            None,
+            false,
+            false,
+            Some("/Users/dev/Project/cc-switch".to_string()),
+            true,
+        )?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (project_dir, project_routed): (Option<String>, i64) = conn.query_row(
+            "SELECT project_dir, project_routed
+             FROM proxy_request_logs WHERE request_id = 'project-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            project_dir.as_deref(),
+            Some("/Users/dev/Project/cc-switch"),
+            "project_dir 应按插入列序往返"
+        );
+        assert_eq!(project_routed, 1, "project_routed=true 应落库为 1");
+        Ok(())
+    }
+
+    #[test]
+    fn project_fields_not_in_semantic_hash() -> Result<(), AppError> {
+        // spec §10 风险 1：归因字段（vision_routed / project_*）不参与语义哈希。
+        // 同语义两条、仅 project 字段不同 → 第二次写入命中幂等短路，
+        // 返回 Ok 且表内仍 1 行；若误入哈希则会走 collision 回退多插一行。
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+
+        let first = request_log("dup-project", 10);
+        let mut second = first.clone();
+        second.project_dir = Some("/Users/dev/Project/other".to_string());
+        second.project_routed = true;
+
+        logger.log_request(&first)?;
+        logger.log_request(&second)?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'dup-project'",
+            [],
+            |row| row.get(0),
+        )?;
+        let fallback_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE request_id LIKE 'dup-project:collision:%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1, "仅 project 字段不同的重放应幂等跳过");
+        assert_eq!(fallback_count, 0, "不应触发 collision 回退插入");
         Ok(())
     }
 }

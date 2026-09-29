@@ -5,6 +5,7 @@
 pub mod failover;
 pub mod mcp;
 pub mod profiles;
+pub mod project_routes;
 pub mod prompts;
 pub mod providers;
 pub mod providers_seed;

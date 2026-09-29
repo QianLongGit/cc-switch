@@ -1716,6 +1716,7 @@
     "multiplier": "倍率",
     "requestModel": "請求模型",
     "visionRouteBadge": "[圖片]",
+    "projectRouteBadge": "[路由]",
     "responseModel": "回傳模型",
     "noData": "暫無資料",
     "unknownProvider": "未知供應商",
@@ -1787,6 +1788,7 @@
     "displayNamePlaceholder": "例如: Claude 3.5 Sonnet",
     "appType": "應用程式類型",
     "statusCode": "狀態碼",
+    "projectDir": "專案",
     "allSources": "全部來源",
     "allModels": "全部模型",
     "filterBySource": "依來源篩選",
@@ -3272,5 +3274,30 @@
     "expiredHint": "請執行 {{tool}} 命令重新整理登入",
     "queryFailed": "查詢失敗",
     "refresh": "重新整理"
+  },
+  "projectRouting": {
+    "title": "專案路由",
+    "subtitle": "將專案綁定到指定供應商；綁定請求不進全域故障轉移佇列，也不會改寫全域目前供應商",
+    "column": {
+      "project": "專案",
+      "activity": "最近活躍",
+      "provider": "供應商",
+      "sync": "同步狀態"
+    },
+    "default": "預設（不綁定）",
+    "invalid": "已失效",
+    "inUse": "使用中",
+    "sync": {
+      "synced": "已同步",
+      "outOfSync": "未同步",
+      "orphan": "偵測到未生效的 X-CC-Project（不參與路由）",
+      "fix": "修復",
+      "clear": "清除"
+    },
+    "empty": "尚未偵測到近期活躍的專案。用 Claude Code 開啟一個目錄後，它會出現在這裡。",
+    "toast": {
+      "saved": "已儲存",
+      "failed": "操作失敗：{{error}}"
+    }
   }
 }

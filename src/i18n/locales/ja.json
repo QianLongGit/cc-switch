@@ -1715,6 +1715,7 @@
     "multiplier": "倍率",
     "requestModel": "リクエストモデル",
     "visionRouteBadge": "[画像]",
+    "projectRouteBadge": "[ルート]",
     "responseModel": "レスポンスモデル",
     "noData": "データなし",
     "unknownProvider": "不明なプロバイダー",
@@ -1786,6 +1787,7 @@
     "displayNamePlaceholder": "例: Claude 3.5 Sonnet",
     "appType": "アプリ種別",
     "statusCode": "ステータスコード",
+    "projectDir": "プロジェクト",
     "allSources": "すべてのソース",
     "allModels": "すべてのモデル",
     "filterBySource": "ソースで絞り込む",
@@ -3271,5 +3273,30 @@
     "expiredHint": "{{tool}}コマンドを実行してログインを更新してください",
     "queryFailed": "クエリに失敗しました",
     "refresh": "更新"
+  },
+  "projectRouting": {
+    "title": "プロジェクトルーティング",
+    "subtitle": "プロジェクトを特定のプロバイダーにバインドします。バインドされたリクエストはグローバルフェイルオーバーキューを経由せず、グローバルの現在プロバイダーも切り替えません",
+    "column": {
+      "project": "プロジェクト",
+      "activity": "最終アクティブ",
+      "provider": "プロバイダー",
+      "sync": "同期状態"
+    },
+    "default": "デフォルト（バインドなし）",
+    "invalid": "無効",
+    "inUse": "使用中",
+    "sync": {
+      "synced": "同期済み",
+      "outOfSync": "未同期",
+      "orphan": "無効な X-CC-Project を検出（ルーティングに影響しません）",
+      "fix": "修復",
+      "clear": "クリア"
+    },
+    "empty": "最近アクティブなプロジェクトはまだ検出されていません。Claude Code でディレクトリを開くとここに表示されます。",
+    "toast": {
+      "saved": "保存しました",
+      "failed": "操作に失敗しました：{{error}}"
+    }
   }
 }

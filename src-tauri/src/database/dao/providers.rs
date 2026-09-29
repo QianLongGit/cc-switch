@@ -377,12 +377,27 @@ impl Database {
     }
 
     pub fn delete_provider(&self, app_type: &str, id: &str) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-        conn.execute(
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 级联清理项目绑定行（spec §4.1）：上层删除入口分散（commands / services 多分支），
+        // 挂在 DAO 一处即覆盖全部入口；与供应商行删除同事务提交，精确匹配 (provider_id, app_type)
+        // 避免跨 app_type 同名 id 误删
+        tx.execute(
+            "DELETE FROM project_routes WHERE provider_id = ?1 AND app_type = ?2",
+            params![id, app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.execute(
             "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
             params![id, app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 

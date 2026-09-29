@@ -1301,3 +1301,194 @@ fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
         "file db should persist INCREMENTAL auto_vacuum after VACUUM rebuild"
     );
 }
+
+// ============================================================================
+// 项目路由（Project Routing）schema v21：
+//   project_routes / settings_local_backup 新表 + proxy_request_logs
+//   项目归因两列（spec §4.1/§4.2/§4.3）
+// ============================================================================
+
+// 新库：裸 Connection 走完 create_tables + migrations 后 user_version == 21，
+// 两张新表关键列齐。Database::memory() 只走 create_tables 不走迁移
+// （user_version 恒 0），不能用它断言版本号。
+#[test]
+fn fresh_db_has_project_routes_table_and_version_21() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version after migration"),
+        21
+    );
+
+    let app_type = get_column_info(&conn, "project_routes", "app_type");
+    assert_eq!(app_type.r#type, "TEXT");
+    assert_eq!(app_type.notnull, 1);
+    assert_eq!(
+        normalize_default(&app_type.default).as_deref(),
+        Some("claude")
+    );
+
+    let content = get_column_info(&conn, "settings_local_backup", "content");
+    assert_eq!(content.r#type, "TEXT");
+    assert_eq!(content.notnull, 1);
+}
+
+// memory() 路径：新表存在 + 日志表两列齐（不断言版本号，见上）
+#[test]
+fn memory_db_has_project_tables_and_columns() {
+    let db = Database::memory().expect("create memory db");
+    let conn = db.conn.lock().expect("lock conn");
+
+    assert!(Database::table_exists(&conn, "project_routes").expect("check project_routes"));
+    assert!(
+        Database::table_exists(&conn, "settings_local_backup")
+            .expect("check settings_local_backup")
+    );
+
+    let project_dir = get_column_info(&conn, "proxy_request_logs", "project_dir");
+    assert_eq!(project_dir.r#type, "TEXT");
+    assert_eq!(project_dir.notnull, 0);
+
+    let project_routed = get_column_info(&conn, "proxy_request_logs", "project_routed");
+    assert_eq!(project_routed.r#type, "INTEGER");
+    assert_eq!(project_routed.notnull, 1);
+    assert_eq!(
+        normalize_default(&project_routed.default).as_deref(),
+        Some("0")
+    );
+}
+
+// UNIQUE(project_path, app_type)：一项目一 app 至多一条绑定；跨 app_type 同路径可共存
+#[test]
+fn project_routes_unique_project_app() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+
+    conn.execute(
+        "INSERT INTO project_routes (id, project_path, app_type, provider_id, updated_at)
+         VALUES ('r1', '/Users/dev/proj', 'claude', 'p1', 1700000000)",
+        [],
+    )
+    .expect("insert first route");
+
+    let dup = conn.execute(
+        "INSERT INTO project_routes (id, project_path, app_type, provider_id, updated_at)
+         VALUES ('r2', '/Users/dev/proj', 'claude', 'p2', 1700000001)",
+        [],
+    );
+    let err = dup.expect_err("same (project_path, app_type) must violate UNIQUE");
+    assert!(
+        err.to_string().contains("UNIQUE"),
+        "unexpected error: {err}"
+    );
+
+    conn.execute(
+        "INSERT INTO project_routes (id, project_path, app_type, provider_id, updated_at)
+         VALUES ('r3', '/Users/dev/proj', 'codex', 'p2', 1700000002)",
+        [],
+    )
+    .expect("same path under other app_type should be allowed");
+}
+
+// 新库路径：日志表建表 DDL 直接含项目归因两列
+#[test]
+fn fresh_request_logs_have_project_columns() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+
+    let project_dir = get_column_info(&conn, "proxy_request_logs", "project_dir");
+    assert_eq!(project_dir.r#type, "TEXT");
+    assert_eq!(project_dir.notnull, 0);
+    assert!(
+        project_dir.default.is_none(),
+        "project_dir should be nullable without default"
+    );
+
+    let project_routed = get_column_info(&conn, "proxy_request_logs", "project_routed");
+    assert_eq!(project_routed.r#type, "INTEGER");
+    assert_eq!(project_routed.notnull, 1);
+    assert_eq!(
+        normalize_default(&project_routed.default).as_deref(),
+        Some("0")
+    );
+}
+
+// 老库迁移 v20 -> v21：列补齐、旧行保留（project_dir IS NULL / project_routed = 0）、
+// 版本到位；新表在老库升级路径同样补建（create_tables IF NOT EXISTS）
+#[test]
+fn v20_db_migrates_to_v21_keeping_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+
+    // v20 形状的日志表：完整列（含 session_id 等，create_tables 的索引
+    // 创建会引用）但缺项目归因两列，并预置一行历史日志
+    conn.execute_batch(
+        r#"
+        CREATE TABLE proxy_request_logs (
+            request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
+            request_model TEXT,
+            pricing_model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            input_token_semantics INTEGER NOT NULL DEFAULT 0,
+            input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
+            cache_read_cost_usd TEXT NOT NULL DEFAULT '0', cache_creation_cost_usd TEXT NOT NULL DEFAULT '0',
+            total_cost_usd TEXT NOT NULL DEFAULT '0', latency_ms INTEGER NOT NULL, first_token_ms INTEGER,
+            duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
+            provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
+            cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            vision_routed INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO proxy_request_logs
+            (request_id, provider_id, app_type, model, latency_ms, status_code, created_at)
+        VALUES ('req-1', 'p1', 'claude', 'kimi-k2', 120, 200, 1700000000);
+        "#,
+    )
+    .expect("seed v20 logs table");
+    Database::set_user_version(&conn, 20).expect("set user_version=20");
+
+    // 按应用启动流程：先 create_tables（补建新表），再按 user_version 迁移
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    let project_dir = get_column_info(&conn, "proxy_request_logs", "project_dir");
+    assert_eq!(project_dir.r#type, "TEXT");
+    assert_eq!(project_dir.notnull, 0);
+
+    let project_routed = get_column_info(&conn, "proxy_request_logs", "project_routed");
+    assert_eq!(project_routed.r#type, "INTEGER");
+    assert_eq!(project_routed.notnull, 1);
+    assert_eq!(
+        normalize_default(&project_routed.default).as_deref(),
+        Some("0")
+    );
+
+    // 旧行保留，归因字段回落到未识别默认值
+    let (legacy_dir, legacy_routed): (Option<String>, i64) = conn
+        .query_row(
+            "SELECT project_dir, project_routed FROM proxy_request_logs WHERE request_id = 'req-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read legacy row");
+    assert_eq!(legacy_dir, None);
+    assert_eq!(legacy_routed, 0);
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        21
+    );
+
+    assert!(
+        Database::table_exists(&conn, "project_routes").expect("check project_routes"),
+        "project_routes should be created on the upgrade path"
+    );
+    assert!(
+        Database::table_exists(&conn, "settings_local_backup")
+            .expect("check settings_local_backup"),
+        "settings_local_backup should be created on the upgrade path"
+    );
+}

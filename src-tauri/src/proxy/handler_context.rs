@@ -4,6 +4,7 @@
 
 use crate::app_config::AppType;
 use crate::provider::Provider;
+use crate::proxy::project_header::percent_decode_project_path;
 use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
@@ -75,6 +76,11 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 项目绑定路由解出的合法项目路径；无 header / decode 失败 / 非 claude → None。
+    /// 归因落库链（handlers / response_processor → logger）由此取值
+    pub project_dir: Option<String>,
+    /// 本条请求是否经项目绑定路由（绑定请求不改写全局 current，spec §5 细则 7）
+    pub project_routed: bool,
 }
 
 impl RequestContext {
@@ -135,10 +141,12 @@ impl RequestContext {
         );
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额；
+        // claude 请求先解出项目绑定标识，命中绑定时由路由层重排候选链（spec §5）
+        let project_dir = extract_project_dir(headers, app_type_str);
+        let (providers, project_routed) = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers_for_request(app_type_str, project_dir.as_deref())
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
@@ -179,6 +187,8 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            project_dir,
+            project_routed,
         })
     }
 
@@ -247,6 +257,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            self.project_routed,
         )
     }
 
@@ -304,9 +315,67 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 纯函数：从请求头解出项目绑定标识（仅 claude，spec §5 细则 8）
+///
+/// - 非 claude app_type → None（项目路由不介入）
+/// - 仅 claude 且 `X-CC-Project` header 值 percent-decode 合法 → Some(真实路径)
+/// - 无 header / header 值非法 percent 序列 / 非 UTF-8 → None（静默回默认策略，不报错不 panic）
+pub(crate) fn extract_project_dir(
+    headers: &axum::http::HeaderMap,
+    app_type_str: &str,
+) -> Option<String> {
+    if app_type_str != AppType::Claude.as_str() {
+        return None;
+    }
+    headers
+        .get("x-cc-project")
+        .and_then(|v| v.to_str().ok())
+        .and_then(percent_decode_project_path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, extract_project_dir};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    /// 构造仅含 X-CC-Project 的请求头（HeaderName 名称大小写不敏感，from_static 取小写基准）
+    fn project_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-cc-project"),
+            HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn extract_project_dir_from_valid_header() {
+        // percent-encode 态的 "/Users/x/项目" → 解码还原真实路径
+        let headers = project_headers("/Users/x/%E9%A1%B9%E7%9B%AE");
+        assert_eq!(
+            extract_project_dir(&headers, "claude").as_deref(),
+            Some("/Users/x/项目"),
+        );
+    }
+
+    #[test]
+    fn extract_project_dir_none_when_decode_fails() {
+        // 非法 percent 序列：header 值整体无效，静默回默认策略，不 panic（Review Focus 1）
+        let headers = project_headers("%zz");
+        assert_eq!(extract_project_dir(&headers, "claude"), None);
+    }
+
+    #[test]
+    fn extract_project_dir_none_when_header_absent() {
+        assert_eq!(extract_project_dir(&HeaderMap::new(), "claude"), None);
+    }
+
+    #[test]
+    fn extract_project_dir_none_for_non_claude() {
+        // 项目绑定仅对 claude 生效：非 claude 即便 header 合法也不介入（spec §5 细则 8）
+        let headers = project_headers("/Users/x/%E9%A1%B9%E7%9B%AE");
+        assert_eq!(extract_project_dir(&headers, "codex"), None);
+    }
 
     #[test]
     fn extract_model_with_action() {

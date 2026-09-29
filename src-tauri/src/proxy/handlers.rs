@@ -316,6 +316,10 @@ struct ClaudeUsageLog {
     is_streaming: bool,
     /// 是否走了图片分支（视觉路由）——历史日志展示 [图片] 前缀
     vision_routed: bool,
+    /// 来源项目路径（项目绑定路由归因）；None = 未识别
+    project_dir: Option<String>,
+    /// 是否因项目绑定改变路由
+    project_routed: bool,
 }
 
 fn prepare_claude_usage_log(
@@ -350,6 +354,8 @@ fn prepare_claude_usage_log(
         status_code,
         is_streaming,
         vision_routed: ctx.vision_routed,
+        project_dir: ctx.project_dir.clone(),
+        project_routed: ctx.project_routed,
     })
 }
 
@@ -368,6 +374,8 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         log.status_code,
         Some(log.session_id),
         log.vision_routed,
+        log.project_dir,
+        log.project_routed,
     )
     .await;
 }
@@ -478,6 +486,8 @@ async fn handle_claude_transform(
             // "claude" 会把 claude-desktop 的行错记到 claude 名下
             let app_type_str = ctx.app_type_str;
             let vision_routed = ctx.vision_routed;
+            let project_dir = ctx.project_dir.clone();
+            let project_routed = ctx.project_routed;
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -495,6 +505,7 @@ async fn handle_claude_transform(
                         let session_id = session_id.clone();
                         let request_model = request_model.clone();
                         let outbound_model = fallback_model.clone();
+                        let project_dir = project_dir.clone();
 
                         tokio::spawn(async move {
                             log_usage(
@@ -511,6 +522,8 @@ async fn handle_claude_transform(
                                 status_code,
                                 Some(session_id),
                                 vision_routed,
+                                project_dir,
+                                project_routed,
                             )
                             .await;
                         });
@@ -1290,6 +1303,8 @@ async fn handle_codex_xai_native_responses_rewrite(
                     let provider_id = ctx.provider.id.clone();
                     let session_id = ctx.session_id.clone();
                     let latency_ms = ctx.latency_ms();
+                    let project_dir = ctx.project_dir.clone();
+                    let project_routed = ctx.project_routed;
                     async move {
                         log_usage(
                             &state,
@@ -1305,6 +1320,8 @@ async fn handle_codex_xai_native_responses_rewrite(
                             status.as_u16(),
                             Some(session_id),
                             false,
+                            project_dir,
+                            project_routed,
                         )
                         .await;
                     }
@@ -1374,6 +1391,8 @@ async fn handle_codex_chat_to_responses_transform(
             let app_type_str = ctx.app_type_str;
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let project_dir = ctx.project_dir.clone();
+            let project_routed = ctx.project_routed;
 
             Some(SseUsageCollector::new(
                 start_time,
@@ -1402,6 +1421,7 @@ async fn handle_codex_chat_to_responses_transform(
                     let request_model = request_model.clone();
                     let outbound_model = fallback_model.clone();
                     let session_id = session_id.clone();
+                    let project_dir = project_dir.clone();
 
                     tokio::spawn(async move {
                         log_usage(
@@ -1418,6 +1438,8 @@ async fn handle_codex_chat_to_responses_transform(
                             status.as_u16(),
                             Some(session_id),
                             false,
+                            project_dir,
+                            project_routed,
                         )
                         .await;
                     });
@@ -1525,6 +1547,8 @@ async fn handle_codex_chat_to_responses_transform(
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
+            let project_dir = ctx.project_dir.clone();
+            let project_routed = ctx.project_routed;
             async move {
                 log_usage(
                     &state,
@@ -1540,6 +1564,8 @@ async fn handle_codex_chat_to_responses_transform(
                     status.as_u16(),
                     Some(session_id),
                     false,
+                    project_dir,
+                    project_routed,
                 )
                 .await;
             }
@@ -1691,6 +1717,8 @@ async fn handle_codex_anthropic_to_responses_transform(
             let provider_id = ctx.provider.id.clone();
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
+            let project_dir = ctx.project_dir.clone();
+            let project_routed = ctx.project_routed;
             async move {
                 log_usage(
                     &state,
@@ -1706,6 +1734,8 @@ async fn handle_codex_anthropic_to_responses_transform(
                     status.as_u16(),
                     Some(session_id),
                     false,
+                    project_dir,
+                    project_routed,
                 )
                 .await;
             }
@@ -1756,6 +1786,8 @@ fn build_codex_anthropic_sse_response(
         let app_type_str = ctx.app_type_str;
         let start_time = ctx.start_time;
         let session_id = ctx.session_id.clone();
+        let project_dir = ctx.project_dir.clone();
+        let project_routed = ctx.project_routed;
 
         Some(SseUsageCollector::new(
             start_time,
@@ -1778,6 +1810,7 @@ fn build_codex_anthropic_sse_response(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let session_id = session_id.clone();
+                let project_dir = project_dir.clone();
 
                 tokio::spawn(async move {
                     log_usage(
@@ -1794,6 +1827,8 @@ fn build_codex_anthropic_sse_response(
                         status.as_u16(),
                         Some(session_id),
                         false,
+                        project_dir,
+                        project_routed,
                     )
                     .await;
                 });
@@ -2831,6 +2866,8 @@ async fn log_usage(
     status_code: u16,
     session_id: Option<String>,
     vision_routed: bool,
+    project_dir: Option<String>,
+    project_routed: bool,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -2867,6 +2904,8 @@ async fn log_usage(
         None, // provider_type
         is_streaming,
         vision_routed,
+        project_dir,
+        project_routed,
     ) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
