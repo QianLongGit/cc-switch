@@ -10,7 +10,8 @@
 //!      无 jsonl 的陈旧残留目录不作为来源
 //!   3. ~/.claude/sessions/*.json —— 当前活跃会话标记（cwd + status）
 //!
-//! 输出统一过滤（项目目录不存在 / 活跃度过旧默认 30 天）后按活跃时间降序；
+//! 输出统一过滤（项目目录不存在 / 活跃度过旧默认 30 天）后按活跃时间降序，
+//! 同刻活跃按路径字典序稳定排序（保证 3s 轮询刷新时列表位置不跳动）；
 //! claude.json 缺失或损坏时靠 jsonl 源降级工作。
 
 use std::collections::HashMap;
@@ -213,7 +214,7 @@ fn scan_sessions(sessions_dir: &Path, merged: &mut HashMap<String, ProjEntry>) {
 }
 
 // ============================================================
-// 收尾：过滤（目录存在 + 未过旧）→ basename → 活跃时间降序
+// 收尾：过滤（目录存在 + 未过旧）→ basename → 活跃时间降序（同刻路径兜底）
 // ============================================================
 
 fn finish(merged: HashMap<String, ProjEntry>, now: i64) -> Vec<ScannedProject> {
@@ -227,7 +228,13 @@ fn finish(merged: HashMap<String, ProjEntry>, now: i64) -> Vec<ScannedProject> {
             has_active_session: e.has_active_session,
         })
         .collect();
-    list.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    list.sort_by(|a, b| {
+        b.last_active_at
+            .cmp(&a.last_active_at)
+            // 同刻活跃（秒级精度下常见 tie）按路径字典序兜底：HashMap 归并
+            // 遍历无序，缺 tie-breaker 时轮询重扫会在 tie 组内洗牌（列表跳动）
+            .then_with(|| a.project_path.cmp(&b.project_path))
+    });
     list
 }
 
@@ -542,5 +549,28 @@ mod tests {
         let list = scan_projects(home.path(), now);
         let paths: Vec<&str> = list.iter().map(|p| p.project_path.as_str()).collect();
         assert_eq!(paths, vec![p1.as_str(), p2.as_str(), p3.as_str()]);
+    }
+
+    #[test]
+    fn tie_last_active_sorted_by_path_stably() {
+        let home = TempDir::new().unwrap();
+        let fx = fixture(&home);
+        let now = chrono::Utc::now().timestamp();
+        // 三项目同刻活跃：last_active_at 归一到秒后 tie 极常见（jsonl mtime
+        // 同秒 / startedAt 毫秒归秒）。排序必须与 HashMap 遍历顺序无关——
+        // 按路径字典序兜底，否则轮询刷新时 tie 组内洗牌、列表位置跳动
+        let pz = fx.real_dir("zzz-last");
+        let pm = fx.real_dir("mmm-last");
+        let pa = fx.real_dir("aaa-last");
+        // 故意乱序铺入（HashMap 迭代顺序不可控，断言序必须唯一确定）
+        fx.claude_json_projects(&[
+            (&pm, json!(now - DAY)),
+            (&pz, json!(now - DAY)),
+            (&pa, json!(now - DAY)),
+        ]);
+
+        let list = scan_projects(home.path(), now);
+        let paths: Vec<&str> = list.iter().map(|p| p.project_path.as_str()).collect();
+        assert_eq!(paths, vec![pa.as_str(), pm.as_str(), pz.as_str()]);
     }
 }
