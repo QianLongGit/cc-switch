@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS settings_local_backup (
 2. **`src-tauri/src/proxy/handler_context.rs`（`RequestContext::new`）**：绑定解析先于 `match stack`。命中 → `stack` 置 `None`（同时压制模型级 StackTarget 与模式级 stack 聚合）、候选链 = `[绑定供应商]`、`project_routed = true`；不改 `auto_failover_enabled`，不切换全局 current 供应商（细则 7 语义保留）。未命中 → 上游 v4.0.0 原逻辑：`stack_mode` → `[current]`，否则 `select_providers_with_current`。
 3. **语义变更**：绑定命中后，绑定供应商故障**不再回退全局 failover 队列**——绑定即唯一出口，失败即失败；绑定悬空（供应商被删）视为未命中，回全局默认策略。
 4. **边界**：请求同时携带 Stack 模型 id 与项目绑定时**绑定胜出**（stack 被压制），转发模型名为 `resolve_stack_target` 改写后的上游名。
+5. **Miss 边界**：请求携带**解不出**的 Stack 前缀模型 id（成员被移除 / 供应商被删 / key 未登记）时，`resolve_stack_target` 的 Miss 在绑定判定之前、于 `src-tauri/src/proxy/handlers.rs` 入口（约 303 行，body 预改写阶段）直接返回 400，**不会**路由到绑定供应商——即第 4 条"绑定胜出"仅覆盖 Stack 解析 Hit 情形，Miss 情形为入口级拒绝。已知边界（审查 Minor）：如需"Miss 时绑定兜底转发"，需后续迭代决策。
+
+**本节取代范围**：§5 细则 1、细则 4（软绑定回退公共队列）、§6.2 第 5 项（`select_providers_for_request`，已删除）、§7.1 前端接入形态描述（合并后实际为 `src/lib/navigation.ts` GlobalPage 体系 + Sidebar globals 入口 + App.tsx renderGlobalPage case）、细则 7 中"4 处判定"行号引用（已收口为 forwarder `finish_success` 单点，实际覆盖 5 个成功出口）——以上均被本修订取代，以本节与现行代码为准。
 
 ## 6. 后端组件设计
 
