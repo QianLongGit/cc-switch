@@ -20,51 +20,6 @@ pub(crate) fn provider_supports_failover(app_type: &str, provider: &Provider) ->
         || !crate::proxy::providers::is_codex_official_provider(provider)
 }
 
-/// 项目绑定路由的重排结果
-pub(crate) struct ProjectRoutePlan {
-    /// 按尝试顺序排列的候选链
-    pub candidates: Vec<Provider>,
-    /// 绑定命中且绑定者位于候选链首位（本请求实际出口由绑定决定，供归因与全局切换排除使用）
-    pub routed: bool,
-}
-
-/// 纯函数：项目绑定语义矩阵重排（spec §5）
-///
-/// - bound=None：base 原样透传（现状语义）
-/// - failover 关 + 绑定：单路由 [绑定者]，忽略 bound_available（跟随 failover 关分支不查熔断的现状）
-/// - failover 开 + 绑定者健康：绑定者置首，其余公共队列依序保留（去重，软绑定降级）
-/// - failover 开 + 绑定者熔断 Open：让位公共队列 base 原样（救场的对偶：绑定者也不可用时不顶替）
-pub(crate) fn apply_project_binding(
-    base: Vec<Provider>,
-    bound: Option<Provider>,
-    failover_enabled: bool,
-    bound_available: bool,
-) -> ProjectRoutePlan {
-    match bound {
-        None => ProjectRoutePlan {
-            candidates: base,
-            routed: false,
-        },
-        Some(p) if !failover_enabled => ProjectRoutePlan {
-            candidates: vec![p],
-            routed: true,
-        },
-        Some(p) if bound_available => {
-            let id = p.id.clone();
-            let mut v = vec![p];
-            v.extend(base.into_iter().filter(|q| q.id != id));
-            ProjectRoutePlan {
-                candidates: v,
-                routed: true,
-            }
-        }
-        Some(_) => ProjectRoutePlan {
-            candidates: base,
-            routed: false,
-        },
-    }
-}
-
 /// 供应商路由器
 pub struct ProviderRouter {
     /// 数据库连接
@@ -88,22 +43,27 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        // 代理模式下路由到代理路由那家，和直连指针无关。
+        let current_provider = AppType::from_str(app_type).ok().and_then(|app_enum| {
+            crate::mode::current::provider_in_use(&self.db, &app_enum)
+                .ok()
+                .flatten()
+        });
+        self.select_providers_with_current(app_type, current_provider)
+            .await
+    }
+
+    /// 同 [`Self::select_providers`]，正在用的那家由调用方给出：处理请求时上下文已经读过
+    /// 一次（要读 `live-state.json` 和这一行），不用每个请求再读一遍，两处用的也一定是
+    /// 同一家。
+    pub async fn select_providers_with_current(
+        &self,
+        app_type: &str,
+        current_provider: Option<Provider>,
+    ) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
-        let current_id = AppType::from_str(app_type)
-            .ok()
-            .and_then(|app_enum| {
-                crate::settings::get_effective_current_provider(&self.db, &app_enum)
-                    .ok()
-                    .flatten()
-            })
-            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
-        let current_provider = current_id
-            .as_deref()
-            .map(|id| self.db.get_provider_by_id(id, app_type))
-            .transpose()?
-            .flatten();
 
         // 检查该应用的自动故障转移开关是否开启（从 proxy_config 表读取）
         let auto_failover_enabled = match self.db.get_proxy_config_for_app(app_type).await {
@@ -175,28 +135,34 @@ impl ProviderRouter {
         Ok(result)
     }
 
-    /// 为单次请求选择候选供应商链（项目绑定路由入口，spec §5）
+    /// 解析项目绑定命中的供应商（项目绑定路由原语，spec §5 + 决策 1）
     ///
-    /// - `project_path=None` 或 `app_type` 非 claude：行为与 `select_providers` 完全一致
-    ///   （逐分支回退现状，细则 8；Codex Official 强制单路由分支由其内部原样保留）
-    /// - 救场分支（细则 1）：failover 开 + 绑定者健康 + 公共队列全熔断/为空
-    ///   （`select_providers` 返回 Err）→ 候选链 = [绑定者]，绑定请求不收到该 Err
-    /// - 返回 routed：绑定命中且绑定者位于候选链首位（细则 7 的全局切换排除标记由此而来）
-    pub async fn select_providers_for_request(
+    /// 返回 `Some(绑定者)` 的唯一条件：claude 请求带合法 `X-CC-Project` 解出的路径，
+    /// 且 `project_routes` 存在绑定行、绑定供应商实体仍可用。命中后调用方应只发往绑定者，
+    /// 完全跳过 Stack 聚合候选链与全局 failover 队列（候选链只剩 [绑定者]，
+    /// 单候选在 forwarder 侧自动绕过熔断闸门）。
+    ///
+    /// 降级矩阵（全部回 `None`，热路径不阻断）：
+    /// - `project_path=None` / `app_type` 非 claude：项目路由不介入（细则 8）
+    /// - 绑定行缺失（项目从未绑定）：走全局策略
+    /// - `find_route` DB Err：按无绑定降级（留告警可观测）
+    /// - 绑定供应商悬空（已删，spec §8 边界 1 兜底路径）：走全局策略
+    ///
+    /// 注意与上面悬空分支的差异化设计：`get_provider_by_id` 的 DB Err 直接上抛不可降级——
+    /// 数据库故障不能被伪装成"绑定悬空"静默走全局队列。
+    pub async fn resolve_project_binding(
         &self,
         app_type: &str,
         project_path: Option<&str>,
-    ) -> Result<(Vec<Provider>, bool), AppError> {
-        // 1. 现状候选链：Result 暂存不立即上抛——公共队列全熔断的 Err 留给救场判定（细则 1）
-        let base: Result<Vec<Provider>, AppError> = self.select_providers(app_type).await;
-
-        // 2. 非 claude / 无项目标识：原样透传（Ok → routed=false，Err 直接上抛）
+    ) -> Result<Option<Provider>, AppError> {
+        // 1. 非 claude / 无项目标识：项目路由不介入
         let Some(project_path) = project_path.filter(|_| app_type == AppType::Claude.as_str())
         else {
-            return base.map(|v| (v, false));
+            return Ok(None);
         };
 
-        // 3. 绑定行缺失（项目从未绑定）→ 原样透传；DB Err 同样按无绑定降级（热路径不阻断），留告警可观测
+        // 2. 绑定行缺失（项目从未绑定）→ 走全局策略；DB Err 同样按无绑定降级
+        //    （热路径不阻断），留告警可观测
         let Some(bound_id) = self
             .db
             .find_route(project_path, app_type)
@@ -206,62 +172,11 @@ impl ProviderRouter {
             .ok()
             .flatten()
         else {
-            return base.map(|v| (v, false));
+            return Ok(None);
         };
 
-        // 4. 防御：绑定供应商已删（悬空行）→ 原样透传（spec §8 边界 1 的兜底路径）
-        //    注意与步骤 3 的差异化设计：find_route 查不到行是可降级语义（无绑定），.ok() 吞掉
-        //    DB Err 一并按"无绑定"回退；而这里供应商 id 存在却取不到实体，若把 DB Err 也吞掉，
-        //    数据库故障会被伪装成"绑定悬空"静默走全局队列——故 Err 直接上抛不可降级。
-        let Some(bound) = self.db.get_provider_by_id(&bound_id, app_type)? else {
-            return base.map(|v| (v, false));
-        };
-
-        // 5. failover 开关每请求直查 DB（细则 2；select_providers 内部那次读不可复用，重读一次与现有模式一致）
-        let failover_enabled = self
-            .db
-            .get_proxy_config_for_app(app_type)
-            .await
-            .map(|config| config.auto_failover_enabled)
-            .unwrap_or(false);
-
-        // 6. 绑定者熔断可用性：仅 failover 开时查询（failover 关分支不查熔断，跟随现状）；
-        //    is_available 只读状态、不消耗 HalfOpen 名额（与队列过滤处的同类用法一致）
-        let bound_available = if failover_enabled {
-            self.get_or_create_circuit_breaker(&format!("{app_type}:{bound_id}"))
-                .await
-                .is_available()
-                .await
-        } else {
-            true
-        };
-
-        // 7. 统一走纯函数重排：Err（公共队列全熔断/无供应商）视为空候选链进入救场判定，
-        //    纯函数产出空候选链时上抛原 Err（绑定者也不可用 → 保持现状错误语义）
-        match base {
-            Ok(candidates) => {
-                let plan = apply_project_binding(
-                    candidates,
-                    Some(bound),
-                    failover_enabled,
-                    bound_available,
-                );
-                Ok((plan.candidates, plan.routed))
-            }
-            Err(e) => {
-                let plan = apply_project_binding(
-                    Vec::new(),
-                    Some(bound),
-                    failover_enabled,
-                    bound_available,
-                );
-                if plan.candidates.is_empty() {
-                    Err(e)
-                } else {
-                    Ok((plan.candidates, plan.routed))
-                }
-            }
-        }
+        // 3. 绑定供应商悬空（已删）→ 走全局策略；DB Err 上抛（见函数级注释）
+        Ok(self.db.get_provider_by_id(&bound_id, app_type)?)
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -770,239 +685,106 @@ mod tests {
     }
 
     // ===================================================================
-    // 项目绑定路由纯函数矩阵（spec §5 四象限 × 熔断状态；无 DB，直接验证 apply_project_binding）
+    // resolve_project_binding 集成（决策 1：项目绑定命中完全压制 Stack 聚合与全局
+    // failover 队列；候选链 [绑定者] 与熔断让位语义由 handler_context / forwarder 承接）
     // ===================================================================
 
     fn plain_provider(id: &str) -> Provider {
         Provider::with_id(id.to_string(), id.to_string(), json!({}), None)
     }
 
-    fn ids(providers: &[Provider]) -> Vec<&str> {
-        providers.iter().map(|p| p.id.as_str()).collect()
-    }
-
-    #[test]
-    fn matrix_no_binding_returns_base_verbatim() {
-        // 无绑定：failover 开/关两态均原样透传（现状语义不变）
-        let base = vec![plain_provider("a"), plain_provider("b")];
-        for failover in [true, false] {
-            let plan = apply_project_binding(base.clone(), None, failover, true);
-            assert_eq!(ids(&plan.candidates), vec!["a", "b"]);
-            assert!(!plan.routed);
-        }
-    }
-
-    #[test]
-    fn matrix_failover_off_bound_single_route() {
-        // failover 关 + 绑定：单路由 [绑定者]，跳过熔断（bound_available=false 仍 [p]，
-        // 跟随 select_providers failover 关分支不查熔断的现状）
-        let plan = apply_project_binding(
-            vec![plain_provider("a"), plain_provider("b")],
-            Some(plain_provider("p")),
-            false,
-            false,
-        );
-        assert_eq!(ids(&plan.candidates), vec!["p"]);
-        assert!(plan.routed);
-    }
-
-    #[test]
-    fn matrix_failover_on_bound_available_prepends() {
-        // failover 开 + 绑定者健康且不在公共队列：置首，其余队列依序保留（软绑定）
-        let plan = apply_project_binding(
-            vec![plain_provider("a"), plain_provider("b")],
-            Some(plain_provider("p")),
-            true,
-            true,
-        );
-        assert_eq!(ids(&plan.candidates), vec!["p", "a", "b"]);
-        assert!(plan.routed);
-    }
-
-    #[test]
-    fn matrix_failover_on_bound_open_yields_to_queue() {
-        // failover 开 + 绑定者熔断 Open：让位公共队列原样，routed=false（归因不误标）
-        let plan = apply_project_binding(
-            vec![plain_provider("a"), plain_provider("b")],
-            Some(plain_provider("p")),
-            true,
-            false,
-        );
-        assert_eq!(ids(&plan.candidates), vec!["a", "b"]);
-        assert!(!plan.routed);
-    }
-
-    #[test]
-    fn matrix_bound_in_queue_deduped() {
-        // 绑定者已在公共队列：去重后置首（恰出现一次）
-        let plan = apply_project_binding(
-            vec![plain_provider("a"), plain_provider("p"), plain_provider("b")],
-            Some(plain_provider("p")),
-            true,
-            true,
-        );
-        assert_eq!(ids(&plan.candidates), vec!["p", "a", "b"]);
-        assert!(plan.routed);
-    }
-
-    #[test]
-    fn matrix_halfopen_treated_as_available() {
-        // HalfOpen 与 Closed 同属 is_available()=true，入参即 bound_available=true 置首；
-        // 两态在纯函数层为同一参数组合，无需分别构造（注释钉死语义来源）
-        let plan = apply_project_binding(
-            vec![plain_provider("a")],
-            Some(plain_provider("p")),
-            true,
-            true,
-        );
-        assert_eq!(ids(&plan.candidates), vec!["p", "a"]);
-        assert!(plan.routed);
-    }
-
-    #[test]
-    fn matrix_bound_healthy_rescues_when_queue_all_open() {
-        // 救场语义（spec §5 细则 1）：公共队列全熔断/为空（base=[]）+ 绑定者健康 + failover 开
-        // → 候选链 [绑定者]；DB 集成对应 select_providers 返回 Err 的救场路径
-        let plan = apply_project_binding(vec![], Some(plain_provider("p")), true, true);
-        assert_eq!(ids(&plan.candidates), vec!["p"]);
-        assert!(plan.routed);
-    }
-
-    // ===================================================================
-    // select_providers_for_request DB 集成（spec §9 路由重排的端到端链路 + 边界 1 两路径）
-    // ===================================================================
-
-    /// 启用 claude 的自动故障转移（仿现有测试的 proxy_config 更新套路）
-    async fn enable_failover(db: &Database) {
-        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
-        config.auto_failover_enabled = true;
-        db.update_proxy_config_for_app(config).await.unwrap();
-    }
-
-    /// sort_index 控制故障转移队列序的供应商
-    fn queue_provider(id: &str, sort: usize) -> Provider {
-        let mut p = Provider::with_id(id.to_string(), id.to_string(), json!({}), None);
-        p.sort_index = Some(sort);
-        p
-    }
-
     #[tokio::test]
     #[serial]
-    async fn request_with_binding_prepends_bound_provider() {
+    async fn resolve_returns_bound_provider_on_hit() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
 
-        // 队列序 [a, b]
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        db.set_current_provider("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
-
+        db.save_provider("claude", &plain_provider("a")).unwrap();
+        db.save_provider("claude", &plain_provider("b")).unwrap();
         db.insert_or_update_route("/p", "claude", "b").unwrap();
 
-        let (providers, routed) = ProviderRouter::new(db)
-            .select_providers_for_request("claude", Some("/p"))
+        // 命中：只返回绑定者本身，不再重排公共队列（决策 1：候选链 [绑定者]）
+        let bound = ProviderRouter::new(db)
+            .resolve_project_binding("claude", Some("/p"))
             .await
-            .unwrap();
-        assert_eq!(ids(&providers), vec!["b", "a"]);
-        assert!(routed);
+            .unwrap()
+            .expect("绑定命中应返回绑定者");
+        assert_eq!(bound.id, "b");
     }
 
     #[tokio::test]
     #[serial]
-    async fn request_without_header_matches_legacy_behavior() {
+    async fn resolve_returns_none_without_path() {
+        // 无项目标识（claude 未带 X-CC-Project）：项目路由不介入，走全局策略
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("claude", &plain_provider("a")).unwrap();
 
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        db.set_current_provider("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
-
-        let router = ProviderRouter::new(db);
-        let (providers, routed) = router
-            .select_providers_for_request("claude", None)
+        let resolved = ProviderRouter::new(db)
+            .resolve_project_binding("claude", None)
             .await
             .unwrap();
-        let legacy = router.select_providers("claude").await.unwrap();
-        assert_eq!(ids(&providers), ids(&legacy));
-        assert!(!routed);
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
     #[serial]
-    async fn route_row_missing_falls_back_to_default() {
+    async fn resolve_returns_none_when_route_row_missing() {
+        // 绑定行缺失（项目从未绑定）→ 走全局策略
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("claude", &plain_provider("a")).unwrap();
 
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        db.set_current_provider("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
-
-        // 绑定行缺失（项目从未绑定）→ 与现状一致
-        let (providers, routed) = ProviderRouter::new(db)
-            .select_providers_for_request("claude", Some("/p"))
+        let resolved = ProviderRouter::new(db)
+            .resolve_project_binding("claude", Some("/p"))
             .await
             .unwrap();
-        assert_eq!(ids(&providers), vec!["a", "b"]);
-        assert!(!routed);
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
     #[serial]
-    async fn provider_deleted_cascade_falls_back() {
+    async fn resolve_returns_none_when_provider_deleted() {
+        // T2 级联：删供应商同一事务清绑定行（spec §8 边界 1 路径二）→ 悬空按无绑定降级
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
 
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        db.set_current_provider("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
-
+        db.save_provider("claude", &plain_provider("a")).unwrap();
+        db.save_provider("claude", &plain_provider("b")).unwrap();
         db.insert_or_update_route("/p", "claude", "b").unwrap();
-        // T2 级联：删供应商同一事务清绑定行（spec §8 边界 1 路径二）
         db.delete_provider("claude", "b").unwrap();
 
-        let (providers, routed) = ProviderRouter::new(db)
-            .select_providers_for_request("claude", Some("/p"))
+        let resolved = ProviderRouter::new(db)
+            .resolve_project_binding("claude", Some("/p"))
             .await
             .unwrap();
-        assert_eq!(ids(&providers), vec!["a"]);
-        assert!(!routed);
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
     #[serial]
-    async fn non_claude_app_type_ignores_header_path() {
+    async fn resolve_returns_none_for_non_claude() {
+        // 项目绑定仅对 claude 生效：非 claude 即便路径合法也不介入（spec §5 细则 8）
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
 
         let current = plain_provider("codex-a");
         db.save_provider("codex", &current).unwrap();
-        db.set_current_provider("codex", "codex-a").unwrap();
-        // failover 关（默认）：仅当前供应商
+        db.insert_or_update_route("/p", "codex", "codex-a").unwrap();
 
-        // 非 claude app_type：项目标识不介入，逐分支回退现状（spec §5 细则 8）
-        let (providers, routed) = ProviderRouter::new(db)
-            .select_providers_for_request("codex", Some("/p"))
+        let resolved = ProviderRouter::new(db)
+            .resolve_project_binding("codex", Some("/p"))
             .await
             .unwrap();
-        assert_eq!(ids(&providers), vec!["codex-a"]);
-        assert!(!routed);
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
     #[serial]
-    async fn request_all_circuit_open_err_rescued_by_healthy_bound() {
+    async fn resolve_ignores_circuit_state_of_bound_provider() {
+        // 决策 1：绑定命中完全压制——绑定者熔断 Open 也照常返回绑定者；
+        // 熔断闸门由 forwarder 的单候选分支（providers.len() == 1）绕过，
+        // 路由层不再让位公共队列
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
 
@@ -1015,93 +797,21 @@ mod tests {
         .await
         .unwrap();
 
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        // c 不在公共队列：显式指定优先于队列资格（spec §5 细则 1）
-        db.save_provider("claude", &plain_provider("c")).unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
+        db.save_provider("claude", &plain_provider("a")).unwrap();
+        db.save_provider("claude", &plain_provider("b")).unwrap();
+        db.insert_or_update_route("/p", "claude", "b").unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
-            .await
-            .unwrap();
         router
             .record_result("b", "claude", false, false, Some("fail".to_string()))
             .await
             .unwrap();
 
-        db.insert_or_update_route("/p", "claude", "c").unwrap();
-
-        // 公共队列全熔断：select_providers 本会 Err，绑定者健康 → 救场 [c]，
-        // 绑定请求不收到 AllProvidersCircuitOpen（spec §5 细则 1 的 Err 介入时序）
-        let (providers, routed) = router
-            .select_providers_for_request("claude", Some("/p"))
+        let bound = router
+            .resolve_project_binding("claude", Some("/p"))
             .await
-            .unwrap();
-        assert_eq!(ids(&providers), vec!["c"]);
-        assert!(routed);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn request_no_providers_configured_rescued_by_healthy_bound() {
-        let _home = TempHome::new();
-        let db = Arc::new(Database::memory().unwrap());
-
-        // failover 开 + 故障转移队列全空：select_providers 本会走
-        // Err(NoProvidersConfigured)（total_providers=0 的另一错误变体，非全熔断）
-        db.save_provider("claude", &plain_provider("c")).unwrap();
-        enable_failover(&db).await;
-
-        db.insert_or_update_route("/p", "claude", "c").unwrap();
-
-        // 绑定者健康 → 救场 [c]，绑定请求不收到 NoProvidersConfigured（细则 1）
-        let (providers, routed) = ProviderRouter::new(db)
-            .select_providers_for_request("claude", Some("/p"))
-            .await
-            .unwrap();
-        assert_eq!(ids(&providers), vec!["c"]);
-        assert!(routed);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn request_all_circuit_open_bound_unavailable_reraises_err() {
-        let _home = TempHome::new();
-        let db = Arc::new(Database::memory().unwrap());
-
-        db.update_circuit_breaker_config(&CircuitBreakerConfig {
-            failure_threshold: 1,
-            timeout_seconds: 3600,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        db.save_provider("claude", &queue_provider("a", 1)).unwrap();
-        db.save_provider("claude", &queue_provider("b", 2)).unwrap();
-        db.add_to_failover_queue("claude", "a").unwrap();
-        db.add_to_failover_queue("claude", "b").unwrap();
-        enable_failover(&db).await;
-
-        let router = ProviderRouter::new(db.clone());
-        router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
-            .await
-            .unwrap();
-        router
-            .record_result("b", "claude", false, false, Some("fail".to_string()))
-            .await
-            .unwrap();
-
-        // 绑定者 a 同样熔断：救场不成立 → 上抛原 Err（绑定者也不可用时保持现状错误语义）
-        db.insert_or_update_route("/p", "claude", "a").unwrap();
-        let result = router
-            .select_providers_for_request("claude", Some("/p"))
-            .await;
-        assert!(matches!(result, Err(AppError::AllProvidersCircuitOpen)));
+            .unwrap()
+            .expect("绑定命中不因熔断让位");
+        assert_eq!(bound.id, "b");
     }
 }

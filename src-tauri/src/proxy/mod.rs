@@ -21,6 +21,7 @@ pub(crate) mod json_canonical;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
+pub mod opaque_state_rectifier;
 pub(crate) mod project_header;
 pub mod provider_router;
 pub mod providers;

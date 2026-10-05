@@ -183,6 +183,17 @@ CREATE TABLE IF NOT EXISTS settings_local_backup (
 8. **共享入口与分支回退**：`RequestContext::new` 是 claude / claude-desktop / codex / gemini 全部 messages 流量的共享入口，替换 `select_providers` 调用点即对全部 app_type 生效。非 claude app_type 或无 `X-CC-Project` header 时，**逐分支回退现状行为**（含 `provider_router.rs:72-81` 的 Codex Official 强制单路由分支原样保留）。
 9. **`provider_supports_failover` 判定不适用于项目绑定者**（与细则 1"绑定优先于队列资格"同源）。首期 claude 场景该判定恒为 true，无实际影响；二期 codex 场景下"绑定优先于该判定"，标注为二期实现时需复核的决策点。
 
+### 2026-10-05 决策修订（合并上游 v4.0.0）
+
+合并上游 v4.0.0 后，用户拍板将项目绑定语义由"软绑定"改为**完全压制**：绑定命中即候选链唯一，绑定者故障不回退公共队列。实现已落地，本节为对齐实现的补记——**本节修订取代上文软绑定矩阵中"绑定者故障回退全局"象限**（救场 / 让位语义取消，原矩阵首行"绑定者失败 → 依序降级公共队列（软绑定）"及同源的细则 1、细则 4 不再描述现行实现）。
+
+实现事实：
+
+1. **`src-tauri/src/proxy/provider_router.rs`**：删除旧 `ProjectRoutePlan` / `apply_project_binding` / `select_providers_for_request`，新增 `resolve_project_binding(app_type, project_path) -> Result<Option<Provider>>`。返回 `None` 的情形：非 claude app_type / 无 project_path / 无绑定行 / `find_route` DB 错误（降级返回 None 并告警）/ 绑定悬空（绑定行指向的供应商已不存在）；`get_provider_by_id` 的 DB 错误**上抛**，不降级。
+2. **`src-tauri/src/proxy/handler_context.rs`（`RequestContext::new`）**：绑定解析先于 `match stack`。命中 → `stack` 置 `None`（同时压制模型级 StackTarget 与模式级 stack 聚合）、候选链 = `[绑定供应商]`、`project_routed = true`；不改 `auto_failover_enabled`，不切换全局 current 供应商（细则 7 语义保留）。未命中 → 上游 v4.0.0 原逻辑：`stack_mode` → `[current]`，否则 `select_providers_with_current`。
+3. **语义变更**：绑定命中后，绑定供应商故障**不再回退全局 failover 队列**——绑定即唯一出口，失败即失败；绑定悬空（供应商被删）视为未命中，回全局默认策略。
+4. **边界**：请求同时携带 Stack 模型 id 与项目绑定时**绑定胜出**（stack 被压制），转发模型名为 `resolve_stack_target` 改写后的上游名。
+
 ## 6. 后端组件设计
 
 ### 6.1 新建（4 个文件）

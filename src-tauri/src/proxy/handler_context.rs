@@ -3,6 +3,7 @@
 //! 提供请求生命周期的上下文管理，封装通用初始化逻辑
 
 use crate::app_config::AppType;
+use crate::mode::stack::StackTarget;
 use crate::provider::Provider;
 use crate::proxy::project_header::percent_decode_project_path;
 use crate::proxy::{
@@ -81,6 +82,8 @@ pub struct RequestContext {
     pub project_dir: Option<String>,
     /// 本条请求是否经项目绑定路由（绑定请求不改写全局 current，spec §5 细则 7）
     pub project_routed: bool,
+    /// Stack 模型的请求（`mode::stack`）：直达 Stack 里的那一家，不读也不写任何路由状态。
+    pub is_stack: bool,
 }
 
 impl RequestContext {
@@ -89,10 +92,12 @@ impl RequestContext {
     /// # Arguments
     /// * `state` - 代理服务器状态
     /// * `body` - 请求体 JSON
-    /// * `headers` - 请求头（用于提取 Session ID）
+    /// * `headers` - 请求头（用于提取 Session ID 与项目绑定标识）
     /// * `app_type` - 应用类型
     /// * `tag` - 日志标签
     /// * `app_type_str` - 应用类型字符串
+    /// * `stack` - Stack 模型的目标（请求体里的 `model` 已换成上游名）；
+    ///   项目绑定命中时被完全压制（决策 1），按普通路由请求处理
     ///
     /// # Errors
     /// 返回 `ProxyError` 如果 Provider 选择失败
@@ -103,11 +108,12 @@ impl RequestContext {
         app_type: AppType,
         tag: &'static str,
         app_type_str: &'static str,
+        stack: Option<StackTarget>,
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
-        let app_config = state
+        let mut app_config = state
             .db
             .get_proxy_config_for_app(app_type_str)
             .await
@@ -117,16 +123,6 @@ impl RequestContext {
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
-
-        let current_provider_id =
-            crate::settings::get_current_provider(&app_type).unwrap_or_default();
-
-        // 从请求体提取模型名称
-        let request_model = body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string();
 
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
@@ -140,35 +136,121 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额；
-        // claude 请求先解出项目绑定标识，命中绑定时由路由层重排候选链（spec §5）
+        // 项目绑定路由（spec §5，仅 claude）：命中即完全压制 Stack（决策 1）——
+        // 模型级 StackTarget 与模式级 Stack 聚合都不介入，候选链只剩绑定者
         let project_dir = extract_project_dir(headers, app_type_str);
-        let (providers, project_routed) = state
-            .provider_router
-            .select_providers_for_request(app_type_str, project_dir.as_deref())
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
+        let project_binding = match project_dir.as_deref() {
+            Some(path) => state
+                .provider_router
+                .resolve_project_binding(app_type_str, Some(path))
+                .await
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?,
+            None => None,
+        };
+        let stack = if project_binding.is_some() {
+            None
+        } else {
+            stack
+        };
+        let is_stack = stack.is_some();
+        let (provider, providers, current_provider_id, request_model, project_routed) =
+            match stack {
+                Some(target) => {
+                    // Stack 模型：只发往 Stack 里的那一家，不读代理路由、不经熔断器选家。按「单家、
+                    // 不转移」处理：换成有效副本，转发和读响应两个阶段都从这里取，超时和重试
+                    // 跟着关掉（见 `create_forwarder`）。
+                    app_config.auto_failover_enabled = false;
+                    log::debug!(
+                        "[{}] Stacked model {} → provider {}, upstream model {}, session: {}",
+                        tag,
+                        target.original_model,
+                        target.provider.name,
+                        target.upstream_model,
+                        session_id
+                    );
+                    (
+                        target.provider.clone(),
+                        vec![target.provider.clone()],
+                        target.provider.id,
+                        target.original_model,
+                        false,
+                    )
                 }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+            None => {
+                let current_provider = crate::mode::current::provider_in_use(&state.db, &app_type)
+                    .ok()
+                    .flatten();
+                let current_provider_id = current_provider
+                    .as_ref()
+                    .map(|provider| provider.id.clone())
+                    .unwrap_or_default();
 
-        let provider = providers
-            .first()
-            .cloned()
-            .ok_or(ProxyError::NoAvailableProvider)?;
+                // 从请求体提取模型名称
+                let request_model = body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-        log::debug!(
-            "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}",
-            tag,
-            provider.name,
-            request_model,
-            providers.len(),
-            session_id
-        );
+                // Stack 模式不做故障转移：只发往默认那家，和故障转移关着时一样跳过熔断器选家；
+                // 队列留着，回到路由模式恢复。故障转移本来就关着时不用读模式。
+                let stack_mode = app_config.auto_failover_enabled
+                    && crate::mode::stack::stack_mode_now(&app_type);
+
+                let (providers, project_routed) = if let Some(bound) = project_binding {
+                    // 项目绑定命中（决策 1）：候选链只剩绑定者，完全跳过 Stack 聚合候选链与
+                    // 全局 failover 队列。单候选在 forwarder 侧自动绕过熔断闸门
+                    // （providers.len() == 1 分支），超时/重试配置仍按用户设置生效
+                    (vec![bound], true)
+                } else if stack_mode {
+                    app_config.auto_failover_enabled = false;
+                    (
+                        vec![current_provider.ok_or(ProxyError::NoProvidersConfigured)?],
+                        false,
+                    )
+                } else {
+                    // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
+                    // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+                    (
+                        state
+                            .provider_router
+                            .select_providers_with_current(app_type_str, current_provider)
+                            .await
+                            .map_err(|e| match e {
+                                crate::error::AppError::AllProvidersCircuitOpen => {
+                                    ProxyError::AllProvidersCircuitOpen
+                                }
+                                crate::error::AppError::NoProvidersConfigured => {
+                                    ProxyError::NoProvidersConfigured
+                                }
+                                _ => ProxyError::DatabaseError(e.to_string()),
+                            })?,
+                        false,
+                    )
+                };
+
+                let provider = providers
+                    .first()
+                    .cloned()
+                    .ok_or(ProxyError::NoAvailableProvider)?;
+
+                log::debug!(
+                    "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}",
+                    tag,
+                    provider.name,
+                    request_model,
+                    providers.len(),
+                    session_id
+                );
+                (
+                    provider,
+                    providers,
+                    current_provider_id,
+                    request_model,
+                    project_routed,
+                )
+            }
+        };
 
         Ok(Self {
             start_time,
@@ -189,6 +271,7 @@ impl RequestContext {
             copilot_optimizer_config,
             project_dir,
             project_routed,
+            is_stack,
         })
     }
 
@@ -259,6 +342,7 @@ impl RequestContext {
             max_retries,
             self.project_routed,
         )
+        .stack_request(self.is_stack)
     }
 
     /// 获取 Provider 列表（用于故障转移）
