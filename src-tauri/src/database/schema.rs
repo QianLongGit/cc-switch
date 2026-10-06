@@ -68,7 +68,8 @@ impl Database {
             enabled_gemini BOOLEAN NOT NULL DEFAULT 0, enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
-            enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+            enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+            enabled_pi BOOLEAN NOT NULL DEFAULT 0
         )",
             [],
         )
@@ -609,6 +610,21 @@ impl Database {
                         log::info!("迁移数据库从 v20 到 v21（请求日志项目归因列）");
                         Self::migrate_v20_to_v21(conn)?;
                         Self::set_user_version(conn, 21)?;
+                    }
+                    // 上游 v4.0.2 的 v19→v20（enabled_pi）与本 fork v20 撞号：
+                    // 重编号为 v21→v22 追加链尾，已升级 v21 的本地库平滑补列，
+                    // 迁移内部逻辑与上游保持一致。
+                    21 => {
+                        log::info!("迁移数据库从 v21 到 v22（MCP 添加 Pi 支持）");
+                        if Self::table_exists(conn, "mcp_servers")? {
+                            Self::add_column_if_missing(
+                                conn,
+                                "mcp_servers",
+                                "enabled_pi",
+                                "BOOLEAN NOT NULL DEFAULT 0",
+                            )?;
+                        }
+                        Self::set_user_version(conn, 22)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -3876,6 +3892,33 @@ mod tests {
         )?;
         assert_eq!(codex_values, (1, 9));
 
+        Ok(())
+    }
+
+    // 上游测试重编号：迁移本身已从 v19→v20 排为 v21→v22（见迁移链注释），
+    // 测试起点与断言随链更新，夹具与断言逻辑保持上游原样。
+    #[test]
+    fn migrate_v21_to_v22_adds_pi_mcp_flag_and_keeps_existing_flags() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (
+                id TEXT PRIMARY KEY,
+                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+                enabled_mcode BOOLEAN NOT NULL DEFAULT 0
+            );
+            INSERT INTO mcp_servers (id, enabled_codex, enabled_mcode) VALUES ('mcp-1', 1, 1);",
+        )?;
+        Database::set_user_version(&conn, 21)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        let values: (i64, i64, i64) = conn.query_row(
+            "SELECT enabled_codex, enabled_mcode, enabled_pi FROM mcp_servers WHERE id = 'mcp-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(values, (1, 1, 0));
         Ok(())
     }
 

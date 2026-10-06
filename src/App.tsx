@@ -1,4 +1,11 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
 import { invoke } from "@tauri-apps/api/core";
@@ -72,6 +79,7 @@ import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { discardUnsavedChanges, hasUnsavedChanges } from "@/lib/unsavedChanges";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { AppsPage } from "@/components/apps/AppsPage";
@@ -84,7 +92,7 @@ import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { SwitchModePanel } from "@/components/providers/mode/SwitchModePanel";
 import { DesktopAccessBar } from "@/components/providers/mode/DesktopAccessBar";
 import { proxyApi } from "@/lib/api/proxy";
-import type { StartupAttachFailure } from "@/types/proxy";
+import type { AppMode, StartupAttachFailure } from "@/types/proxy";
 import UsageScriptModal from "@/components/UsageScriptModal";
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
 import PromptPanel from "@/components/prompts/PromptPanel";
@@ -92,6 +100,7 @@ import { PROMPT_APP_IDS } from "@/lib/query/prompts";
 import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+import { WhatsNewNotice } from "@/components/WhatsNewDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { HoverTip } from "@/components/ui/hover-tip";
@@ -159,6 +168,17 @@ function App() {
     PROMPT_APP_IDS.includes(sharedFeatureApp) ? sharedFeatureApp : "claude",
   );
   const [isAddOpen, setIsAddOpen] = useState(false);
+  // 供应商页顶部正在看的那格（直连 / 路由 / 聚合），由 SwitchModePanel 报上来。打开新增、
+  // 编辑时记下当时那格，表单按它选布局：在聚合那格打开就是聚合的简化表单。
+  const [providerModeView, setProviderModeView] = useState<{
+    app: AppId;
+    view: AppMode;
+  } | null>(null);
+  const [formModeView, setFormModeView] = useState<AppMode>();
+  const handleProviderModeViewChange = useCallback(
+    (app: AppId, view: AppMode) => setProviderModeView({ app, view }),
+    [],
+  );
   // 托盘里点了直连下需要路由的那家：打开应用页后弹「需要路由」对话框
   const [trayNeedsRoute, setTrayNeedsRoute] = useState<{
     app: AppId;
@@ -270,6 +290,13 @@ function App() {
 
   const { isRunning: isProxyRunning, takeoverStatus } = useProxyStatus();
   const proxyAppId = isProxyAppId(activeApp) ? activeApp : null;
+  // 换了应用、新面板还没报上来时为 undefined：表单按应用实际生效的模式
+  const currentModeView =
+    providerModeView?.app === activeApp ? providerModeView.view : undefined;
+  const openAddProvider = (modeView: AppMode | undefined) => {
+    setFormModeView(modeView);
+    setIsAddOpen(true);
+  };
   const currentAppUsesProxy =
     proxyAppId !== null || activeApp === "claude-desktop";
   const isCurrentAppTakeoverActive = proxyAppId
@@ -601,8 +628,17 @@ function App() {
     setUsageProvider(null);
   };
 
+  // 整页编辑器里有未保存的修改：先确认，确认放弃后再执行这次导航
+  const [pendingLeave, setPendingLeave] = useState<(() => void) | null>(null);
+  const confirmLeave = (proceed: () => void) => {
+    if (!hasUnsavedChanges()) return false;
+    setPendingLeave(() => proceed);
+    return true;
+  };
+
   const openSettings = (section: SettingsSection = "general") => {
     if (managementBusyRef.current) return;
+    if (confirmLeave(() => openSettings(section))) return;
     closeProviderPanels();
     if (currentViewRef.current !== "settings") {
       settingsReturnViewRef.current = currentViewRef.current;
@@ -617,6 +653,7 @@ function App() {
 
   const selectApp = (app: AppId) => {
     if (managementBusyRef.current) return;
+    if (confirmLeave(() => selectApp(app))) return;
     closeProviderPanels();
     setActiveApp(app);
     localStorage.setItem(APP_STORAGE_KEY, app);
@@ -629,6 +666,7 @@ function App() {
       return;
     }
     if (managementBusyRef.current) return;
+    if (confirmLeave(() => openPage(page))) return;
     closeProviderPanels();
     if (page === "prompts" && currentViewRef.current !== "prompts") {
       // 提示词页默认选中侧栏里最后选的那个应用
@@ -641,20 +679,24 @@ function App() {
   useTrayAppPageSeen(currentView === "providers" ? activeApp : null);
 
   useTrayNavigation((navigation) => {
-    if (navigation.section) {
-      openSettings(navigation.section);
-      return;
-    }
-    if (!navigation.app) return;
-    selectApp(navigation.app);
-    if (navigation.intent === "add") setIsAddOpen(true);
-    if (navigation.intent === "needsRoute" && navigation.providerId) {
-      setTrayNeedsRoute({
-        app: navigation.app,
-        providerId: navigation.providerId,
-        nonce: Date.now(),
-      });
-    }
+    const navigate = () => {
+      if (navigation.section) {
+        openSettings(navigation.section);
+        return;
+      }
+      if (!navigation.app) return;
+      selectApp(navigation.app);
+      // 托盘先换应用：新应用那格还没报上来，按它实际生效的模式
+      if (navigation.intent === "add") openAddProvider(undefined);
+      if (navigation.intent === "needsRoute" && navigation.providerId) {
+        setTrayNeedsRoute({
+          app: navigation.app,
+          providerId: navigation.providerId,
+          nonce: Date.now(),
+        });
+      }
+    };
+    if (managementBusyRef.current || !confirmLeave(navigate)) navigate();
   });
 
   // 侧栏、⌘K 进用量统计看全部应用；只有应用页 ⋯ 进来时带应用筛选
@@ -1124,7 +1166,7 @@ function App() {
             <Button
               variant="solid"
               size="regular"
-              onClick={() => setIsAddOpen(true)}
+              onClick={() => openAddProvider(currentModeView)}
             >
               <Plus className="h-4 w-4" />
               {t("provider.addProvider")}
@@ -1177,14 +1219,17 @@ function App() {
   };
 
   const listCallbacks = {
-    onEdit: (provider: Provider) => setEditingProvider(provider),
+    onEdit: (provider: Provider) => {
+      setFormModeView(currentModeView);
+      setEditingProvider(provider);
+    },
     onDelete: (provider: Provider) =>
       setConfirmAction({ provider, action: "delete" }),
     onDuplicate: handleDuplicateProvider,
     onConfigureUsage: setUsageProvider,
     onOpenWebsite: handleOpenWebsite,
     onOpenTerminal: activeApp === "claude" ? handleOpenTerminal : undefined,
-    onCreate: () => setIsAddOpen(true),
+    onCreate: () => openAddProvider(currentModeView),
   };
 
   const renderProviderList = () => {
@@ -1206,6 +1251,7 @@ function App() {
             trayNeedsRoute?.app === proxyAppId ? trayNeedsRoute : undefined
           }
           onNeedsRouteHandled={() => setTrayNeedsRoute(null)}
+          onViewChange={handleProviderModeViewChange}
           startupFailure={startupFailure}
           onDismissStartupFailure={() =>
             setStartupFailures((list) =>
@@ -1522,6 +1568,7 @@ function App() {
         onOpenChange={setIsAddOpen}
         appId={activeApp}
         onSubmit={addProvider}
+        modeView={formModeView}
       />
 
       <EditProviderDialog
@@ -1536,6 +1583,7 @@ function App() {
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
         isCurrent={effectiveEditingProvider?.id === currentProviderId}
+        modeView={formModeView}
       />
 
       {effectiveUsageProvider && (
@@ -1568,6 +1616,22 @@ function App() {
       />
 
       <ConfirmDialog
+        isOpen={pendingLeave !== null}
+        title={t("common.unsavedLeaveTitle")}
+        message={t("common.unsavedLeaveMessage")}
+        confirmText={t("common.unsavedLeaveConfirm")}
+        cancelText={t("common.unsavedLeaveCancel")}
+        zIndex="top"
+        onConfirm={() => {
+          const proceed = pendingLeave;
+          setPendingLeave(null);
+          discardUnsavedChanges();
+          proceed?.();
+        }}
+        onCancel={() => setPendingLeave(null)}
+      />
+
+      <ConfirmDialog
         isOpen={launchDashboardOpen}
         title={t("hermes.webui.launchConfirmTitle")}
         message={t("hermes.webui.launchConfirmMessage")}
@@ -1592,6 +1656,7 @@ function App() {
       <DeepLinkImportDialog />
       <FirstRunNoticeDialog />
       <NewLayoutDialog />
+      <WhatsNewNotice />
     </WindowControlsContext.Provider>
   );
 }
