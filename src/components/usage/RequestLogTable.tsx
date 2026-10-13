@@ -26,9 +26,11 @@ import {
   fmtInt,
   fmtUsd,
   formatEstimatedTokensPerSecond,
+  formatFirstTokenSeconds,
   formatOutputTokensPerSecond,
   formatTokensCompact,
   getLocaleFromLanguage,
+  isSessionLogRequest,
   parseFiniteNumber,
 } from "./format";
 import { usageTable } from "./usageTable";
@@ -189,17 +191,28 @@ export function RequestLogTable({
     const tps = exactTps ?? estimatedTps;
     const latency = parseFiniteNumber(log.latencyMs);
     const firstToken = parseFiniteNumber(log.firstTokenMs);
-    const timingTip =
-      latency != null && latency > 0 && firstToken != null
-        ? t("usage.timingTip", {
+    const firstTokenText = formatFirstTokenSeconds(firstToken);
+    // 会话日志的耗时和首字都是按时间戳估的，带 ≈
+    const isSession = isSessionLogRequest(log);
+    const timing =
+      latency != null && latency > 0
+        ? {
             duration: (latency / 1000).toFixed(1),
-            ttft: (firstToken / 1000).toFixed(1),
-          })
-        : estimatedTps != null && latency != null
-          ? t("usage.estimatedTimingTip", {
-              duration: (latency / 1000).toFixed(1),
-            })
-          : undefined;
+            ttft: firstToken != null ? (firstToken / 1000).toFixed(1) : null,
+          }
+        : null;
+    const timingTip =
+      timing == null
+        ? undefined
+        : !isSession
+          ? timing.ttft != null
+            ? t("usage.timingTip", timing)
+            : undefined
+          : timing.ttft != null
+            ? t("usage.estimatedTimingTipWithFirstToken", timing)
+            : estimatedTps != null
+              ? t("usage.estimatedTimingTip", timing)
+              : undefined;
     const multiplier = parseFiniteNumber(log.costMultiplier);
     const modelTitle =
       log.requestModel && log.requestModel !== log.model
@@ -258,7 +271,8 @@ export function RequestLogTable({
           </span>
         </td>
         {/* 供应商、项目、模型三列按比例取宽（max-w-0 让百分比宽度生效、内容截断）；
-            比例合计 44%，再大就会把数值列挤到只剩内容宽度。模型名通常比供应商名长 */}
+            比例合计 44%，再大就会把数值列挤到只剩内容宽度。模型名通常比供应商名长，
+            放不下的截断、悬停看全名 */}
         <td className={cn(usageTable.td, "w-[14%] max-w-0")}>
           <span
             className="block truncate"
@@ -297,7 +311,7 @@ export function RequestLogTable({
           </span>
         </td>
         <td
-          className={usageTable.tdEnd}
+          className={usageTable.td}
           title={
             isCacheInclusive
               ? `${fmtInt(freshInput, locale)} (${t("usage.rawInputLabel")}: ${fmtInt(log.inputTokens, locale)})`
@@ -306,14 +320,11 @@ export function RequestLogTable({
         >
           {formatTokensCompact(freshInput, locale)}
         </td>
-        <td
-          className={usageTable.tdEnd}
-          title={fmtInt(log.outputTokens, locale)}
-        >
+        <td className={usageTable.td} title={fmtInt(log.outputTokens, locale)}>
           {formatTokensCompact(log.outputTokens, locale)}
         </td>
         <td
-          className={cn(usageTable.tdEnd, !hasCache && usageTable.muted)}
+          className={cn(usageTable.td, !hasCache && usageTable.muted)}
           title={t("usage.cacheTip", {
             read: fmtInt(log.cacheReadTokens, locale),
             write: fmtInt(log.cacheCreationTokens, locale),
@@ -323,7 +334,7 @@ export function RequestLogTable({
         </td>
         <td
           className={cn(
-            usageTable.tdEnd,
+            usageTable.td,
             "font-medium",
             unpriced && "font-normal text-fg-3",
           )}
@@ -336,7 +347,7 @@ export function RequestLogTable({
           {unpriced ? t("usage.unpriced") : fmtUsd(log.totalCostUsd, 4)}
         </td>
         <td
-          className={cn(usageTable.tdEnd, tps == null && usageTable.muted)}
+          className={cn(usageTable.td, tps == null && usageTable.muted)}
           title={timingTip}
         >
           {tps == null ? (
@@ -350,6 +361,16 @@ export function RequestLogTable({
               </span>
             </>
           )}
+        </td>
+        <td
+          className={cn(
+            usageTable.td,
+            firstTokenText == null && usageTable.muted,
+          )}
+          title={timingTip}
+        >
+          {isSession && firstTokenText != null && "≈"}
+          {firstTokenText ?? "—"}
         </td>
       </tr>
     );
@@ -396,15 +417,23 @@ export function RequestLogTable({
               {/* 本地扩展：项目列（basename + 路由徽标） */}
               <th className={usageTable.th}>{t("usage.projectDir")}</th>
               <th className={usageTable.th}>{t("usage.model")}</th>
-              <th className={usageTable.thEnd}>{t("usage.freshInput")}</th>
-              <th className={usageTable.thEnd}>{t("usage.outputTokens")}</th>
-              <th className={usageTable.thEnd}>{t("usage.cacheReadTokens")}</th>
-              <th className={usageTable.thEnd}>{t("usage.cost")}</th>
-              <th className={usageTable.thEnd}>
+              <th className={usageTable.th}>{t("usage.freshInput")}</th>
+              <th className={usageTable.th}>{t("usage.outputTokens")}</th>
+              <th className={usageTable.th}>{t("usage.cacheReadTokens")}</th>
+              <th className={usageTable.th}>{t("usage.cost")}</th>
+              <th className={usageTable.th}>
                 <span className="inline-flex items-center gap-0.5">
                   {t("usage.speed")}
                   <HelpTip title={t("usage.speedHelpTitle")} align="end">
                     {t("usage.speedHelp")}
+                  </HelpTip>
+                </span>
+              </th>
+              <th className={usageTable.th}>
+                <span className="inline-flex items-center gap-0.5">
+                  {t("usage.firstToken")}
+                  <HelpTip title={t("usage.firstTokenHelpTitle")} align="end">
+                    {t("usage.firstTokenHelp")}
                   </HelpTip>
                 </span>
               </th>
@@ -413,7 +442,7 @@ export function RequestLogTable({
           <tbody>
             {logs.length === 0 ? (
               <tr>
-                <td colSpan={10} className={usageTable.empty}>
+                <td colSpan={11} className={usageTable.empty}>
                   {t("usage.noData")}
                 </td>
               </tr>
