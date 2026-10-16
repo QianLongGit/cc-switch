@@ -347,12 +347,6 @@ function modeTag(
   status: AppNavStatus,
   t: (key: string) => string,
 ): { label: string; className: string } | null {
-  if (status.mapping) {
-    return {
-      label: t("nav.mode.mapping"),
-      className: "bg-route-soft text-route-text",
-    };
-  }
   if (status.mode === "route") {
     return {
       label: t("nav.mode.route"),
@@ -384,9 +378,8 @@ function AppNavItem({
   const { t } = useTranslation();
   const name = APP_DISPLAY_NAME[app];
   const tag = modeTag(status, t);
-  const modeName = status.mapping
-    ? t("nav.mode.mappingFull")
-    : status.mode === "route"
+  const modeName =
+    status.mode === "route"
       ? t("nav.mode.route")
       : status.mode === "stack"
         ? t("nav.mode.stack")
@@ -403,7 +396,7 @@ function AppNavItem({
       ? { className: "bg-danger text-action-fg", icon: AlertGlyph }
       : status.mode === "stack"
         ? { className: "bg-stack-solid text-stack-on", icon: Layers }
-        : status.mode === "route" || status.mapping
+        : status.mode === "route"
           ? { className: "bg-route-solid text-route-on", icon: Route }
           : null;
     return (
