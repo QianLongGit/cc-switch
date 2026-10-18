@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useRequestLogs } from "@/lib/query/usage";
 import { TablePagination } from "./TablePagination";
@@ -6,6 +6,7 @@ import { HelpTip } from "@/components/ui/help-tip";
 import { AppGlyph, APP_DISPLAY_NAME } from "@/components/shell/AppGlyph";
 import type { AppId } from "@/lib/api";
 import {
+  CACHE_INCLUSIVE_APP_TYPES,
   getFreshInputTokens,
   isUnpricedUsage,
   type LogFilters,
@@ -24,7 +25,6 @@ import {
 import { uniqueProjectDirs } from "./projectFilter";
 import {
   fmtInt,
-  fmtUsd,
   formatEstimatedTokensPerSecond,
   formatFirstTokenSeconds,
   formatOutputTokensPerSecond,
@@ -35,6 +35,12 @@ import {
 } from "./format";
 import { usageTable } from "./usageTable";
 import { getUsageProviderLabel, usageProviderTitle } from "./providerLabel";
+import { useMoneyFormat } from "@/hooks/useMoneyFormat";
+import {
+  REQUEST_LOG_COLUMN_LABEL_KEYS,
+  resolveRequestLogColumns,
+  type RequestLogColumnId,
+} from "./requestLogColumns";
 
 /** 提取路径 basename（兼容 POSIX / Windows 分隔符）；空段回落原串。 */
 const basenameOf = (dir: string): string => dir.split(/[\\/]/).pop() || dir;
@@ -51,6 +57,8 @@ interface RequestLogTableProps {
   refreshIntervalMs: number;
   /** 点一行打开请求详情 */
   onOpenDetail?: (requestId: string) => void;
+  /** 要显示的列（按表格顺序）；不传按默认列 */
+  columns?: RequestLogColumnId[];
 }
 
 const pad2 = (value: number) => String(value).padStart(2, "0");
@@ -114,6 +122,67 @@ export function appShortName(appType: string): string {
 
 const isSuccessStatus = (code: number) => code >= 200 && code < 300;
 
+const DEFAULT_COLUMNS = resolveRequestLogColumns(undefined);
+
+// ============================================================================
+// 本地扩展：项目列（fork 特性，不在上游 requestLogColumns 注册表内）
+//
+// 上游 v4.0.15 起请求日志改为「自选列」体系（列注册表 + 设置覆盖），注册表是
+// 上游文件、不含项目列；项目列因此在本文件内叠加渲染：
+//   - 当且仅当当前页日志里出现过 projectDir（即右上角项目筛选有选项）时插入，
+//     纯净数据 / 空表保持上游列集合（列数与上游测试口径一致）；
+//   - 位置固定在 provider 之后（provider 被关掉则退到 app、再退到锁定的 time）；
+//   - 单元格：basename 主展示 + 完整路径悬停 + [路由] 徽标，空值「—」。
+// ============================================================================
+
+/** 行 / 表头实际渲染的列 id：上游自选列 + 本地固定的项目列 */
+type RowCellId = RequestLogColumnId | "project";
+
+/** 项目列表头文案键（与右上角项目筛选共用） */
+const PROJECT_COLUMN_LABEL_KEY = "usage.projectDir";
+
+/**
+ * 单条请求的缓存命中率，口径与用量页「缓存命中率」相同：
+ * 缓存命中 ÷（新增输入 + 缓存写入 + 缓存命中）。没有可缓存的输入时返回 null。
+ */
+export function getRequestCacheHitRate(
+  log: RequestLog,
+): { rate: number; cacheable: number } | null {
+  const cacheable =
+    getFreshInputTokens(log) + log.cacheCreationTokens + log.cacheReadTokens;
+  if (cacheable <= 0) return null;
+  return { rate: log.cacheReadTokens / cacheable, cacheable };
+}
+
+/** 「87.3%」；只有真的全命中才写「100%」，99.96% 不进成 100 */
+export function formatHitPercent(rate: number): string {
+  const percent = Math.max(0, Math.min(100, rate * 100));
+  if (percent >= 100) return "100%";
+  return `${(Math.floor(percent * 10) / 10).toFixed(1)}%`;
+}
+
+function StatusBadge({
+  code,
+  title,
+  className,
+}: {
+  code: number;
+  title?: string;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "rounded-[4px] bg-danger-soft px-1 text-badge text-danger-text",
+        className,
+      )}
+      title={title || undefined}
+    >
+      {code}
+    </span>
+  );
+}
+
 export function RequestLogTable({
   range,
   appType: dashboardAppType,
@@ -122,8 +191,10 @@ export function RequestLogTable({
   statusCode,
   refreshIntervalMs,
   onOpenDetail,
+  columns = DEFAULT_COLUMNS,
 }: RequestLogTableProps) {
   const { t, i18n } = useTranslation();
+  const { money, usdHint } = useMoneyFormat();
   // 本地扩展：项目筛选留在日志表内（statusCode 等全局筛选已由 Dashboard 下传）
   const [projectDir, setProjectDir] = useState<string | undefined>(undefined);
   const [page, setPage] = useState(0);
@@ -176,6 +247,52 @@ export function RequestLogTable({
     return <div className={usageTable.skeleton} />;
   }
 
+  // 带说明的列在表头挂「?」，其余只写列名
+  const headerHelp: Partial<
+    Record<RowCellId, { title: string; body: string }>
+  > = {
+    hitRate: {
+      title: t("usage.metrics.hitRateHelpTitle"),
+      body: t("usage.metrics.hitRateHelp"),
+    },
+    speed: { title: t("usage.speedHelpTitle"), body: t("usage.speedHelp") },
+    firstToken: {
+      title: t("usage.firstTokenHelpTitle"),
+      body: t("usage.firstTokenHelp"),
+    },
+  };
+  const renderHeader = (id: RowCellId) => {
+    const label = t(
+      id === "project"
+        ? PROJECT_COLUMN_LABEL_KEY
+        : REQUEST_LOG_COLUMN_LABEL_KEYS[id],
+    );
+    const help = headerHelp[id];
+    if (!help) return label;
+    return (
+      <span className="inline-flex items-center gap-0.5">
+        {label}
+        <HelpTip title={help.title} align="end">
+          {help.body}
+        </HelpTip>
+      </span>
+    );
+  };
+  // 打开了「状态码」列就不在时间旁边再挂一个错误码
+  const showStatusInTime = !columns.includes("statusCode");
+
+  // 本地扩展：当前页出现过 projectDir（= 右上角项目筛选有选项）才插项目列；
+  // 表头、行、空态 colSpan、最小宽度全部走 cellIds，保证口径一致
+  const showProjectColumn = uniqueProjectDirs(logs).length > 0;
+  // 插在 provider 之后；provider 被关掉时退到 app 之后，再退到锁定的 time 之后
+  const anchorId = (["provider", "app", "time"] as const).find((id) =>
+    columns.includes(id),
+  );
+  const projectAt = anchorId ? columns.indexOf(anchorId) + 1 : columns.length;
+  const cellIds: RowCellId[] = showProjectColumn
+    ? [...columns.slice(0, projectAt), "project", ...columns.slice(projectAt)]
+    : columns;
+
   const renderRow = (log: RequestLog) => {
     const unpriced = isUnpricedUsage(log);
     const freshInput = getFreshInputTokens(log);
@@ -219,14 +336,14 @@ export function RequestLogTable({
         ? `${log.visionRouted ? `${t("usage.visionRouteBadge")} ` : ""}${log.requestModel} → ${log.model}`
         : log.model;
     const hasCache = log.cacheReadTokens > 0;
+    // OpenAI 协议不单报缓存写入，这几个应用的 0 是「不知道」，不是「没写」
+    const cacheWriteUnknown = CACHE_INCLUSIVE_APP_TYPES.has(log.appType);
+    const hitRate = getRequestCacheHitRate(log);
+    const success = isSuccessStatus(log.statusCode);
 
-    return (
-      <tr
-        key={log.requestId}
-        className={onOpenDetail ? usageTable.rowInteractive : usageTable.row}
-        onClick={() => onOpenDetail?.(log.requestId)}
-      >
-        {/* 时间、应用两列收紧到内容宽度（w-px），多出来的宽度留给后面的数值列 */}
+    const cells: Record<RowCellId, ReactNode> = {
+      // 时间、应用两列收紧到内容宽度（w-px），多出来的宽度留给后面的数值列
+      time: (
         <td className={cn(usageTable.td, "w-px")}>
           <button
             type="button"
@@ -243,15 +360,16 @@ export function RequestLogTable({
           >
             {time}
           </button>
-          {!isSuccessStatus(log.statusCode) && (
-            <span
-              className="ms-1.5 rounded-[4px] bg-danger-soft px-1 text-badge text-danger-text"
-              title={log.errorMessage || undefined}
-            >
-              {log.statusCode}
-            </span>
+          {showStatusInTime && !success && (
+            <StatusBadge
+              className="ms-1.5"
+              code={log.statusCode}
+              title={log.errorMessage}
+            />
           )}
         </td>
+      ),
+      app: (
         <td className={cn(usageTable.td, "w-px")}>
           <span
             className="flex max-w-[88px] items-center gap-1.5"
@@ -270,9 +388,11 @@ export function RequestLogTable({
             <span className="sr-only">{appDisplayName(log.appType)}</span>
           </span>
         </td>
-        {/* 供应商、项目、模型三列按比例取宽（max-w-0 让百分比宽度生效、内容截断）；
-            比例合计 44%，再大就会把数值列挤到只剩内容宽度。模型名通常比供应商名长，
-            放不下的截断、悬停看全名 */}
+      ),
+      // 供应商、项目、模型三列按比例取宽（max-w-0 让百分比宽度生效、内容截断）；
+      // 比例合计 44%，再大就会把数值列挤到只剩内容宽度。模型名通常比供应商名长，
+      // 放不下的截断、悬停看全名
+      provider: (
         <td className={cn(usageTable.td, "w-[14%] max-w-0")}>
           <span
             className="block truncate"
@@ -281,7 +401,9 @@ export function RequestLogTable({
             {provider}
           </span>
         </td>
-        {/* 本地扩展：项目列——basename 主展示、完整路径悬停；[路由] 徽标表示走了项目级绑定 */}
+      ),
+      // 本地扩展：项目列——basename 主展示、完整路径悬停；[路由] 徽标表示走了项目级绑定
+      project: (
         <td className={cn(usageTable.td, "w-[12%] max-w-0")}>
           {log.projectDir ? (
             <span className="flex items-center gap-1" title={log.projectDir}>
@@ -299,6 +421,8 @@ export function RequestLogTable({
             <span className={usageTable.muted}>—</span>
           )}
         </td>
+      ),
+      model: (
         <td className={cn(usageTable.td, usageTable.mono, "w-[18%] max-w-0")}>
           <span className="block truncate" title={modelTitle}>
             {/* 本地扩展：[图片] 徽标表示该请求被分流到了视觉模型 */}
@@ -310,6 +434,8 @@ export function RequestLogTable({
             {log.model}
           </span>
         </td>
+      ),
+      freshInput: (
         <td
           className={usageTable.td}
           title={
@@ -320,9 +446,13 @@ export function RequestLogTable({
         >
           {formatTokensCompact(freshInput, locale)}
         </td>
+      ),
+      output: (
         <td className={usageTable.td} title={fmtInt(log.outputTokens, locale)}>
           {formatTokensCompact(log.outputTokens, locale)}
         </td>
+      ),
+      cacheRead: (
         <td
           className={cn(usageTable.td, !hasCache && usageTable.muted)}
           title={t("usage.cacheTip", {
@@ -332,6 +462,41 @@ export function RequestLogTable({
         >
           {hasCache ? formatTokensCompact(log.cacheReadTokens, locale) : "—"}
         </td>
+      ),
+      cacheWrite: (
+        <td
+          className={cn(
+            usageTable.td,
+            (cacheWriteUnknown || log.cacheCreationTokens <= 0) &&
+              usageTable.muted,
+          )}
+          title={
+            cacheWriteUnknown
+              ? t("usage.cacheWriteNotReported")
+              : fmtInt(log.cacheCreationTokens, locale)
+          }
+        >
+          {!cacheWriteUnknown && log.cacheCreationTokens > 0
+            ? formatTokensCompact(log.cacheCreationTokens, locale)
+            : "—"}
+        </td>
+      ),
+      hitRate: (
+        <td
+          className={cn(usageTable.td, hitRate == null && usageTable.muted)}
+          title={
+            hitRate == null
+              ? undefined
+              : t("usage.logColumns.hitRateTip", {
+                  read: fmtInt(log.cacheReadTokens, locale),
+                  total: fmtInt(hitRate.cacheable, locale),
+                })
+          }
+        >
+          {hitRate == null ? "—" : formatHitPercent(hitRate.rate)}
+        </td>
+      ),
+      cost: (
         <td
           className={cn(
             usageTable.td,
@@ -339,13 +504,20 @@ export function RequestLogTable({
             unpriced && "font-normal text-fg-3",
           )}
           title={
-            multiplier != null && multiplier !== 1
-              ? `${t("usage.costMultiplier")} ×${multiplier.toFixed(2)}`
-              : undefined
+            [
+              unpriced ? undefined : usdHint(log.totalCostUsd),
+              multiplier != null && multiplier !== 1
+                ? `${t("usage.costMultiplier")} ×${multiplier.toFixed(2)}`
+                : undefined,
+            ]
+              .filter(Boolean)
+              .join(" · ") || undefined
           }
         >
-          {unpriced ? t("usage.unpriced") : fmtUsd(log.totalCostUsd, 4)}
+          {unpriced ? t("usage.unpriced") : money(log.totalCostUsd, 4)}
         </td>
+      ),
+      speed: (
         <td
           className={cn(usageTable.td, tps == null && usageTable.muted)}
           title={timingTip}
@@ -362,6 +534,8 @@ export function RequestLogTable({
             </>
           )}
         </td>
+      ),
+      firstToken: (
         <td
           className={cn(
             usageTable.td,
@@ -372,9 +546,46 @@ export function RequestLogTable({
           {isSession && firstTokenText != null && "≈"}
           {firstTokenText ?? "—"}
         </td>
+      ),
+      duration: (
+        <td
+          className={cn(usageTable.td, timing == null && usageTable.muted)}
+          title={
+            timing == null
+              ? undefined
+              : `${isSession ? "≈" : ""}${fmtInt(latency, locale)} ms`
+          }
+        >
+          {timing == null ? "—" : `${isSession ? "≈" : ""}${timing.duration}s`}
+        </td>
+      ),
+      statusCode: (
+        <td className={usageTable.td}>
+          {success ? (
+            log.statusCode
+          ) : (
+            <StatusBadge code={log.statusCode} title={log.errorMessage} />
+          )}
+        </td>
+      ),
+    };
+
+    return (
+      <tr
+        key={log.requestId}
+        className={onOpenDetail ? usageTable.rowInteractive : usageTable.row}
+        onClick={() => onOpenDetail?.(log.requestId)}
+      >
+        {cellIds.map((id) => (
+          <Fragment key={id}>{cells[id]}</Fragment>
+        ))}
       </tr>
     );
   };
+
+  // 默认 10 列时 620px：最小窗口（900）展开侧栏表格区只有 644px，再宽最右的速度列就被挤进横向滚动；
+  // 多开一列（含本地项目列）加一份宽度，列再多就横向滚动，不把每列挤到看不清
+  const minWidth = 620 + Math.max(0, cellIds.length - 10) * 64;
 
   return (
     <div className="flex flex-col">
@@ -404,45 +615,24 @@ export function RequestLogTable({
         </Select>
       </div>
       <div className={usageTable.scroller}>
-        {/* 最小窗口（900）展开侧栏时表格区只有 644px：最小宽度超过它，最右的速度列就被挤到横向滚动里看不见 */}
         <table
-          className={cn(usageTable.table, "min-w-[620px]")}
+          className={usageTable.table}
+          style={{ minWidth }}
           aria-label={t("usage.requestLogs")}
         >
           <thead>
             <tr className={usageTable.headRow}>
-              <th className={usageTable.th}>{t("usage.time")}</th>
-              <th className={usageTable.th}>{t("usage.app")}</th>
-              <th className={usageTable.th}>{t("usage.provider")}</th>
-              {/* 本地扩展：项目列（basename + 路由徽标） */}
-              <th className={usageTable.th}>{t("usage.projectDir")}</th>
-              <th className={usageTable.th}>{t("usage.model")}</th>
-              <th className={usageTable.th}>{t("usage.freshInput")}</th>
-              <th className={usageTable.th}>{t("usage.outputTokens")}</th>
-              <th className={usageTable.th}>{t("usage.cacheReadTokens")}</th>
-              <th className={usageTable.th}>{t("usage.cost")}</th>
-              <th className={usageTable.th}>
-                <span className="inline-flex items-center gap-0.5">
-                  {t("usage.speed")}
-                  <HelpTip title={t("usage.speedHelpTitle")} align="end">
-                    {t("usage.speedHelp")}
-                  </HelpTip>
-                </span>
-              </th>
-              <th className={usageTable.th}>
-                <span className="inline-flex items-center gap-0.5">
-                  {t("usage.firstToken")}
-                  <HelpTip title={t("usage.firstTokenHelpTitle")} align="end">
-                    {t("usage.firstTokenHelp")}
-                  </HelpTip>
-                </span>
-              </th>
+              {cellIds.map((id) => (
+                <th key={id} className={usageTable.th}>
+                  {renderHeader(id)}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
             {logs.length === 0 ? (
               <tr>
-                <td colSpan={11} className={usageTable.empty}>
+                <td colSpan={cellIds.length} className={usageTable.empty}>
                   {t("usage.noData")}
                 </td>
               </tr>
