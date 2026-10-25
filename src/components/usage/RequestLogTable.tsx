@@ -1,4 +1,12 @@
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import {
+  cloneElement,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactElement,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useRequestLogs } from "@/lib/query/usage";
 import { TablePagination } from "./TablePagination";
@@ -33,11 +41,18 @@ import {
   isSessionLogRequest,
   parseFiniteNumber,
 } from "./format";
-import { usageTable } from "./usageTable";
+import {
+  stickyCol,
+  usageTable,
+  useElementWidth,
+  useScrolledFromStart,
+} from "./usageTable";
 import { getUsageProviderLabel, usageProviderTitle } from "./providerLabel";
 import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import {
   REQUEST_LOG_COLUMN_LABEL_KEYS,
+  requestLogGroupBreaks,
+  requestLogPinnedStart,
   resolveRequestLogColumns,
   type RequestLogColumnId,
 } from "./requestLogColumns";
@@ -59,6 +74,10 @@ interface RequestLogTableProps {
   onOpenDetail?: (requestId: string) => void;
   /** 要显示的列（按表格顺序）；不传按默认列 */
   columns?: RequestLogColumnId[];
+  /** 每页几条（页面记住用户的选择）；不传按 20 */
+  pageSize?: number;
+  pageSizeOptions?: readonly number[];
+  onPageSizeChange?: (size: number) => void;
 }
 
 const pad2 = (value: number) => String(value).padStart(2, "0");
@@ -114,7 +133,9 @@ const APP_SHORT_NAME: Record<AppId, string> = {
   hermes: "Hermes",
   pi: "Pi",
   mcode: "MiniMax",
+  kimi: "Kimi",
   agy: "Antigravity",
+  omp: "omp",
 };
 
 export function appShortName(appType: string): string {
@@ -193,13 +214,15 @@ export function RequestLogTable({
   refreshIntervalMs,
   onOpenDetail,
   columns = DEFAULT_COLUMNS,
+  pageSize = 20,
+  pageSizeOptions,
+  onPageSizeChange,
 }: RequestLogTableProps) {
   const { t, i18n } = useTranslation();
   const { money, usdHint } = useMoneyFormat();
   // 本地扩展：项目筛选留在日志表内（statusCode 等全局筛选已由 Dashboard 下传）
   const [projectDir, setProjectDir] = useState<string | undefined>(undefined);
   const [page, setPage] = useState(0);
-  const pageSize = 20;
 
   const effectiveFilters: LogFilters = {
     appType:
@@ -212,7 +235,11 @@ export function RequestLogTable({
     projectDir,
   };
 
-  const { data: result, isLoading } = useRequestLogs({
+  const {
+    data: result,
+    isLoading,
+    isPlaceholderData,
+  } = useRequestLogs({
     filters: effectiveFilters,
     range,
     page,
@@ -222,9 +249,102 @@ export function RequestLogTable({
     },
   });
 
+  // 固定列：左边有没有内容滚进固定列底下、第一列多宽（第二个贴左的列要让出这段）
+  const [scrollRef, scrolled] = useScrolledFromStart<HTMLDivElement>();
+  const [firstHeadRef, firstWidth] = useElementWidth<HTMLTableCellElement>();
+
   const logs = result?.data ?? [];
   const total = result?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  // 停在后面的页时总数变少了（「今天」跨日、重建 Codex 用量）：收回到最后一页。
+  // 只剩一页时翻页条不画，不收回就只剩一张空表、也翻不回去
+  const pageOutOfRange = !!result && !isPlaceholderData && page >= totalPages;
+  useEffect(() => {
+    if (pageOutOfRange) setPage(totalPages - 1);
+  }, [pageOutOfRange, totalPages]);
+
+  // 刷新带来新请求时：旧行从原位置滑到新位置，新行淡入并留一段渐隐的底色，
+  // 看着的那行往哪走了一眼就能跟上。只在第一页、筛选没变时做；减少动态效果时只留底色
+  const tbodyRef = useRef<HTMLTableSectionElement>(null);
+  const shownRef = useRef<{ view: string; ids: string[] } | null>(null);
+  // 翻页、换每页条数、换筛选都算换了一屏：多出来的行不是「新来的」，不播进场动画
+  const view = JSON.stringify([
+    page,
+    pageSize,
+    dashboardAppType,
+    providerName,
+    model,
+    statusCode,
+    range.preset,
+    range.customStartDate,
+    range.customEndDate,
+  ]);
+  useLayoutEffect(() => {
+    // 换筛选时先显示的是上一份数据，不算「新来的」
+    if (!result || isPlaceholderData) return;
+    const ids = result.data.map((log) => log.requestId);
+    const shown = shownRef.current;
+    shownRef.current = { view, ids };
+    const tbody = tbodyRef.current;
+    if (
+      page !== 0 ||
+      shown?.view !== view ||
+      !tbody ||
+      typeof tbody.animate !== "function"
+    ) {
+      return;
+    }
+    const before = new Map(shown.ids.map((id, index) => [id, index]));
+    const reduceMotion = window.matchMedia?.(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const highlight = getComputedStyle(tbody)
+      .getPropertyValue("--action-soft")
+      .trim();
+    ids.forEach((id, index) => {
+      const row = tbody.rows[index];
+      const from = before.get(id);
+      if (!row) return;
+      if (from === undefined) {
+        // 底色画在每个单元格上（盖得住固定列自己的底色）；
+        // 叠在格子原有的阴影上（贴左列滚动后的分隔线），动画期间不把它冲掉
+        for (const cell of Array.from(row.cells)) {
+          const own = getComputedStyle(cell).boxShadow;
+          const keep = own && own !== "none" ? `, ${own}` : "";
+          cell.animate(
+            [
+              { boxShadow: `inset 0 0 0 100vmax ${highlight}${keep}` },
+              { boxShadow: `inset 0 0 0 100vmax transparent${keep}` },
+            ],
+            {
+              duration: 1200,
+              delay: 300,
+              easing: "ease-in",
+              fill: "backwards",
+            },
+          );
+        }
+        if (!reduceMotion) {
+          row.animate([{ opacity: 0 }, { opacity: 1 }], {
+            duration: 240,
+            delay: 160,
+            easing: "ease-out",
+            fill: "backwards",
+          });
+        }
+      } else if (from !== index && !reduceMotion) {
+        // 行等高，按自身高度的倍数位移
+        row.animate(
+          [
+            { transform: `translateY(${(from - index) * 100}%)` },
+            { transform: "none" },
+          ],
+          { duration: 320, easing: "cubic-bezier(0.2, 0, 0, 1)" },
+        );
+      }
+    });
+  }, [result, isPlaceholderData, view, page]);
 
   useEffect(() => {
     setPage(0);
@@ -342,7 +462,12 @@ export function RequestLogTable({
     const hitRate = getRequestCacheHitRate(log);
     const success = isSuccessStatus(log.statusCode);
 
-    const cells: Record<RowCellId, ReactNode> = {
+    // 本地扩展：cells 的键含 project（上游自选列 + 本地项目列）；
+    // 上游改用 ReactElement + cloneElement 渲染行（附加 denseCell / 固定列样式）
+    const cells: Record<
+      RowCellId,
+      ReactElement<{ className?: string; style?: CSSProperties }>
+    > = {
       // 时间、应用两列收紧到内容宽度（w-px），多出来的宽度留给后面的数值列
       time: (
         <td className={cn(usageTable.td, "w-px")}>
@@ -373,7 +498,7 @@ export function RequestLogTable({
       app: (
         <td className={cn(usageTable.td, "w-px")}>
           <span
-            className="flex max-w-[88px] items-center gap-1.5"
+            className="flex items-center gap-1.5"
             title={appDisplayName(log.appType)}
           >
             {isKnownAppId(log.appType) && (
@@ -383,29 +508,22 @@ export function RequestLogTable({
                 badgeClassName="bg-surface"
               />
             )}
-            <span className="truncate" aria-hidden="true">
-              {appShortName(log.appType)}
-            </span>
+            <span aria-hidden="true">{appShortName(log.appType)}</span>
             <span className="sr-only">{appDisplayName(log.appType)}</span>
           </span>
         </td>
       ),
-      // 供应商、项目、模型三列按比例取宽（max-w-0 让百分比宽度生效、内容截断）；
-      // 比例合计 44%，再大就会把数值列挤到只剩内容宽度。模型名通常比供应商名长，
-      // 放不下的截断、悬停看全名
+      // 供应商、项目、模型按内容取宽、不截断：放不下时整张表横向滚动，不把列挤到看不全
+      // （本地项目列跟随上游内容取宽体系；完整路径放在悬停提示里）
       provider: (
-        <td className={cn(usageTable.td, "w-[14%] max-w-0")}>
-          <span
-            className="block truncate"
-            title={usageProviderTitle(providerLabel)}
-          >
-            {provider}
-          </span>
+        <td className={usageTable.td}>
+          <span title={usageProviderTitle(providerLabel)}>{provider}</span>
         </td>
       ),
       // 本地扩展：项目列——basename 主展示、完整路径悬停；[路由] 徽标表示走了项目级绑定
+      // （宽度跟随上游内容取宽体系，不设百分比；旧版的 w-[12%] max-w-0 属于按比例取宽布局）
       project: (
-        <td className={cn(usageTable.td, "w-[12%] max-w-0")}>
+        <td className={usageTable.td}>
           {log.projectDir ? (
             <span className="flex items-center gap-1" title={log.projectDir}>
               {log.projectRouted && (
@@ -424,11 +542,11 @@ export function RequestLogTable({
         </td>
       ),
       model: (
-        <td className={cn(usageTable.td, usageTable.mono, "w-[18%] max-w-0")}>
-          <span className="block truncate" title={modelTitle}>
-            {/* 本地扩展：[图片] 徽标表示该请求被分流到了视觉模型 */}
+        <td className={cn(usageTable.td, usageTable.mono)}>
+          {/* 本地扩展：[图片] 徽标表示该请求被分流到了视觉模型 */}
+          <span className="inline-flex items-center gap-1" title={modelTitle}>
             {log.visionRouted && (
-              <span className="me-0.5 rounded-[4px] bg-subtle px-1 text-badge text-fg-2">
+              <span className="shrink-0 rounded-[4px] bg-subtle px-1 text-badge text-fg-2">
                 {t("usage.visionRouteBadge")}
               </span>
             )}
@@ -577,16 +695,50 @@ export function RequestLogTable({
         className={onOpenDetail ? usageTable.rowInteractive : usageTable.row}
         onClick={() => onOpenDetail?.(log.requestId)}
       >
-        {cellIds.map((id) => (
-          <Fragment key={id}>{cells[id]}</Fragment>
-        ))}
+        {cellIds.map((id) => {
+          const pin = pinFor(id, "body");
+          return cloneElement(cells[id], {
+            key: id,
+            className: cn(
+              cells[id].props.className,
+              usageTable.denseCell,
+              id !== "project" &&
+                groupBreaks.has(id) &&
+                usageTable.denseGroupGap,
+              pin.className,
+            ),
+            style: pin.style,
+          });
+        })}
       </tr>
     );
   };
 
-  // 默认 10 列时 620px：最小窗口（900）展开侧栏表格区只有 644px，再宽最右的速度列就被挤进横向滚动；
-  // 多开一列（含本地项目列）加一份宽度，列再多就横向滚动，不把每列挤到看不清
-  const minWidth = 620 + Math.max(0, cellIds.length - 10) * 64;
+  const groupBreaks = requestLogGroupBreaks(columns);
+
+  // 横向滚动时：开头的时间 / 应用列贴左
+  const pinnedStart = requestLogPinnedStart(columns);
+  const pinFor = (
+    id: RowCellId,
+    part: "head" | "body",
+  ): { className?: string; style?: CSSProperties } => {
+    // 本地扩展：项目列不在上游固定列集合里（也顺带把类型窄化回上游列 id）
+    if (id === "project") return {};
+    const index = pinnedStart.indexOf(id);
+    if (index >= 0) {
+      return {
+        className: cn(
+          stickyCol.start,
+          stickyCol[part],
+          index === pinnedStart.length - 1 && scrolled && stickyCol.startEdge,
+        ),
+        // ponytail: 只量了第一列，偏移只对最多两列固定成立（requestLogPinnedStart 取前两列）；
+        // 要固定第三列时改成量每个固定列、按累计宽度偏移
+        style: { insetInlineStart: index === 0 ? 0 : firstWidth },
+      };
+    }
+    return {};
+  };
 
   return (
     <div className="flex flex-col">
@@ -615,22 +767,37 @@ export function RequestLogTable({
           </SelectContent>
         </Select>
       </div>
-      <div className={usageTable.scroller}>
+      <div ref={scrollRef} className={usageTable.scroller}>
+        {/* 表格按内容取宽（w-max），至少铺满面板；比面板宽时在外层横向滚动，每列都完整显示 */}
         <table
-          className={usageTable.table}
-          style={{ minWidth }}
+          className={cn(usageTable.table, "w-max min-w-full")}
           aria-label={t("usage.requestLogs")}
         >
           <thead>
             <tr className={usageTable.headRow}>
-              {cellIds.map((id) => (
-                <th key={id} className={usageTable.th}>
-                  {renderHeader(id)}
-                </th>
-              ))}
+              {cellIds.map((id, index) => {
+                const pin = pinFor(id, "head");
+                return (
+                  <th
+                    key={id}
+                    ref={index === 0 ? firstHeadRef : undefined}
+                    className={cn(
+                      usageTable.th,
+                      usageTable.denseCell,
+                      id !== "project" &&
+                        groupBreaks.has(id) &&
+                        usageTable.denseGroupGap,
+                      pin.className,
+                    )}
+                    style={pin.style}
+                  >
+                    {renderHeader(id)}
+                  </th>
+                );
+              })}
             </tr>
           </thead>
-          <tbody>
+          <tbody ref={tbodyRef}>
             {logs.length === 0 ? (
               <tr>
                 <td colSpan={cellIds.length} className={usageTable.empty}>
@@ -649,6 +816,16 @@ export function RequestLogTable({
         totalPages={totalPages}
         total={total}
         onPageChange={setPage}
+        pageSize={pageSize}
+        pageSizeOptions={pageSizeOptions}
+        onPageSizeChange={
+          onPageSizeChange &&
+          ((next) => {
+            // 换条数后停在包含当前第一行的那一页
+            setPage(Math.floor((page * pageSize) / next));
+            onPageSizeChange(next);
+          })
+        }
       />
     </div>
   );

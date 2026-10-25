@@ -69,8 +69,10 @@ impl Database {
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_agy BOOLEAN NOT NULL DEFAULT 0,
+            enabled_kimi BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
-            enabled_pi BOOLEAN NOT NULL DEFAULT 0
+            enabled_pi BOOLEAN NOT NULL DEFAULT 0,
+            enabled_omp BOOLEAN NOT NULL DEFAULT 0
         )",
             [],
         )
@@ -101,6 +103,7 @@ impl Database {
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_mcode BOOLEAN NOT NULL DEFAULT 0,
             enabled_agy BOOLEAN NOT NULL DEFAULT 0,
+            enabled_kimi BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT,
@@ -643,6 +646,37 @@ impl Database {
                             }
                         }
                         Self::set_user_version(conn, 23)?;
+                    }
+                    // 上游 v4.0.19 的 v21→v22（enabled_kimi）与本 fork v22 撞号：
+                    // 重编号为 v23→v24 追加链尾，已升级 v23 的本地库平滑补列，
+                    // 迁移内部逻辑与上游保持一致。
+                    23 => {
+                        for table in ["mcp_servers", "skills"] {
+                            if Self::table_exists(conn, table)? {
+                                Self::add_column_if_missing(
+                                    conn,
+                                    table,
+                                    "enabled_kimi",
+                                    "BOOLEAN NOT NULL DEFAULT 0",
+                                )?;
+                            }
+                        }
+                        Self::set_user_version(conn, 24)?;
+                    }
+                    // 上游 v4.0.20 的 v22→v23（enabled_omp）与本 fork v23 撞号：
+                    // 重编号为 v24→v25 追加链尾，已升级 v24 的本地库平滑补列，
+                    // 迁移内部逻辑与上游保持一致。
+                    24 => {
+                        // Oh My Pi：只有 MCP 存开关；Skills 的启用状态按原生目录现算（同 Pi）。
+                        if Self::table_exists(conn, "mcp_servers")? {
+                            Self::add_column_if_missing(
+                                conn,
+                                "mcp_servers",
+                                "enabled_omp",
+                                "BOOLEAN NOT NULL DEFAULT 0",
+                            )?;
+                        }
+                        Self::set_user_version(conn, 25)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -2592,6 +2626,34 @@ impl Database {
             ("kimi-k3", "Kimi K3", "3.00", "15.00", "0.30", "3.00"),
             // Kimi For Coding 套餐里 K3 的裸名（无 kimi- 前缀），同标准 list 价
             ("k3", "Kimi K3", "3.00", "15.00", "0.30", "3.00"),
+            // 2026-10-24 官方价页：K3.1 Pro 缓存写入取默认 5 分钟档（1 小时档为 2 倍）。
+            // HighSpeed 只有输入/输出/缓存写翻倍，缓存读仍是 $0.20，别按 K2.7 的 2 倍规律改
+            (
+                "kimi-k3.1-pro",
+                "Kimi K3.1 Pro",
+                "2.00",
+                "10.00",
+                "0.20",
+                "2.00",
+            ),
+            (
+                "kimi-k3.1-pro-highspeed",
+                "Kimi K3.1 Pro HighSpeed",
+                "4.00",
+                "20.00",
+                "0.20",
+                "4.00",
+            ),
+            // Kimi Code 套餐里的裸名（无 kimi- 前缀），同标准 list 价
+            ("k3.1-pro", "Kimi K3.1 Pro", "2.00", "10.00", "0.20", "2.00"),
+            (
+                "k3.1-pro-highspeed",
+                "Kimi K3.1 Pro HighSpeed",
+                "4.00",
+                "20.00",
+                "0.20",
+                "4.00",
+            ),
             // 腾讯混元 (Tencent Hunyuan)（官方 CNY 1/4/0.25 按 1 USD ≈ 7.14 折算；Hy3 阶梯计价取最低档）
             ("hunyuan-hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
             ("hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
@@ -4042,12 +4104,52 @@ mod tests {
     // v22→v23 追加链尾（见迁移链注释），测试起点与断言随链更新，
     // 夹具与断言逻辑保持上游原样。
     #[test]
+    fn kimi_migration_preserves_existing_flags_and_defaults_to_disabled() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE mcp_servers(id TEXT PRIMARY KEY, enabled_codex BOOLEAN); CREATE TABLE skills(id TEXT PRIMARY KEY, enabled_claude BOOLEAN); INSERT INTO mcp_servers VALUES ('m',1); INSERT INTO skills VALUES ('s',1);")?;
+        // 上游原测试从 v21 起步（上游 kimi 臂起点）；重编号为 v23→v24 后对齐链尾起点。
+        Database::set_user_version(&conn, 23)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for (table, flag) in [
+            ("mcp_servers", "enabled_codex"),
+            ("skills", "enabled_claude"),
+        ] {
+            let flags = conn.query_row(
+                &format!("SELECT {flag}, enabled_kimi FROM {table}"),
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            assert_eq!(flags, (1, 0));
+        }
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kimi_clean_database_persists_mcp_and_skill_flags_independently() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let server = serde_json::from_value(serde_json::json!({"id":"m", "name":"m", "server":{"command":"echo"}, "apps":{"kimi":true,"codex":true}})).unwrap();
+        db.save_mcp_server(&server)?;
+        db.update_mcp_server_app_enabled("m", &crate::app_config::AppType::Kimi, false)?;
+        let saved = db.get_all_mcp_servers()?;
+        assert!(!saved["m"].apps.kimi);
+        assert!(saved["m"].apps.codex);
+        let skill = serde_json::from_value(serde_json::json!({"id":"s", "name":"s", "description":"", "directory":"s", "apps":{"kimi":true,"claude":true}, "installedAt":0})).unwrap();
+        db.save_skill(&skill)?;
+        let saved = db.get_installed_skill("s")?.unwrap();
+        assert!(saved.apps.kimi && saved.apps.claude);
+        assert!(db.get_all_installed_skills()?["s"].apps.kimi);
+        Ok(())
+    }
+
+    #[test]
     fn agy_migration_preserves_existing_flags_and_defaults_to_disabled() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("CREATE TABLE mcp_servers(id TEXT PRIMARY KEY, enabled_gemini BOOLEAN); CREATE TABLE skills(id TEXT PRIMARY KEY, enabled_codex BOOLEAN); INSERT INTO mcp_servers VALUES ('m',1); INSERT INTO skills VALUES ('s',1);")?;
         Database::set_user_version(&conn, 22)?;
         Database::apply_schema_migrations_on_conn(&conn)?;
-        assert_eq!(Database::get_user_version(&conn)?, 23);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         for (table, flag) in [
             ("mcp_servers", "enabled_gemini"),
             ("skills", "enabled_codex"),
