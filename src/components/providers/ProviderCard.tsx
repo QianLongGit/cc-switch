@@ -6,7 +6,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type QueryKey } from "@tanstack/react-query";
 import type {
   DraggableAttributes,
   DraggableSyntheticListeners,
@@ -23,6 +23,15 @@ import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import XaiOauthQuotaFooter from "@/components/XaiOauthQuotaFooter";
 import AgyAccountQuotaFooter from "@/components/AgyAccountQuotaFooter";
+import { ClaudeBoundAccountLine } from "@/components/providers/forms/ClaudeOfficialSection";
+import ClaudeAccountQuotaFooter from "@/components/ClaudeAccountQuotaFooter";
+import { claudePlanLabel } from "@/lib/claudePlan";
+import {
+  subscriptionKeys,
+  useClaudeDefaultPlan,
+} from "@/lib/query/subscription";
+import { useQuotaPlan } from "@/lib/query/accountPlans";
+import type { CopilotQuota } from "@/lib/query/copilot";
 import KimiAccountQuotaFooter from "@/components/KimiAccountQuotaFooter";
 import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
 import {
@@ -34,13 +43,17 @@ import { isMac } from "@/lib/platform";
 import {
   isOfficialAccount,
   resolveCodexOfficialIdentity,
+  supportsConnectivityCheck,
 } from "@/utils/providerCapabilities";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
 import { resolveProviderIcon } from "@/utils/providerIcon";
-import { isAdditiveAppId, isProxyAppId } from "@/config/appConfig";
+import { isProxyAppId } from "@/config/appConfig";
 import { ProviderCardActions } from "./ProviderCardActions";
+import { terminalAvailable, terminalIsIsolated } from "./OpenTerminalDialog";
 import type { CardChip, CardPresentation, CardTone } from "./presentation";
+
+const copilotPlan = (data: unknown) => (data as CopilotQuota).plan;
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -53,9 +66,8 @@ interface ProviderCardProps {
   appId: AppId;
   /** 卡片怎么画：模式色、状态 / 按钮、徽标（由列表按模式算好） */
   presentation: CardPresentation;
-  /** 用来决定额度是否自动查询（共存式应用看 isInConfig） */
+  /** 用来决定官方订阅 / OAuth 额度是否自动查询 */
   isCurrent: boolean;
-  isInConfig?: boolean;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onConfigureUsage: (provider: Provider) => void;
@@ -180,7 +192,6 @@ export function ProviderCard({
   appId,
   presentation,
   isCurrent,
-  isInConfig = true,
   onEdit,
   onDelete,
   onConfigureUsage,
@@ -250,9 +261,17 @@ export function ProviderCard({
   }, [provider.notes, displayUrl, fallbackUrlText]);
 
   const isBoundCodexOfficial = codexOfficialIdentity === "managed_account";
-  const usageEnabled =
-    provider.meta?.usage_script?.enabled ?? isBoundCodexOfficial;
   const isOfficial = isOfficialProvider(provider, appId);
+  // Claude 官方卡绑了 Claude 官方账号：副标题写账号，额度按这个号查
+  const claudeBoundAccountId =
+    appId === "claude" && isOfficial
+      ? resolveManagedAccountId(provider.meta, "claude_official")?.trim() ||
+        null
+      : null;
+  // 绑了账号的官方卡（Codex / Claude）默认查额度，和 Kimi、agy 的账号卡一样
+  const usageEnabled =
+    provider.meta?.usage_script?.enabled ??
+    (isBoundCodexOfficial || Boolean(claudeBoundAccountId));
   const supportsOfficialSubscription =
     isOfficial &&
     ["claude", "codex", "gemini", "grokbuild", "agy"].includes(appId);
@@ -261,6 +280,22 @@ export function ProviderCard({
     TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION;
   const officialSubscriptionEnabled =
     supportsOfficialSubscription && usageEnabled && isOfficialSubscriptionUsage;
+  // 没绑账号的 Claude 官方卡用 Claude Code 的默认登录：开了额度查询时，地址后面跟默认登录的套餐
+  const showClaudeDefaultPlan =
+    appId === "claude" &&
+    isOfficial &&
+    !claudeBoundAccountId &&
+    officialSubscriptionEnabled;
+  const { data: claudeDefaultPlan } = useClaudeDefaultPlan(
+    showClaudeDefaultPlan,
+  );
+  const claudeDefaultPlanLabel = showClaudeDefaultPlan
+    ? claudePlanLabel(
+        t,
+        claudeDefaultPlan?.subscriptionType,
+        claudeDefaultPlan?.rateLimitTier,
+      )
+    : null;
 
   const isCopilot =
     provider.meta?.providerType === PROVIDER_TYPES.GITHUB_COPILOT ||
@@ -276,12 +311,51 @@ export function ProviderCard({
     appId === "agy" && isOfficial && isMac()
       ? resolveManagedAccountId(provider.meta, "agy_oauth")?.trim() || null
       : null;
-  // 获取用量数据以判断是否有多套餐
-  // 累加模式应用：使用 isInConfig 代替 isCurrent
-  const shouldAutoQuery = isAdditiveAppId(appId) ? isInConfig : isCurrent;
-  const autoQueryInterval = shouldAutoQuery
-    ? provider.meta?.usage_script?.autoQueryInterval || 0
-    : 0;
+  // 副标题末尾的套餐：读右边额度那个查询的缓存（键和各额度 footer 一致），额度查到才有。
+  // Claude 官方卡另有写法（claudeDefaultPlanLabel / ClaudeBoundAccountLine）
+  const quotaPlanKey: QueryKey | null = isCopilot
+    ? [
+        "copilot",
+        "quota",
+        resolveManagedAccountId(provider.meta, PROVIDER_TYPES.GITHUB_COPILOT) ??
+          "default",
+      ]
+    : isCodexOauth
+      ? !isBoundCodexOfficial || usageEnabled
+        ? [
+            "codex_oauth",
+            "quota",
+            resolveManagedAccountId(
+              provider.meta,
+              PROVIDER_TYPES.CODEX_OAUTH,
+            ) ?? "default",
+          ]
+        : null
+      : isXaiOauth
+        ? [
+            "xai_oauth",
+            "quota",
+            resolveManagedAccountId(provider.meta, PROVIDER_TYPES.XAI_OAUTH) ??
+              "default",
+          ]
+        : appId === "kimi" && isOfficial
+          ? ["kimi_oauth", "quota", provider.id]
+          : isOfficial && officialSubscriptionEnabled && appId !== "claude"
+            ? agyBoundAccountId
+              ? ["agy_oauth", "quota", agyBoundAccountId]
+              : subscriptionKeys.quota(appId)
+            : null;
+  const quotaPlan = useQuotaPlan(
+    quotaPlanKey,
+    isCopilot ? copilotPlan : undefined,
+  );
+  const subtitlePlan = claudeDefaultPlanLabel ?? quotaPlan;
+  const planSuffix = (className = "-ms-1") =>
+    subtitlePlan ? (
+      <span className={cn("shrink-0", className)}>· {subtitlePlan}</span>
+    ) : null;
+  // 获取用量数据以判断是否有多套餐，按用户配置刷新，不依赖供应商启用状态。
+  const autoQueryInterval = provider.meta?.usage_script?.autoQueryInterval ?? 0;
 
   // 脚本用量只在「已启用 + 非官方 + 非官方订阅模板」时才查询；展开判定必须复用同一谓词，
   // 因为禁用的 React Query observer 仍会返回同 key 的旧缓存。
@@ -385,12 +459,15 @@ export function ProviderCard({
           {codexOfficialIdentity && codexOfficialIdentity !== "api_key" ? (
             <div className="mt-0.5 flex min-w-0 items-center gap-2 text-caption text-fg-2">
               {codexOfficialIdentity === "native_login" ? (
-                <span className="min-w-0 truncate" title={manualNote}>
-                  {manualNote ??
-                    t("codex.followCodexLoginDescription", {
-                      defaultValue: "账号会随 Codex CLI 当前登录变化",
-                    })}
-                </span>
+                <>
+                  <span className="min-w-0 truncate" title={manualNote}>
+                    {manualNote ??
+                      t("codex.followCodexLoginDescription", {
+                        defaultValue: "账号会随 Codex CLI 当前登录变化",
+                      })}
+                  </span>
+                  {planSuffix()}
+                </>
               ) : managedCodexAccount ? (
                 <>
                   <span
@@ -404,6 +481,7 @@ export function ProviderCard({
                           })
                         : managedCodexAccount.login)}
                   </span>
+                  {planSuffix()}
                   {managedCodexAccount.reauth_required && (
                     <span className="inline-flex shrink-0 items-center gap-1 text-warning-text">
                       <AlertTriangle className="h-3.5 w-3.5" />
@@ -448,11 +526,37 @@ export function ProviderCard({
                 </span>
               )}
             </div>
+          ) : claudeBoundAccountId ? (
+            <ClaudeBoundAccountLine
+              accountId={claudeBoundAccountId}
+              providerName={provider.name}
+              note={manualNote}
+              showPlan={usageEnabled}
+            />
           ) : agyModel ? (
             <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-caption text-fg-2">
               <span className="min-w-0 truncate" title={agyModel}>
                 {agyModel}
               </span>
+              {planSuffix("-ms-0.5")}
+            </div>
+          ) : displayUrl && subtitlePlan ? (
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-caption text-fg-2">
+              <button
+                type="button"
+                onClick={handleOpenWebsite}
+                className={cn(
+                  "inline-flex min-w-0 items-center overflow-hidden text-start",
+                  isClickableUrl
+                    ? "cursor-pointer decoration-border-strong underline-offset-[3px] hover:underline"
+                    : "cursor-default",
+                )}
+                title={displayUrl}
+                disabled={!isClickableUrl}
+              >
+                <span className="min-w-0 truncate">{displayUrl}</span>
+              </button>
+              {planSuffix()}
             </div>
           ) : displayUrl ? (
             <button
@@ -509,6 +613,17 @@ export function ProviderCard({
                   inline={true}
                   isCurrent={isCurrent}
                 />
+              ) : claudeBoundAccountId ? (
+                usageEnabled ? (
+                  <ClaudeAccountQuotaFooter
+                    accountId={claudeBoundAccountId}
+                    inline={true}
+                    isCurrent={isCurrent}
+                    autoQueryInterval={
+                      provider.meta?.usage_script?.autoQueryInterval ?? 5
+                    }
+                  />
+                ) : null
               ) : isOfficial ? (
                 officialSubscriptionEnabled ? (
                   agyBoundAccountId ? (
@@ -544,8 +659,6 @@ export function ProviderCard({
                   providerId={provider.id}
                   appId={appId}
                   usageEnabled={usageEnabled}
-                  isCurrent={isCurrent}
-                  isInConfig={isInConfig}
                   inline={true}
                 />
               )}
@@ -581,12 +694,7 @@ export function ProviderCard({
                 : undefined
             }
             onTest={
-              // 连通检测对第三方/自定义/Copilot/Codex-OAuth 供应商开放。官方供应商一律不给：
-              // 它们 base_url 故意留空、走客户端默认/OAuth 端点，没有可靠的探测目标。
-              onTest &&
-              appId !== "mcode" &&
-              appId !== "kimi" &&
-              provider.category !== "official"
+              onTest && supportsConnectivityCheck(appId, provider)
                 ? () => onTest(provider)
                 : undefined
             }
@@ -600,8 +708,11 @@ export function ProviderCard({
                 : () => onConfigureUsage(provider)
             }
             onOpenTerminal={
-              onOpenTerminal ? () => onOpenTerminal(provider) : undefined
+              onOpenTerminal && terminalAvailable(provider, appId, isCurrent)
+                ? () => onOpenTerminal(provider)
+                : undefined
             }
+            openTerminalIsolated={terminalIsIsolated(provider, appId)}
           />
         </div>
       </div>
@@ -613,8 +724,6 @@ export function ProviderCard({
             providerId={provider.id}
             appId={appId}
             usageEnabled={usageEnabled}
-            isCurrent={isCurrent}
-            isInConfig={isInConfig}
             inline={false}
           />
         </div>

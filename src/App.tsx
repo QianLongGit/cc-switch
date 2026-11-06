@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -22,6 +24,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
 import { KNOWN_APP_TYPES, type AppTypeFilter } from "@/types/usage";
 import type { EnvConflict } from "@/types/env";
+import type { SubscriptionQuota } from "@/types/subscription";
 import {
   providersQueryOptions,
   proxyKeys,
@@ -79,32 +82,23 @@ import { WindowControls } from "@/components/shell/WindowControls";
 import { APP_DISPLAY_NAME, AppGlyph } from "@/components/shell/AppGlyph";
 import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
-import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import {
   hasOpencodeDefinition,
   isNativeOpencodeConfig,
 } from "@/components/providers/forms/helpers/opencodeFormUtils";
-import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { OpenTerminalDialog } from "@/components/providers/OpenTerminalDialog";
 import { discardUnsavedChanges, hasUnsavedChanges } from "@/lib/unsavedChanges";
-import { SettingsPage } from "@/components/settings/SettingsPage";
-import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
-import { AppsPage } from "@/components/apps/AppsPage";
+import { RefreshAllQuotaButton } from "@/components/settings/auth/RefreshAllQuotaButton";
 import {
   checkToolUpdatesInBackground,
   useToolUpdatesAvailable,
 } from "@/components/apps/useToolManagement";
-import { UsagePage } from "@/components/usage/UsagePage";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { SwitchModePanel } from "@/components/providers/mode/SwitchModePanel";
 import { proxyApi } from "@/lib/api/proxy";
 import type { AppMode, StartupAttachFailure } from "@/types/proxy";
-import UsageScriptModal from "@/components/UsageScriptModal";
-import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
-import PromptPanel from "@/components/prompts/PromptPanel";
 import { PROMPT_APP_IDS } from "@/lib/query/prompts";
-import UnifiedSkillsPanel from "@/components/skills/UnifiedSkillsPanel";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
 import { WhatsNewNotice } from "@/components/WhatsNewDialog";
@@ -120,20 +114,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
 import {
   useDisableCurrentOmo,
   useDisableCurrentOmoSlim,
 } from "@/lib/query/omo";
 import { invalidatePiProviderCaches, usePiCurrentState } from "@/lib/query/pi";
-import WorkspaceFilesPanel from "@/components/workspace/WorkspaceFilesPanel";
-import EnvPanel from "@/components/openclaw/EnvPanel";
-import ToolsPanel from "@/components/openclaw/ToolsPanel";
-import AgentsDefaultsPanel from "@/components/openclaw/AgentsDefaultsPanel";
 import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
-import HermesMemoryPanel, {
-  HermesMemorySaveButton,
-} from "@/components/hermes/HermesMemoryPanel";
 // 本地扩展：项目路由页（Claude 项目级供应商绑定）
 import { ProjectRoutingPage } from "@/components/projectRouting/ProjectRoutingPage";
 import {
@@ -144,6 +130,76 @@ import {
   orderAppIds,
 } from "@/config/appConfig";
 import type { PiFamilyAppId } from "@/lib/api/pi";
+
+// Keep the provider page and event listeners ready at startup. Editors, charts
+// and secondary pages are loaded when the user first opens them.
+const AddProviderDialog = lazy(() =>
+  import("@/components/providers/AddProviderDialog").then((m) => ({
+    default: m.AddProviderDialog,
+  })),
+);
+const EditProviderDialog = lazy(() =>
+  import("@/components/providers/EditProviderDialog").then((m) => ({
+    default: m.EditProviderDialog,
+  })),
+);
+const SettingsPage = lazy(() =>
+  import("@/components/settings/SettingsPage").then((m) => ({
+    default: m.SettingsPage,
+  })),
+);
+const AuthCenterPanel = lazy(() =>
+  import("@/components/settings/AuthCenterPanel").then((m) => ({
+    default: m.AuthCenterPanel,
+  })),
+);
+const AppsPage = lazy(() =>
+  import("@/components/apps/AppsPage").then((m) => ({ default: m.AppsPage })),
+);
+const UsagePage = lazy(() =>
+  import("@/components/usage/UsagePage").then((m) => ({
+    default: m.UsagePage,
+  })),
+);
+const SessionManagerPage = lazy(() =>
+  import("@/components/sessions/SessionManagerPage").then((m) => ({
+    default: m.SessionManagerPage,
+  })),
+);
+const UsageScriptModal = lazy(() => import("@/components/UsageScriptModal"));
+const UnifiedMcpPanel = lazy(() => import("@/components/mcp/UnifiedMcpPanel"));
+const PromptPanel = lazy(() => import("@/components/prompts/PromptPanel"));
+const UnifiedSkillsPanel = lazy(
+  () => import("@/components/skills/UnifiedSkillsPanel"),
+);
+const WorkspaceFilesPanel = lazy(
+  () => import("@/components/workspace/WorkspaceFilesPanel"),
+);
+const EnvPanel = lazy(() => import("@/components/openclaw/EnvPanel"));
+const ToolsPanel = lazy(() => import("@/components/openclaw/ToolsPanel"));
+const AgentsDefaultsPanel = lazy(
+  () => import("@/components/openclaw/AgentsDefaultsPanel"),
+);
+const HermesMemoryPanel = lazy(
+  () => import("@/components/hermes/HermesMemoryPanel"),
+);
+const HermesMemorySaveButton = lazy(() =>
+  import("@/components/hermes/HermesMemoryPanel").then((m) => ({
+    default: m.HermesMemorySaveButton,
+  })),
+);
+
+function PageLoading() {
+  const { t } = useTranslation();
+  return (
+    <div
+      role="status"
+      className="flex flex-1 items-center justify-center text-sm text-fg-2"
+    >
+      {t("common.loading")}
+    </div>
+  );
+}
 
 interface SyncStatusUpdatedPayload {
   source?: string;
@@ -180,6 +236,10 @@ function App() {
     PROMPT_APP_IDS.includes(sharedFeatureApp) ? sharedFeatureApp : "claude",
   );
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [hasOpenedAdd, setHasOpenedAdd] = useState(false);
+  useEffect(() => {
+    if (isAddOpen) setHasOpenedAdd(true);
+  }, [isAddOpen]);
   // 供应商搜索面板：页头按钮和 ⌘F 都能打开；换应用或离开供应商页就收起
   const [providerSearchOpen, setProviderSearchOpen] = useState(false);
   const [connectionStatusSlot, setConnectionStatusSlot] =
@@ -281,6 +341,10 @@ function App() {
   }, [activeApp, currentView]);
 
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [hasOpenedEdit, setHasOpenedEdit] = useState(false);
+  useEffect(() => {
+    if (editingProvider) setHasOpenedEdit(true);
+  }, [editingProvider]);
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
@@ -452,6 +516,22 @@ function App() {
             if (event.appType === "pi") {
               await invalidatePiProviderCaches(queryClient);
             }
+            if (event.appType === "claude") {
+              // 托盘切卡、应用项目同样可能把默认登录收成新账号
+              await queryClient.invalidateQueries({
+                queryKey: ["managed-auth-status", "claude_official"],
+              });
+            }
+            // 切换会顺带刷新托管 ChatGPT 账号的令牌（托盘切换也一样）：
+            // 重查停在失败上的账号额度，免得主界面一直显示旧的「登录过期」
+            await queryClient.invalidateQueries({
+              predicate: (query) =>
+                query.queryKey[0] === "codex_oauth" &&
+                query.queryKey[1] === "quota" &&
+                (query.state.status === "error" ||
+                  (query.state.data as SubscriptionQuota | undefined)
+                    ?.success === false),
+            });
           },
         );
         if (!active) {
@@ -536,6 +616,22 @@ function App() {
           defaultValue: `当前供应商 ${payload.providerName} 是官方供应商，建议切换到第三方供应商后再使用代理接管`,
         }),
         { duration: 8000 },
+      );
+    },
+  );
+
+  // Codex / Grok Build 跟随系统代理发请求：发往本地路由的请求被系统代理接走时客户端只看到
+  // 空正文 502，CC Switch 这边没有日志（#9221），进入路由时后端自检一次，没回来就提示。
+  useTauriEvent<{ appType: AppId; origin: string }>(
+    "proxy-loopback-hijacked",
+    (payload) => {
+      const app = APP_DISPLAY_NAME[payload.appType] ?? payload.appType;
+      toast.warning(
+        t("notifications.proxyLoopbackHijacked", {
+          app,
+          origin: payload.origin,
+        }),
+        { duration: 15000 },
       );
     },
   );
@@ -768,6 +864,7 @@ function App() {
       try {
         if (
           activeApp === "mcode" ||
+          activeApp === "dsh" ||
           activeApp === "kimi" ||
           activeApp === "agy"
         )
@@ -998,7 +1095,7 @@ function App() {
         queryClient.invalidateQueries({ queryKey: hermesKeys.liveProviderIds }),
         queryClient.invalidateQueries({ queryKey: hermesKeys.modelConfig }),
       ]);
-    } else if (app === "mcode" || app === "kimi") {
+    } else if (app === "mcode" || app === "dsh" || app === "kimi") {
       await queryClient.invalidateQueries({ queryKey: ["providers", app] });
     }
   };
@@ -1167,7 +1264,11 @@ function App() {
         existingKeys,
       );
       duplicatedProvider.addToLive = false;
-    } else if (activeApp === "mcode" || activeApp === "kimi") {
+    } else if (
+      activeApp === "mcode" ||
+      activeApp === "dsh" ||
+      activeApp === "kimi"
+    ) {
       // The MCode list already includes its live custom nodes; the backend
       // rejects a key that MCode itself owns.
       duplicatedProvider.providerKey = generateUniqueProviderCopyKey(
@@ -1283,7 +1384,7 @@ function App() {
 
   // 应用页 ⋯ →「查看此应用的用量」：带上这个应用的筛选（Claude Desktop 的流量并在 Claude 里）
   const usageAppOf = (app: AppId): AppTypeFilter | null => {
-    const type = app === "claude-desktop" ? "claude" : app;
+    const type = sharedFeatureAppOf(app);
     return (KNOWN_APP_TYPES as ReadonlyArray<string>).includes(type)
       ? (type as AppTypeFilter)
       : null;
@@ -1371,6 +1472,7 @@ function App() {
         <>
           {currentView === "providers" &&
             activeApp !== "mcode" &&
+            activeApp !== "dsh" &&
             activeApp !== "kimi" &&
             (settingsData?.showProfileSwitcher ?? false) && (
               <ProfileSwitcher activeApp={activeApp} />
@@ -1414,7 +1516,11 @@ function App() {
               {t("provider.addProvider")}
             </Button>
           )}
-          {currentView === "hermesMemory" && <HermesMemorySaveButton />}
+          {currentView === "hermesMemory" && (
+            <Suspense fallback={null}>
+              <HermesMemorySaveButton />
+            </Suspense>
+          )}
           {appMenu}
         </>
       }
@@ -1471,7 +1577,7 @@ function App() {
     onConfigureUsage: setUsageProvider,
     onOpenWebsite: handleOpenWebsite,
     onOpenTerminal:
-      activeApp === "claude" || activeApp === "agy"
+      activeApp === "claude" || activeApp === "codex" || activeApp === "agy"
         ? setTerminalProvider
         : undefined,
     onCreate: () => openAddProvider(currentModeView),
@@ -1538,6 +1644,7 @@ function App() {
               activeApp === "pi" ||
               activeApp === "mcode" ||
               activeApp === "kimi" ||
+              activeApp === "dsh" ||
               activeApp === "omp"
                 ? (provider) => setConfirmAction({ provider, action: "remove" })
                 : undefined
@@ -1658,6 +1765,7 @@ function App() {
                   </Badge>
                 </>
               }
+              actions={<RefreshAllQuotaButton />}
             />
             <div
               id="main-content"
@@ -1808,48 +1916,54 @@ function App() {
             }
             className="flex min-h-0 flex-1 flex-col"
           >
-            {renderContent()}
+            <Suspense fallback={<PageLoading />}>{renderContent()}</Suspense>
           </div>
         </main>
       </div>
 
-      <AddProviderDialog
-        open={isAddOpen}
-        onOpenChange={setIsAddOpen}
-        appId={activeApp}
-        onSubmit={addProvider}
-        modeView={formModeView}
-      />
+      <Suspense fallback={null}>
+        {(isAddOpen || hasOpenedAdd) && (
+          <AddProviderDialog
+            open={isAddOpen}
+            onOpenChange={setIsAddOpen}
+            appId={activeApp}
+            onSubmit={addProvider}
+            modeView={formModeView}
+          />
+        )}
 
-      <EditProviderDialog
-        open={Boolean(editingProvider)}
-        provider={effectiveEditingProvider}
-        onOpenChange={(open) => {
-          if (!open) {
-            setEditingProvider(null);
-          }
-        }}
-        onSubmit={handleEditProvider}
-        appId={activeApp}
-        isProxyTakeover={isCurrentAppTakeoverActive}
-        isCurrent={effectiveEditingProvider?.id === currentProviderId}
-        modeView={formModeView}
-      />
+        {(editingProvider || hasOpenedEdit) && (
+          <EditProviderDialog
+            open={Boolean(editingProvider)}
+            provider={effectiveEditingProvider}
+            onOpenChange={(open) => {
+              if (!open) {
+                setEditingProvider(null);
+              }
+            }}
+            onSubmit={handleEditProvider}
+            appId={activeApp}
+            isProxyTakeover={isCurrentAppTakeoverActive}
+            isCurrent={effectiveEditingProvider?.id === currentProviderId}
+            modeView={formModeView}
+          />
+        )}
 
-      {effectiveUsageProvider && (
-        <UsageScriptModal
-          key={effectiveUsageProvider.id}
-          provider={effectiveUsageProvider}
-          appId={activeApp}
-          isOpen={Boolean(usageProvider)}
-          onClose={() => setUsageProvider(null)}
-          onSave={(script) => {
-            if (usageProvider) {
-              void saveUsageScript(usageProvider, script);
-            }
-          }}
-        />
-      )}
+        {effectiveUsageProvider && (
+          <UsageScriptModal
+            key={effectiveUsageProvider.id}
+            provider={effectiveUsageProvider}
+            appId={activeApp}
+            isOpen={Boolean(usageProvider)}
+            onClose={() => setUsageProvider(null)}
+            onSave={(script) => {
+              if (usageProvider) {
+                void saveUsageScript(usageProvider, script);
+              }
+            }}
+          />
+        )}
+      </Suspense>
 
       <OpenTerminalDialog
         provider={terminalProvider}

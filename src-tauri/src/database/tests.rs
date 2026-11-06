@@ -1438,11 +1438,11 @@ fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
 //   项目归因两列（spec §4.1/§4.2/§4.3）
 // ============================================================================
 
-// 新库：裸 Connection 走完 create_tables + migrations 后 user_version == 25，
+// 新库：裸 Connection 走完 create_tables + migrations 后 user_version == 26，
 // 两张新表关键列齐。Database::memory() 只走 create_tables 不走迁移
 // （user_version 恒 0），不能用它断言版本号。
 #[test]
-fn fresh_db_has_project_routes_table_and_version_25() {
+fn fresh_db_has_project_routes_table_and_version_26() {
     let conn = Connection::open_in_memory().expect("open memory db");
 
     Database::create_tables_on_conn(&conn).expect("create tables");
@@ -1450,7 +1450,7 @@ fn fresh_db_has_project_routes_table_and_version_25() {
 
     assert_eq!(
         Database::get_user_version(&conn).expect("read version after migration"),
-        25
+        26
     );
 
     let app_type = get_column_info(&conn, "project_routes", "app_type");
@@ -1609,7 +1609,7 @@ fn v20_db_migrates_to_v21_keeping_rows() {
 
     assert_eq!(
         Database::get_user_version(&conn).expect("version after migration"),
-        25
+        26
     );
 
     assert!(
@@ -1679,4 +1679,50 @@ fn migration_v24_to_v25_adds_enabled_omp_to_mcp_servers_only() {
         )
         .expect("read mcp row");
     assert_eq!((pi, omp), (1, 0));
+}
+
+/// 上游 v4.0.26 的 v23→v24（enabled_dsh）与本 fork v24（enabled_kimi）撞号，
+/// 重编号为 v25→v26：从 v25 升级必须补上 `mcp_servers.enabled_dsh` 与
+/// `skills.enabled_dsh`，且不改动既有 omp/kimi 开关状态。
+#[test]
+fn migration_v25_to_v26_adds_dsh_flags_without_changing_omp_or_skill_state() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    conn.execute_batch(
+        "ALTER TABLE mcp_servers DROP COLUMN enabled_dsh;
+         ALTER TABLE skills DROP COLUMN enabled_dsh;
+         INSERT INTO mcp_servers (id, name, server_config, enabled_omp)
+         VALUES ('shared', 'Shared MCP', '{}', 1);
+         INSERT INTO skills (id, name, directory, enabled_kimi)
+         VALUES ('skill', 'Skill', 'skill', 1);",
+    )
+    .expect("seed v25 database");
+    Database::set_user_version(&conn, 25).expect("set user_version=25");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("upgrade v23 database");
+    assert_eq!(Database::get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+    let mcp_flags: (bool, bool) = conn
+        .query_row(
+            "SELECT enabled_omp, enabled_dsh FROM mcp_servers WHERE id = 'shared'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated MCP flags");
+    let skill_flags: (bool, bool) = conn
+        .query_row(
+            "SELECT enabled_kimi, enabled_dsh FROM skills WHERE id = 'skill'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated skill flags");
+    assert_eq!(mcp_flags, (true, false));
+    assert_eq!(skill_flags, (true, false));
+
+    conn.execute("UPDATE mcp_servers SET enabled_dsh = 1", [])
+        .unwrap();
+    Database::apply_schema_migrations_on_conn(&conn).expect("reopen migrated database");
+    assert!(conn
+        .query_row("SELECT enabled_dsh FROM mcp_servers", [], |row| row
+            .get::<_, bool>(0))
+        .unwrap());
 }
