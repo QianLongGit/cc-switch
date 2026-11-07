@@ -13,12 +13,25 @@ use crate::session_manager::model::{ContentRef, ImageRef, TranscriptChunk};
 #[path = "session_manager_tests.rs"]
 mod tests;
 
+/// 会话列表：不传 `hostId` 扫描本机；传了则扫描对应 SSH 远程主机的
+/// claude / codex 会话（主机配置缺失 → Err）。远程列表不写本机扫描的
+/// 复用槽（session index 只索引本机会话）。
 #[tauri::command]
-pub async fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, String> {
-    let sessions = tauri::async_runtime::spawn_blocking(session_manager::scan_sessions)
-        .await
-        .map_err(|e| format!("Failed to scan sessions: {e}"))?;
-    Ok(sessions)
+pub async fn list_sessions(
+    hostId: Option<String>,
+) -> Result<Vec<session_manager::SessionMeta>, String> {
+    tauri::async_runtime::spawn_blocking(move || match hostId {
+        None => Ok(session_manager::scan_sessions()),
+        Some(host_id) => {
+            let host = crate::settings::get_settings()
+                .ssh_hosts
+                .and_then(|hosts| hosts.into_iter().find(|host| host.id == host_id))
+                .ok_or_else(|| format!("SSH 主机不存在: {host_id}"))?;
+            Ok(session_manager::scan_remote_sessions(&host)?.sessions)
+        }
+    })
+    .await
+    .map_err(|e| format!("Failed to scan sessions: {e}"))?
 }
 
 /// 在后台把会话正文索引同步到当前会话列表；进度通过 `session-index-status` 事件推送。

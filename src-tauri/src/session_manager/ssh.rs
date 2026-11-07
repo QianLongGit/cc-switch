@@ -12,18 +12,23 @@
 //! - [`head_tail_batch_command`] / [`parse_head_tail_output`]：批量头尾帧协议（哨兵标记分帧）
 //! - [`decode_zst_prefix`]：zst 压缩前缀的截断容忍解压
 //! - [`read_full_command`] / [`read_range_command`] / [`delete_file_command`]：全文 / 区间 / 删除命令
+//! - [`home_dirs_command`] / [`parse_home_dirs`] / [`classify_remote_provider`] /
+//!   [`prefer_plain_entries`] / [`remote_head_tail_request`] / [`rebind_remote_meta`]：
+//!   远程扫描链路的清单归类与请求组装纯函数（由 `mod.rs::scan_remote_sessions` 编排）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
 use crate::settings::SshHostConfig;
+
+use super::SessionMeta;
 
 /* ===== 常量 ===== */
 
@@ -63,7 +68,6 @@ pub(crate) enum SshError {
 /// POSIX 单引号转义：整体包一层单引号，内部 `'` 替换为 `'\''`。
 /// 空串返回 `''`，保证语义为空参数而非缺参数。
 // 后续任务构造远端命令时接线，届时移除
-#[allow(dead_code)]
 pub(crate) fn escape_remote_path(p: &str) -> String {
     let mut out = String::with_capacity(p.len() + 2);
     out.push('\'');
@@ -240,7 +244,6 @@ pub(crate) fn run_command(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>
 
 /// 在指定主机上执行远端命令并取回 stdout。
 // 后续任务接线数据层后移除
-#[allow(dead_code)]
 pub(crate) fn run_remote(
     host: &SshHostConfig,
     remote_cmd: &str,
@@ -304,8 +307,6 @@ impl SshScanRegistry {
     }
 
     /// 全量替换某主机的清单，旧清单整体丢弃
-    // Task 7 接线远端扫描任务后移除（当前仅测试写入）
-    #[allow(dead_code)]
     pub(crate) fn replace_manifest(&self, host_id: &str, entries: HashMap<String, RemoteFileMeta>) {
         self.lock_write().insert(host_id.to_string(), entries);
     }
@@ -342,8 +343,6 @@ impl SshScanRegistry {
 /* ===== 远端原语：列表 ===== */
 
 /// 远端会话文件条目：`find -printf` TSV 的一行。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteFileEntry {
     pub path: String,
@@ -353,9 +352,11 @@ pub(crate) struct RemoteFileEntry {
 
 /// 构造远端列表命令：`for` 循环对各目录 `find` 出 `.jsonl` / `.jsonl.zst` 文件，
 /// 按 `size\t%T@\tpath` TSV 输出；`2>/dev/null` 吞掉目录不存在等远端噪音。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
+/// 空 slice 早退为 shell no-op（`:`），避免生成 `for d in ; do ...` 病态命令。
 pub(crate) fn list_files_command(dirs: &[String]) -> String {
+    if dirs.is_empty() {
+        return ":".to_string();
+    }
     let quoted = dirs
         .iter()
         .map(|d| escape_remote_path(d))
@@ -370,8 +371,6 @@ pub(crate) fn list_files_command(dirs: &[String]) -> String {
 ///
 /// 逐行容错——空行 / 非 UTF-8 / 字段不足 / `size` 或 mtime 非法的行整行跳过；
 /// 路径列取第 3 字段起（路径内含 `\t` 不再被切分）。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 pub(crate) fn parse_list_output(out: &[u8]) -> Vec<RemoteFileEntry> {
     let mut entries = Vec::new();
     for line in out.split(|&b| b == b'\n') {
@@ -418,9 +417,9 @@ fn parse_mtime_ms(raw: &str) -> Option<i64> {
     }
     let ms: i64 = ms_digits.parse().ok()?;
     Some(if negative {
-        secs * 1000 - ms
+        secs.saturating_mul(1000).saturating_sub(ms)
     } else {
-        secs * 1000 + ms
+        secs.saturating_mul(1000).saturating_add(ms)
     })
 }
 
@@ -428,8 +427,6 @@ fn parse_mtime_ms(raw: &str) -> Option<i64> {
 
 /// 单文件头尾拉取请求。未压缩按需声明 head 行 / tail 行 / 字节尾窗；
 /// 压缩文件忽略行参数，仅拉取前 [`ZSTD_PREFIX_BYTES`] 压缩字节（本地截断解压）。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HeadTailRequest {
     pub path: String,
@@ -441,8 +438,6 @@ pub(crate) struct HeadTailRequest {
 
 /// 帧解析后的单文件数据：head/tail 为行数组；
 /// `tail_bytes` 为 C 段原始字节（未压缩 = 尾窗，压缩 = 压缩前缀，由调用方区分用途）。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct HeadTailData {
     pub head: Vec<String>,
@@ -490,8 +485,6 @@ fn marker_statement(marker: &str) -> String {
 ///
 /// 每文件按 [`wanted_kinds`] 声明打印标记行 + `head -n` / `tail -n` / `tail -c`；
 /// 压缩文件仅 `head -c` 于 C 标记；末尾统一打印结束标记供截断判定。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 pub(crate) fn head_tail_batch_command(batch: &[HeadTailRequest], sentinel: &str) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(batch.len() * 2 + 1);
     for req in batch {
@@ -540,8 +533,6 @@ pub(crate) fn head_tail_batch_command(batch: &[HeadTailRequest], sentinel: &str)
 /// - 每段末尾剥掉恰好一个换行（对应标记 printf 的前置 `\n`）；
 ///   C 段保留原始字节不做行切分
 /// - 结束标记缺失或其后仍有残留 → Err；声明的段未出现 → Err（输出被截断）
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 pub(crate) fn parse_head_tail_output(
     out: &[u8],
     sentinel: &str,
@@ -639,8 +630,6 @@ fn split_lines(body: &[u8]) -> Vec<String> {
 ///
 /// 截断 frame 触发 `io::Error` 时，已解出的字节 >0 即视为成功返回前缀；
 /// 完全无法解压（非 zst 数据 / 空输入）→ Err。输出按有损 UTF-8 转字符串。
-// Task 7 接线扫描链路后移除
-#[allow(dead_code)]
 pub(crate) fn decode_zst_prefix(bytes: &[u8]) -> Result<String, String> {
     let mut decoder = zstd::stream::read::Decoder::new(bytes)
         .map_err(|e| format!("zstd 解码器初始化失败: {e}"))?;
@@ -656,6 +645,147 @@ pub(crate) fn decode_zst_prefix(bytes: &[u8]) -> Result<String, String> {
         }
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/* ===== 远程扫描链路：清单归类与请求组装 ===== */
+
+/// 远程头尾拉取的行窗口（与 claude / codex 本地扫描的 head/tail 行数一致）
+const REMOTE_HEAD_LINES: usize = 10;
+const REMOTE_TAIL_LINES: usize = 30;
+/// claude 远程额外拉取的字节尾窗：relocated 记录散布在最后 64 KiB 内，
+/// 与 `claude.rs::RELOCATED_TAIL_BYTES` 对齐
+const REMOTE_CLAUDE_TAIL_WINDOW: u64 = 64 * 1024;
+/// 清单 TSV 尾缀（stem = 路径去掉该尾缀）
+const PLAIN_SUFFIX: &str = ".jsonl";
+const COMPRESSED_SUFFIX: &str = ".jsonl.zst";
+
+/// 一条命令回传远端 HOME 下的三个会话根目录（claude 一个 + codex 两个），
+/// 供 [`parse_home_dirs`] 解析后再喂 [`list_files_command`]。
+pub(crate) fn home_dirs_command() -> String {
+    "printf '%s\\n' \"$HOME/.claude/projects\" \"$HOME/.codex/sessions\" \"$HOME/.codex/archived_sessions\"".to_string()
+}
+
+/// 解析 [`home_dirs_command`] 输出：按行收非空绝对路径；空行 / 相对路径 /
+/// 非 UTF-8 行丢弃。输出顺序即 claude / codex sessions / codex archived。
+pub(crate) fn parse_home_dirs(out: &[u8]) -> Vec<String> {
+    out.split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let text = std::str::from_utf8(line).ok()?;
+            text.strip_prefix('/')
+                .map(|rest| format!("/{rest}"))
+                .filter(|dir| dir != "/")
+        })
+        .collect()
+}
+
+/// 按目录前缀归类远端文件路径：claude 目录下 → `"claude"`，codex 目录任一下
+/// → `"codex"`，都不属于 → `None`（跳过）。前缀必须落在目录边界（后跟 `/`），
+/// `…/projects-evil` 不得误判进 `…/projects`。
+pub(crate) fn classify_remote_provider(
+    path: &str,
+    claude_dir: &str,
+    codex_dirs: &[String],
+) -> Option<&'static str> {
+    let under = |dir: &str| path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    if under(claude_dir) {
+        return Some("claude");
+    }
+    if codex_dirs.iter().any(|dir| under(dir)) {
+        return Some("codex");
+    }
+    None
+}
+
+/// 清单级 `.jsonl` / `.jsonl.zst` 共存判定（Codex 压缩过渡期两种形态并存）：
+/// 同 stem 两者都有时保留未压缩、丢弃 zst；仅 zst 时保留 zst。顺序保持清单原序。
+///
+/// 这是清单版判定，不复用 `content.rs::codex_source_or_sibling`——后者判断
+/// 本地文件存在性，语义不适用于远端清单。
+pub(crate) fn prefer_plain_entries(entries: Vec<RemoteFileEntry>) -> Vec<RemoteFileEntry> {
+    let plain_keys: HashSet<String> = entries
+        .iter()
+        .filter(|e| e.path.ends_with(PLAIN_SUFFIX))
+        .map(|e| path_key_without_suffix(&e.path).to_string())
+        .collect();
+    entries
+        .into_iter()
+        .filter(|e| {
+            !e.path.ends_with(COMPRESSED_SUFFIX)
+                || !plain_keys.contains(path_key_without_suffix(&e.path))
+        })
+        .collect()
+}
+
+/// 按 provider 组装单文件头尾请求：
+/// - claude：head 10 行 / tail 30 行 / 64 KiB 字节尾窗（relocated 解析）
+/// - codex 未压缩：head 10 行 / tail 30 行
+/// - codex 压缩：仅 C 段压缩前缀（行参数被帧协议忽略）
+pub(crate) fn remote_head_tail_request(provider: &str, entry: &RemoteFileEntry) -> HeadTailRequest {
+    let compressed = entry.path.ends_with(COMPRESSED_SUFFIX);
+    match (provider, compressed) {
+        ("claude", _) => HeadTailRequest {
+            path: entry.path.clone(),
+            compressed: false,
+            head_lines: REMOTE_HEAD_LINES,
+            tail_lines: REMOTE_TAIL_LINES,
+            tail_bytes: REMOTE_CLAUDE_TAIL_WINDOW,
+        },
+        (_, true) => HeadTailRequest {
+            path: entry.path.clone(),
+            compressed: true,
+            head_lines: 0,
+            tail_lines: 0,
+            tail_bytes: 0,
+        },
+        _ => HeadTailRequest {
+            path: entry.path.clone(),
+            compressed: false,
+            head_lines: REMOTE_HEAD_LINES,
+            tail_lines: REMOTE_TAIL_LINES,
+            tail_bytes: 0,
+        },
+    }
+}
+
+/// 远端文件名 stem：文件名去 `.jsonl` / `.jsonl.zst` 尾缀（`/p/x.jsonl` →
+/// `x`）；两种尾缀都不是返回 `None`。用作远程会话的 `session_id`。
+pub(crate) fn remote_session_stem(path: &str) -> Option<&str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(COMPRESSED_SUFFIX)
+        .or_else(|| name.strip_suffix(PLAIN_SUFFIX))
+}
+
+/// 全路径去尾缀（保留目录）：`.jsonl` / `.jsonl.zst` 共存判定的分组 key——
+/// 不同目录的同名文件是两个会话，不得因文件名相同被误判为并存形态。
+fn path_key_without_suffix(path: &str) -> &str {
+    path.strip_suffix(COMPRESSED_SUFFIX)
+        .or_else(|| path.strip_suffix(PLAIN_SUFFIX))
+        .unwrap_or(path)
+}
+
+/// 清单 mtime（Unix 毫秒）→ `SystemTime` 供解析缓存的指纹比对；负时间戳
+/// 无法表达为 `SystemTime`，归 `None`（每轮恒定，缓存键仍稳定）。
+pub(crate) fn mtime_to_system_time(ms: i64) -> Option<SystemTime> {
+    let ms = u64::try_from(ms).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
+}
+
+/// 远程会话标识覆盖：`session_id` = 文件 stem、`source_path` =
+/// `ssh:<hostId><远端路径>`（与 [`parse_ssh_source`] 的解析形态及 registry
+/// 清单 key 严格一致）、`resume_command` 置空；解析产出的其余字段原样保留。
+pub(crate) fn rebind_remote_meta(
+    mut meta: SessionMeta,
+    host_id: &str,
+    remote_path: &str,
+) -> SessionMeta {
+    if let Some(stem) = remote_session_stem(remote_path) {
+        meta.session_id = stem.to_string();
+    }
+    // 远端路径自带前导 `/`，拼接时去重避免 `ssh:h1//root/...` 双斜杠形态
+    let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
+    meta.source_path = Some(format!("ssh:{host_id}/{rel}"));
+    meta.resume_command = None;
+    meta
 }
 
 /* ===== 远端原语：全文 / 区间 / 删除 ===== */
@@ -1261,5 +1391,203 @@ mod tests {
             read_range_command("/p/a.jsonl", 10, 100),
             "tail -c +11 '/p/a.jsonl' | head -c 100"
         );
+    }
+
+    /* ===== 远程扫描链路（Task 7）===== */
+
+    /// 构造远端清单条目
+    fn rfe(path: &str, size: u64, mtime_ms: i64) -> RemoteFileEntry {
+        RemoteFileEntry {
+            path: path.to_string(),
+            size,
+            mtime_ms,
+        }
+    }
+
+    #[test]
+    fn list_cmd_empty_dirs_is_noop() {
+        // 空 slice 早退为 shell no-op，避免生成 `for d in ; do ...` 病态命令
+        assert_eq!(list_files_command(&[]), ":");
+    }
+
+    #[test]
+    fn parse_mtime_saturates_on_huge_seconds() {
+        // 秒数溢出 i64 毫秒域时饱和而非 panic（far-future 时间戳防御）
+        assert_eq!(parse_mtime_ms("9300000000000000.5").unwrap(), i64::MAX);
+        assert_eq!(parse_mtime_ms("-9300000000000000.5").unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn home_dirs_command_prints_three_dirs_under_home() {
+        assert_eq!(
+            home_dirs_command(),
+            "printf '%s\\n' \"$HOME/.claude/projects\" \"$HOME/.codex/sessions\" \"$HOME/.codex/archived_sessions\""
+        );
+    }
+
+    #[test]
+    fn parse_home_dirs_keeps_absolute_lines_only() {
+        let out = b"/root/.claude/projects\n\nrelative/x\n/root/.codex/sessions\n/root/.codex/archived_sessions\n";
+        assert_eq!(
+            parse_home_dirs(out),
+            vec![
+                "/root/.claude/projects".to_string(),
+                "/root/.codex/sessions".to_string(),
+                "/root/.codex/archived_sessions".to_string(),
+            ]
+        );
+        assert!(parse_home_dirs(b"").is_empty());
+        // 非 UTF-8 行丢弃
+        assert_eq!(parse_home_dirs(b"/a\xff\n/b\n"), vec!["/b".to_string()]);
+    }
+
+    #[test]
+    fn classify_matches_dir_prefix_with_slash_boundary() {
+        let claude_dir = "/root/.claude/projects".to_string();
+        let codex_dirs = vec![
+            "/root/.codex/sessions".to_string(),
+            "/root/.codex/archived_sessions".to_string(),
+        ];
+        assert_eq!(
+            classify_remote_provider(
+                "/root/.claude/projects/p-abc/s.jsonl",
+                &claude_dir,
+                &codex_dirs
+            ),
+            Some("claude")
+        );
+        assert_eq!(
+            classify_remote_provider(
+                "/root/.codex/sessions/2026/rl.jsonl",
+                &claude_dir,
+                &codex_dirs
+            ),
+            Some("codex")
+        );
+        assert_eq!(
+            classify_remote_provider(
+                "/root/.codex/archived_sessions/rl.jsonl.zst",
+                &claude_dir,
+                &codex_dirs
+            ),
+            Some("codex")
+        );
+        // 前缀相似但非目录边界（projects-evil）与无关路径都不得误判
+        assert_eq!(
+            classify_remote_provider(
+                "/root/.claude/projects-evil/s.jsonl",
+                &claude_dir,
+                &codex_dirs
+            ),
+            None
+        );
+        assert_eq!(
+            classify_remote_provider("/opt/other/s.jsonl", &claude_dir, &codex_dirs),
+            None
+        );
+    }
+
+    #[test]
+    fn prefer_plain_drops_zst_when_both_present() {
+        let entries = vec![
+            rfe("/p/a.jsonl.zst", 1, 1),
+            rfe("/p/a.jsonl", 2, 2),
+            rfe("/p/b.jsonl.zst", 3, 3),
+        ];
+        let kept = prefer_plain_entries(entries);
+        // 同 stem 并存 → 未压缩优先；仅 zst → 保留；顺序保持清单原序
+        assert_eq!(
+            kept,
+            vec![rfe("/p/a.jsonl", 2, 2), rfe("/p/b.jsonl.zst", 3, 3)]
+        );
+    }
+
+    #[test]
+    fn prefer_plain_keeps_same_name_files_in_different_dirs() {
+        // 不同目录的同名文件是两个会话，不得因文件名相同被误判为并存形态
+        let entries = vec![
+            rfe("/p/sessions/2026/rollout-a.jsonl.zst", 1, 1),
+            rfe("/p/archived/rollout-a.jsonl", 2, 2),
+        ];
+        let kept = prefer_plain_entries(entries);
+        assert_eq!(kept.len(), 2, "跨目录同名文件都应保留");
+    }
+
+    #[test]
+    fn head_tail_request_shapes_per_provider() {
+        let claude = remote_head_tail_request("claude", &rfe("/p/a.jsonl", 1, 1));
+        assert_eq!(
+            claude,
+            HeadTailRequest {
+                path: "/p/a.jsonl".to_string(),
+                compressed: false,
+                head_lines: 10,
+                tail_lines: 30,
+                tail_bytes: 64 * 1024,
+            }
+        );
+        let codex_plain = remote_head_tail_request("codex", &rfe("/p/a.jsonl", 1, 1));
+        assert_eq!(codex_plain.tail_bytes, 0, "codex 未压缩不需要字节尾窗");
+        let codex_zst = remote_head_tail_request("codex", &rfe("/p/a.jsonl.zst", 1, 1));
+        assert_eq!(
+            codex_zst,
+            HeadTailRequest {
+                path: "/p/a.jsonl.zst".to_string(),
+                compressed: true,
+                head_lines: 0,
+                tail_lines: 0,
+                tail_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn session_stem_strips_both_suffixes() {
+        assert_eq!(remote_session_stem("/p/rollout-1.jsonl"), Some("rollout-1"));
+        assert_eq!(
+            remote_session_stem("/p/rollout-1.jsonl.zst"),
+            Some("rollout-1")
+        );
+        assert_eq!(remote_session_stem("/p/readme"), None);
+    }
+
+    #[test]
+    fn mtime_converts_to_system_time_and_negative_to_none() {
+        assert_eq!(mtime_to_system_time(0), Some(SystemTime::UNIX_EPOCH));
+        assert_eq!(
+            mtime_to_system_time(1500),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1500))
+        );
+        // 负时间戳（1969 前）无法表达为 SystemTime，归 None；缓存键每轮恒定即可
+        assert_eq!(mtime_to_system_time(-500), None);
+    }
+
+    #[test]
+    fn rebind_overrides_identity_fields_keeps_rest() {
+        let meta = SessionMeta {
+            provider_id: "claude".to_string(),
+            session_id: "ignored".to_string(),
+            title: Some("标题".to_string()),
+            summary: None,
+            project_dir: Some("/work".to_string()),
+            created_at: Some(1),
+            last_active_at: Some(2),
+            source_path: Some("/root/x.jsonl".to_string()),
+            resume_command: Some("claude --resume x".to_string()),
+        };
+        let rebound = rebind_remote_meta(meta, "host-1", "/root/x.jsonl");
+        // session_id = 文件 stem；source_path = ssh:<hostId><远端路径>（单斜杠，
+        // 与 parse_ssh_source 的解析形态、registry 清单 key 严格一致）
+        assert_eq!(rebound.session_id, "x");
+        assert_eq!(
+            rebound.source_path.as_deref(),
+            Some("ssh:host-1/root/x.jsonl")
+        );
+        assert_eq!(rebound.resume_command, None, "远程会话不支持本地 resume");
+        // 解析产出字段原样保留
+        assert_eq!(rebound.title.as_deref(), Some("标题"));
+        assert_eq!(rebound.project_dir.as_deref(), Some("/work"));
+        assert_eq!(rebound.created_at, Some(1));
+        assert_eq!(rebound.last_active_at, Some(2));
     }
 }

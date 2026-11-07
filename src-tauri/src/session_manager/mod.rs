@@ -10,15 +10,16 @@ pub mod ssh;
 pub mod terminal;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // 其余模型类型从 `session_manager::model` 引用
 pub use model::SessionMessage;
 use providers::{
     agy, claude, codex, dsh, gemini, grokbuild, hermes, kimi, mcode, omp, openclaw, opencode, pi,
+    utils::FileParseCache,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +148,257 @@ pub(crate) fn scan_sessions_with_status() -> SessionScan {
         b_ts.cmp(&a_ts)
     });
     scan
+}
+
+/* ===== SSH 远程扫描链路（spec §5.4）===== */
+
+/// 远端目录解析命令超时（连接建立 + printf，亚秒级完成）
+const REMOTE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
+/// 远端清单命令超时（大目录 `find` 遍历较慢，放宽）
+const REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 单批头尾拉取超时
+const REMOTE_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// 头尾拉取批大小上限（spec §5.4：单批 ≤ 50 个文件）
+const REMOTE_HEAD_TAIL_BATCH: usize = 50;
+
+/// 远程解析缓存：按 hostId 隔离。不同主机的远端绝对路径可能完全相同
+/// （都是 `/root/...`），共用实例会跨主机串缓存；与各 provider 的本地
+/// `PARSE_CACHE` 也互不共享——本地扫描每轮整表重建，会驱逐远程条目。
+static REMOTE_PARSE_CACHES: LazyLock<Mutex<HashMap<String, Arc<FileParseCache>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 取（或首次创建）某主机的远程解析缓存；Arc 克隆后立刻释放全局锁，
+/// 并发的多主机扫描互不阻塞。
+fn remote_parse_cache(host_id: &str) -> Arc<FileParseCache> {
+    REMOTE_PARSE_CACHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(host_id.to_string())
+        .or_insert_with(|| Arc::new(FileParseCache::new()))
+        .clone()
+}
+
+/// 扫描 SSH 远程主机的 claude / codex 会话（spec §5.4）：
+///
+/// 1. 一条命令解析远端 HOME 下的三个会话根目录
+/// 2. `find` 清单 → 按 provider 归类 → `.jsonl`/`.jsonl.zst` 共存判定
+/// 3. 分批（≤50）头尾帧协议拉取 → provider 解析（复用各 provider 的
+///    行解析原语）→ 覆盖远程标识字段
+/// 4. 排序 + 写入 `SshScanRegistry` 清单（validate / fingerprint / 删除共用）
+///
+/// 任一 ssh 命令失败整体报错；成功即 claude 与 codex 双 provider 完整。
+pub fn scan_remote_sessions(
+    host: &crate::settings::SshHostConfig,
+) -> Result<SessionScan, String> {
+    // ── 1. 远端 HOME 下的三个会话根目录 ──
+    let dirs_raw = ssh::run_remote(host, &ssh::home_dirs_command(), REMOTE_DIRS_TIMEOUT)
+        .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+    let dirs = ssh::parse_home_dirs(&dirs_raw);
+    if dirs.len() < 3 {
+        return Err(format!(
+            "SSH 主机「{}」: 远端目录解析异常，期望 3 个目录，实际 {} 个",
+            host.label,
+            dirs.len()
+        ));
+    }
+    let (claude_dir, codex_dirs) = (dirs[0].clone(), dirs[1..].to_vec());
+
+    // ── 2. 会话文件清单 → 归类 + 共存判定 ──
+    let list_raw = ssh::run_remote(host, &ssh::list_files_command(&dirs), REMOTE_LIST_TIMEOUT)
+        .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+    let mut claude_files = Vec::new();
+    let mut codex_files = Vec::new();
+    for entry in ssh::parse_list_output(&list_raw) {
+        // 帧协议按行分帧：含换行的远端路径无法安全入批，fail-closed 跳过
+        if entry.path.contains('\n') {
+            log::warn!("跳过含换行的远端路径: {:?}", entry.path);
+            continue;
+        }
+        match ssh::classify_remote_provider(&entry.path, &claude_dir, &codex_dirs) {
+            // claude 本地扫描只收 .jsonl（agent/journal 等已在远端无对应形态）
+            Some("claude") if entry.path.ends_with(".jsonl") => claude_files.push(entry),
+            Some("codex") => codex_files.push(entry),
+            _ => {}
+        }
+    }
+    let codex_files = ssh::prefer_plain_entries(codex_files);
+
+    // ── 3. 分批拉取头尾并解析 ──
+    let mut sessions = scan_claude_remote(host, &claude_files)?;
+    sessions.extend(scan_codex_remote(host, &codex_files)?);
+    sessions.sort_by(|a, b| {
+        let a_ts = a.last_active_at.or(a.created_at).unwrap_or(0);
+        let b_ts = b.last_active_at.or(b.created_at).unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+
+    // ── 4. 清单登记（validate / fingerprint / 删除按路径查询）──
+    let manifest = claude_files
+        .iter()
+        .chain(codex_files.iter())
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                ssh::RemoteFileMeta {
+                    len: entry.size,
+                    mtime_ms: entry.mtime_ms,
+                },
+            )
+        })
+        .collect();
+    ssh::SshScanRegistry::global().replace_manifest(&host.id, manifest);
+
+    Ok(SessionScan {
+        sessions,
+        complete_providers: HashSet::from(["claude".to_string(), "codex".to_string()]),
+    })
+}
+
+/// claude 远程解析：head/tail 行 + 64 KiB 字节尾窗（relocated 记录在末尾窗口内）
+fn scan_claude_remote(
+    host: &crate::settings::SshHostConfig,
+    files: &[ssh::RemoteFileEntry],
+) -> Result<Vec<SessionMeta>, String> {
+    let requests: Vec<ssh::HeadTailRequest> = files
+        .iter()
+        .map(|entry| ssh::remote_head_tail_request("claude", entry))
+        .collect();
+    let data = fetch_head_tail_batches(host, &requests)?;
+
+    // 缓存键经 PathBuf → to_string_lossy 往返（Windows 会翻转斜杠），解析闭包
+    // 用同构键查条目；远程标识字段始终取条目里的原始远端字符串
+    let by_key: HashMap<String, &ssh::RemoteFileEntry> = files
+        .iter()
+        .map(|entry| (Path::new(&entry.path).to_string_lossy().into_owned(), entry))
+        .collect();
+    let cache_files: Vec<(PathBuf, Option<SystemTime>, u64)> = files
+        .iter()
+        .map(|entry| {
+            (
+                PathBuf::from(&entry.path),
+                ssh::mtime_to_system_time(entry.mtime_ms),
+                entry.size,
+            )
+        })
+        .collect();
+
+    let host_id = host.id.clone();
+    let parse = |path: &Path| -> std::io::Result<Option<SessionMeta>> {
+        let Some(entry) = by_key.get(path.to_string_lossy().as_ref()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "清单条目缺失",
+            ));
+        };
+        let Some(file) = data.get(&entry.path) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "头尾数据缺失",
+            ));
+        };
+        let relocated = file
+            .tail_bytes
+            .as_deref()
+            .and_then(|window| claude::parse_relocated_from_tail_bytes(window, entry.size));
+        Ok(claude::parse_session_lines(
+            path,
+            file.head.clone(),
+            file.tail.clone(),
+            relocated,
+        )
+        .map(|meta| ssh::rebind_remote_meta(meta, &host_id, &entry.path)))
+    };
+
+    Ok(remote_parse_cache(&host.id).scan_remote(cache_files, parse))
+}
+
+/// codex 远程解析：未压缩走 head/tail 行；压缩形态用 zst 前缀解出的头部行，
+/// 最后活跃时间以清单 mtime 兜底（线程标题走既有 fallback，远端 state.db 不可读）
+fn scan_codex_remote(
+    host: &crate::settings::SshHostConfig,
+    files: &[ssh::RemoteFileEntry],
+) -> Result<Vec<SessionMeta>, String> {
+    let requests: Vec<ssh::HeadTailRequest> = files
+        .iter()
+        .map(|entry| ssh::remote_head_tail_request("codex", entry))
+        .collect();
+    let data = fetch_head_tail_batches(host, &requests)?;
+
+    let by_key: HashMap<String, &ssh::RemoteFileEntry> = files
+        .iter()
+        .map(|entry| (Path::new(&entry.path).to_string_lossy().into_owned(), entry))
+        .collect();
+    let cache_files: Vec<(PathBuf, Option<SystemTime>, u64)> = files
+        .iter()
+        .map(|entry| {
+            (
+                PathBuf::from(&entry.path),
+                ssh::mtime_to_system_time(entry.mtime_ms),
+                entry.size,
+            )
+        })
+        .collect();
+
+    let host_id = host.id.clone();
+    let parse = |path: &Path| -> std::io::Result<Option<SessionMeta>> {
+        let Some(entry) = by_key.get(path.to_string_lossy().as_ref()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "清单条目缺失",
+            ));
+        };
+        let Some(file) = data.get(&entry.path) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "头尾数据缺失",
+            ));
+        };
+        let lines = if entry.path.ends_with(".jsonl.zst") {
+            let prefix = file.tail_bytes.as_deref().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "压缩前缀缺失")
+            })?;
+            let text = ssh::decode_zst_prefix(prefix)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            codex::SessionLines {
+                head: text
+                    .lines()
+                    .take(codex::HEAD_LINES)
+                    .map(str::to_string)
+                    .collect(),
+                tail: Vec::new(),
+                fallback_last_active: Some(entry.mtime_ms),
+            }
+        } else {
+            codex::SessionLines {
+                head: file.head.clone(),
+                tail: file.tail.clone(),
+                fallback_last_active: None,
+            }
+        };
+        Ok(codex::parse_session_lines(path, lines, &HashMap::new())
+            .map(|meta| ssh::rebind_remote_meta(meta, &host_id, &entry.path)))
+    };
+
+    Ok(remote_parse_cache(&host.id).scan_remote(cache_files, parse))
+}
+
+/// 分批（≤[`REMOTE_HEAD_TAIL_BATCH`]）执行头尾帧协议拉取；sentinel 每批
+/// 随机生成，文件内容中出现的固定哨兵文本无法伪装成行首分界。
+fn fetch_head_tail_batches(
+    host: &crate::settings::SshHostConfig,
+    requests: &[ssh::HeadTailRequest],
+) -> Result<HashMap<String, ssh::HeadTailData>, String> {
+    let mut all = HashMap::new();
+    for batch in requests.chunks(REMOTE_HEAD_TAIL_BATCH) {
+        let sentinel = uuid::Uuid::new_v4().simple().to_string();
+        let cmd = ssh::head_tail_batch_command(batch, &sentinel);
+        let out = ssh::run_remote(host, &cmd, REMOTE_BATCH_TIMEOUT)
+            .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+        let map = ssh::parse_head_tail_output(&out, &sentinel, batch)
+            .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+        all.extend(map);
+    }
+    Ok(all)
 }
 
 pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<SessionMessage>, String> {

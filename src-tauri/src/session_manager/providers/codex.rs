@@ -1936,15 +1936,16 @@ fn parse_session_with_titles(
 }
 
 /// 列表元数据要读的行：开头取 id / 项目 / 首条消息，结尾取最后活跃时间与预览。
-struct SessionLines {
-    head: Vec<String>,
-    tail: Vec<String>,
+/// （远程链路复用：行数据与兜底时间由 ssh 头尾帧协议供给后构造。）
+pub(crate) struct SessionLines {
+    pub head: Vec<String>,
+    pub tail: Vec<String>,
     /// 结尾没读到时间时的兜底（毫秒）
-    fallback_last_active: Option<i64>,
+    pub fallback_last_active: Option<i64>,
 }
 
-const HEAD_LINES: usize = 10;
-const TAIL_LINES: usize = 30;
+pub(crate) const HEAD_LINES: usize = 10;
+pub(crate) const TAIL_LINES: usize = 30;
 
 /// 压缩文件没法跳到结尾，整份解压又太慢（几十 GB 的会话目录每次打开都要等），
 /// 所以只解压开头；最后活跃时间用文件 mtime（Codex 压缩时保留了它），不出预览。
@@ -1973,7 +1974,9 @@ fn read_session_lines(path: &Path) -> std::io::Result<SessionLines> {
     })
 }
 
-fn parse_session_lines(
+/// 解析头尾行窗口为会话元数据（远程链路复用：行数据来自 ssh 头尾帧协议，
+/// 压缩文件用 zst 前缀解出的头部行 + mtime 兜底）。
+pub(crate) fn parse_session_lines(
     path: &Path,
     lines: SessionLines,
     thread_titles: &HashMap<String, String>,
