@@ -25,8 +25,8 @@ const MAX_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: u64 = 4096;
 /// `try_wait` 轮询间隔
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// ssh 连接建立超时（秒）
-const CONNECT_TIMEOUT_SECS: &str = "10";
+/// ssh 连接建立超时（秒）；spec 全局约束：ssh 命令统一 ConnectTimeout=8
+const CONNECT_TIMEOUT_SECS: &str = "8";
 /// 连接复用的存活时长；Windows OpenSSH 不支持，仅非 Windows 启用
 const CONTROL_PERSIST: &str = "10m";
 
@@ -288,7 +288,7 @@ mod tests {
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "cat /tmp/x");
         let argv = args(&cmd);
         assert!(argv.contains(&"BatchMode=yes".to_string()));
-        assert!(argv.contains(&"ConnectTimeout=10".to_string()));
+        assert!(argv.contains(&"ConnectTimeout=8".to_string()));
         assert!(argv.contains(&"ControlPersist=10m".to_string()));
         assert!(argv.contains(&"dev@example.com".to_string()));
         // remote_cmd 必须是最后一个参数
