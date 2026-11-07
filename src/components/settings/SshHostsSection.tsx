@@ -82,9 +82,10 @@ export const sshHostMatchKey = (
   user?: string,
 ): string =>
   [
+    // host 走 DNS，大小写不敏感；user 是登录身份，大小写敏感——只 trim 不折叠
     host.trim().toLowerCase(),
     String(port ?? 22),
-    user?.trim().toLowerCase() ?? "",
+    user?.trim() ?? "",
   ].join("::");
 
 /** ssh config 条目是否已被现有 sshHosts 覆盖（决定导入列表里的禁用态） */

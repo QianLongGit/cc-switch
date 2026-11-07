@@ -127,16 +127,25 @@ describe("isSshConfigHostImported", () => {
     );
   });
 
-  it("user 参与匹配；host 大小写与首尾空白归一", () => {
+  it("user 参与匹配且大小写敏感；host 大小写与首尾空白归一", () => {
     const existing: SshHostConfig[] = [
       { id: "h1", label: "box", host: "Example.COM ", user: " Dev " },
     ];
+    // host 归一（大小写 / 空白），user trim 后完全一致 → 同一主机
+    expect(
+      isSshConfigHostImported(
+        { alias: "box", hostName: "example.com", user: "Dev" },
+        existing,
+      ),
+    ).toBe(true);
+    // ssh 用户名大小写敏感：dev ≠ Dev，不判已导入
     expect(
       isSshConfigHostImported(
         { alias: "box", hostName: "example.com", user: "dev" },
         existing,
       ),
-    ).toBe(true);
+    ).toBe(false);
+    // user 缺省与显式 user 同样是不同身份
     expect(
       isSshConfigHostImported(
         { alias: "box", hostName: "example.com" },
