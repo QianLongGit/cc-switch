@@ -1502,7 +1502,8 @@ mod tests {
     /// 注入窗口内与真实值的差异只有 `ssh_hosts` 一个字段（无其它测试消费），并靠
     /// `#[serial_test::serial]` 与其它 settings 测试互斥。
     struct SshSettingsSandbox {
-        home: tempfile::TempDir,
+        // 仅持有以维持存活（drop 时删除临时目录），无读取方——下划线前缀豁免
+        _home: tempfile::TempDir,
         previous_home: Option<std::ffi::OsString>,
         previous: crate::settings::AppSettings,
     }
@@ -1510,9 +1511,9 @@ mod tests {
     impl SshSettingsSandbox {
         fn enter(host_id: &str) -> Self {
             let previous = crate::settings::get_settings();
-            let home = tempfile::tempdir().unwrap();
+            let _home = tempfile::tempdir().unwrap();
             let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-            std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+            std::env::set_var("CC_SWITCH_TEST_HOME", _home.path());
             let mut injected = previous.clone();
             injected.ssh_hosts = Some(vec![crate::settings::SshHostConfig {
                 id: host_id.to_string(),
@@ -1524,7 +1525,7 @@ mod tests {
             }]);
             crate::settings::update_settings(injected).expect("注入测试 ssh 主机");
             Self {
-                home,
+                _home,
                 previous_home,
                 previous,
             }
@@ -1728,7 +1729,10 @@ mod tests {
         // 根目录外 / 目录边界（projects-evil）/ 逃逸段 → false
         assert!(!remote_image_allowed("h1", "/tmp/evil.png"));
         assert!(!remote_image_allowed("h1", "/home/u/.config/screen.png"));
-        assert!(!remote_image_allowed("h1", "/home/u/.claude/projects-evil/a.png"));
+        assert!(!remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects-evil/a.png"
+        ));
         assert!(!remote_image_allowed(
             "h1",
             "/home/u/.claude/projects/p/../../etc/passwd.png"
@@ -1743,7 +1747,10 @@ mod tests {
             "h1",
             "/home/u/.claude/projects/p/notes.txt"
         ));
-        assert!(!remote_image_allowed("h1", "/home/u/.claude/projects/p/noext"));
+        assert!(!remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects/p/noext"
+        ));
     }
 
     /// Ssh 图片加载：白名单 / SVG 检查在前（确定性文案），主机缺失就近报错
@@ -1759,8 +1766,11 @@ mod tests {
         );
         // 白名单内但 host 不在 settings（不注入 sandbox，读取并发安全）
         assert_eq!(
-            load_remote_image("cc-switch-test-no-host", "/home/u/.claude/projects/a/ok.png")
-                .unwrap_err(),
+            load_remote_image(
+                "cc-switch-test-no-host",
+                "/home/u/.claude/projects/a/ok.png"
+            )
+            .unwrap_err(),
             "SSH 主机不存在或已移除"
         );
     }

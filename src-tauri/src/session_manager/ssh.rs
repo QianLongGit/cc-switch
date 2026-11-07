@@ -140,13 +140,16 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
         cmd.arg("-i").arg(identity);
     }
     cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
+    cmd.arg("-o")
+        .arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
 
     #[cfg(not(windows))]
     if let Some(control_path) = control_socket_dir() {
         cmd.arg("-o").arg("ControlMaster=auto");
-        cmd.arg("-o").arg(format!("ControlPath={}/cm-%C", control_path.display()));
-        cmd.arg("-o").arg(format!("ControlPersist={CONTROL_PERSIST}"));
+        cmd.arg("-o")
+            .arg(format!("ControlPath={}/cm-%C", control_path.display()));
+        cmd.arg("-o")
+            .arg(format!("ControlPersist={CONTROL_PERSIST}"));
     }
 
     let destination = match host.user.as_deref().filter(|s| !s.is_empty()) {
@@ -298,10 +301,9 @@ pub(crate) struct SshScanRegistry {
     manifests: RwLock<HashMap<String, HashMap<String, RemoteFileMeta>>>,
 }
 
-static GLOBAL: LazyLock<SshScanRegistry> =
-    LazyLock::new(|| SshScanRegistry {
-        manifests: RwLock::new(HashMap::new()),
-    });
+static GLOBAL: LazyLock<SshScanRegistry> = LazyLock::new(|| SshScanRegistry {
+    manifests: RwLock::new(HashMap::new()),
+});
 
 impl SshScanRegistry {
     /// 进程级共享清单（单例参照 `cache.rs::global()` 的 LazyLock 方案）
@@ -327,14 +329,18 @@ impl SshScanRegistry {
     }
 
     /// 取读锁；锁中毒时直接恢复数据继续用（清单为可重建的缓存态，无不变量需保护）
-    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
+    fn lock_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
         self.manifests
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 取写锁；中毒恢复策略同 [`Self::lock_read`]
-    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
+    fn lock_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
         self.manifests
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -352,7 +358,15 @@ pub(crate) struct RemoteFileEntry {
 }
 
 /// 构造远端列表命令：`for` 循环对各目录 `find` 出 `.jsonl` / `.jsonl.zst` 文件，
-/// 按 `size\t%T@\tpath` TSV 输出；`2>/dev/null` 吞掉目录不存在等远端噪音。
+/// 按 `size\t%T@\tpath` TSV 输出；`2>/dev/null` 吞掉目录不存在的远端噪音，
+/// 末尾 `; :` 归零退出码——`find` 对缺失目录退出 1，只装 claude 未装 codex
+/// 的主机（`~/.codex/*` 不存在）不应让整条命令以失败收场。
+///
+/// 远端 find 兼容性：`-printf` 是 GNU 扩展，BSD find（macOS 远端主机）不
+/// 认——报错被 `2>/dev/null` 吞掉后输出为空，会静默漏掉全部会话。因此
+/// GNU 输出为空时回退 `stat` 组装（GNU `stat -c` 优先、BSD `stat -f` 兜底，
+/// 秒级 mtime 由 [`parse_mtime_ms`] 的整秒形态兼容）；GNU 可用的远端不走
+/// 回退，毫秒精度不受影响。
 /// 空 slice 早退为 shell no-op（`:`），避免生成 `for d in ; do ...` 病态命令。
 pub(crate) fn list_files_command(dirs: &[String]) -> String {
     if dirs.is_empty() {
@@ -361,11 +375,17 @@ pub(crate) fn list_files_command(dirs: &[String]) -> String {
     let quoted = dirs
         .iter()
         .map(|d| escape_remote_path(d))
-        .collect::<Vec<_>>();
-    format!(
-        "for d in {}; do find \"$d\" -type f \\( -name '*.jsonl' -o -name '*.jsonl.zst' \\) -printf '%s\\t%T@\\t%p\\n' 2>/dev/null; done",
-        quoted.join(" ")
-    )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let gnu = format!(
+        "for d in {quoted}; do find \"$d\" -type f \\( -name '*.jsonl' -o -name '*.jsonl.zst' \\) -printf '%s\\t%T@\\t%p\\n' 2>/dev/null; done"
+    );
+    // stat 格式串直接嵌真实 TAB 字符（Rust `\t`）：BSD stat 不解释 `\t` 转义，
+    // GNU stat 两种都认——真 TAB 是唯一双平台稳妥形态
+    let bsd = format!(
+        "for d in {quoted}; do find \"$d\" -type f \\( -name '*.jsonl' -o -name '*.jsonl.zst' \\) -exec sh -c 'for f do stat -c \"%s\t%Y\t%n\" -- \"$f\" 2>/dev/null || stat -f \"%z\t%m\t%N\" \"$f\"; done' sh {{}} + 2>/dev/null; done"
+    );
+    format!("o=$({gnu}); if [ -n \"$o\" ]; then printf '%s\\n' \"$o\"; else {bsd}; fi; :")
 }
 
 /// 解析列表命令的 TSV 输出为条目列表。
@@ -376,7 +396,9 @@ pub(crate) fn parse_list_output(out: &[u8]) -> Vec<RemoteFileEntry> {
     let mut entries = Vec::new();
     for line in out.split(|&b| b == b'\n') {
         // 非 UTF-8 行：路径已损坏，无拯救价值，整行丢弃
-        let Ok(text) = std::str::from_utf8(line) else { continue };
+        let Ok(text) = std::str::from_utf8(line) else {
+            continue;
+        };
         let mut fields = text.splitn(3, '\t');
         let (Some(size), Some(mtime_ms), Some(path)) = (
             fields.next().and_then(|s| s.parse::<u64>().ok()),
@@ -553,7 +575,8 @@ pub(crate) fn parse_head_tail_output(
 
     // 逐行扫描字节流记录分界（行首 = 流首或 \n 之后）：
     // (行首, 行尾不含换行, 分界归属；None = 结束标记)
-    let mut bounds: Vec<(usize, usize, Option<(char, String)>)> = Vec::new();
+    type LineBound = (usize, usize, Option<(char, String)>);
+    let mut bounds: Vec<LineBound> = Vec::new();
     let mut pos = 0;
     while pos < out.len() {
         let line_end = out[pos..]
@@ -587,7 +610,9 @@ pub(crate) fn parse_head_tail_output(
     let mut found: Vec<(char, String)> = Vec::new();
     for pair in bounds.windows(2) {
         let (prev_end, prev_section) = (&pair[0].1, &pair[0].2);
-        let Some((kind, path)) = prev_section else { continue };
+        let Some((kind, path)) = prev_section else {
+            continue;
+        };
         let content = &out[prev_end + 1..pair[1].0];
         // 剥掉段末恰好一个合成换行，还原真实内容
         let body = content.strip_suffix(b"\n").unwrap_or(content);
@@ -687,7 +712,10 @@ pub(crate) fn classify_remote_provider(
     claude_dir: &str,
     codex_dirs: &[String],
 ) -> Option<&'static str> {
-    let under = |dir: &str| path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    let under = |dir: &str| {
+        path.strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
     if under(claude_dir) {
         return Some("claude");
     }
@@ -1040,8 +1068,13 @@ mod tests {
             .unwrap();
         let cp = &argv[cp_idx];
         assert!(cp.contains("cm-%C"), "ControlPath 应使用 cm-%C: {cp}");
-        let dir = cp.trim_start_matches("ControlPath=").trim_end_matches("/cm-%C");
-        assert!(std::path::Path::new(dir).is_dir(), "目录应被惰性创建: {dir}");
+        let dir = cp
+            .trim_start_matches("ControlPath=")
+            .trim_end_matches("/cm-%C");
+        assert!(
+            std::path::Path::new(dir).is_dir(),
+            "目录应被惰性创建: {dir}"
+        );
     }
 
     /* ===== 进程执行 ===== */
@@ -1086,7 +1119,9 @@ mod tests {
 
     #[test]
     fn error_display_is_chinese() {
-        assert!(SshError::ConnectOrAuth("x".into()).to_string().contains("连接"));
+        assert!(SshError::ConnectOrAuth("x".into())
+            .to_string()
+            .contains("连接"));
         assert!(SshError::Remote("x".into()).to_string().contains("远端"));
         assert!(SshError::Timeout.to_string().contains("超时"));
         assert!(SshError::SshUnavailable.to_string().contains("ssh"));
@@ -1156,7 +1191,10 @@ mod tests {
             host,
             HashMap::from([("/b.jsonl".to_string(), meta(20, 200))]),
         );
-        assert!(reg.lookup(host, "/a.jsonl").is_none(), "旧清单条目应被全量替换");
+        assert!(
+            reg.lookup(host, "/a.jsonl").is_none(),
+            "旧清单条目应被全量替换"
+        );
         assert_eq!(reg.lookup(host, "/b.jsonl"), Some(meta(20, 200)));
     }
 
@@ -1196,18 +1234,83 @@ mod tests {
             "/home/u/.claude/projects".to_string(),
             "/home/u/.codex/sessions".to_string(),
         ]);
-        assert_eq!(
-            cmd,
-            "for d in '/home/u/.claude/projects' '/home/u/.codex/sessions'; do \
+        // GNU 主路径：毫秒精度 -printf TSV
+        assert!(cmd.contains(
+            "o=$(for d in '/home/u/.claude/projects' '/home/u/.codex/sessions'; do \
              find \"$d\" -type f \\( -name '*.jsonl' -o -name '*.jsonl.zst' \\) \
-             -printf '%s\\t%T@\\t%p\\n' 2>/dev/null; done"
+             -printf '%s\\t%T@\\t%p\\n' 2>/dev/null; done)"
+        ));
+        // GNU 输出为空时的 BSD find + stat 回退（GNU stat -c 优先、BSD stat -f 兜底）；
+        // stat 格式串用真实 TAB 字符（BSD stat 不解释 `\t` 转义）
+        assert!(cmd.contains("if [ -n \"$o\" ]"));
+        assert!(cmd.contains("stat -c \"%s\t%Y\t%n\" -- \"$f\""));
+        assert!(cmd.contains("stat -f \"%z\t%m\t%N\" \"$f\""));
+        // 整体退出码归零
+        assert!(cmd.ends_with("; :"), "命令应以 no-op 收尾: {cmd}");
+    }
+
+    /// 缺失目录不得让清单命令以非零退出收场（只装 claude 未装 codex 的主机）
+    #[test]
+    fn list_cmd_missing_dirs_exit_zero_via_local_sh() {
+        let missing = std::env::temp_dir()
+            .join("cc-switch-no-such-dir")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(list_files_command(&[missing]))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "缺失目录应吞掉退出码: {} / stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
         );
+        assert!(out.stdout.is_empty(), "无匹配文件应无清单输出");
+    }
+
+    /// BSD find（macOS 远端）真跑回退路径：无 `-printf` 的 find 上 GNU 段输出
+    /// 为空 → stat 组装的 TSV 仍可被 [`parse_list_output`] 解析（含整秒 mtime）
+    #[test]
+    fn list_cmd_bsd_fallback_via_local_sh() {
+        let dir = std::env::temp_dir().join(format!("cc-switch-ls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jsonl"), "line1\n").unwrap();
+
+        let dir_s = dir.to_str().unwrap().to_string();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(list_files_command(std::slice::from_ref(&dir_s)))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "sh 执行失败: {} / stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let entries = parse_list_output(&out.stdout);
+        assert_eq!(entries.len(), 1, "应恰好列出一个夹具文件: {entries:?}");
+        assert_eq!(entries[0].path, format!("{dir_s}/a.jsonl"));
+        assert_eq!(entries[0].size, 6, "字节数应来自 stat 的 size");
+        // 本机为 BSD find：必然走回退段，mtime 为整秒（无小数部分）
+        assert!(
+            entries[0].mtime_ms >= 1_700_000_000_000,
+            "mtime 应为现代时间戳毫秒值"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn list_cmd_escapes_embedded_single_quote() {
         let cmd = list_files_command(&["/dir with'quote".to_string()]);
-        assert!(cmd.starts_with("for d in '/dir with'\\''quote'; do "));
+        // 单引号路径转义后拼入两段（GNU 主路径与 BSD 回退）
+        assert!(cmd.contains("for d in '/dir with'\\''quote'; do "));
+        assert_eq!(cmd.matches("'/dir with'\\''quote'").count(), 2);
     }
 
     #[test]
@@ -1235,12 +1338,12 @@ mod tests {
     #[test]
     fn parse_list_skips_bad_lines_and_keeps_good_ones() {
         let mut out = Vec::new();
-        out.extend_from_slice(b"\n");                               // 空行
-        out.extend_from_slice(b"garbage-without-tabs\n");           // 无 TSV 字段
-        out.extend_from_slice(b"abc\t1.0\t/p/bad1.jsonl\n");        // size 非数字
+        out.extend_from_slice(b"\n"); // 空行
+        out.extend_from_slice(b"garbage-without-tabs\n"); // 无 TSV 字段
+        out.extend_from_slice(b"abc\t1.0\t/p/bad1.jsonl\n"); // size 非数字
         out.extend_from_slice(b"789\tnot-a-time\t/p/bad2.jsonl\n"); // mtime 非法
-        out.extend_from_slice(b"9\t100.5\t/\xffbad.jsonl\n");       // 非 UTF-8 行
-        out.extend_from_slice(b"77\t1700000000\t/p/last.jsonl");    // 无尾换行 + 整秒时间
+        out.extend_from_slice(b"9\t100.5\t/\xffbad.jsonl\n"); // 非 UTF-8 行
+        out.extend_from_slice(b"77\t1700000000\t/p/last.jsonl"); // 无尾换行 + 整秒时间
         assert_eq!(
             parse_list_output(&out),
             vec![RemoteFileEntry {
@@ -1510,7 +1613,10 @@ mod tests {
     #[test]
     fn read_full_and_delete_quote_paths() {
         assert_eq!(read_full_command("/p/a b.jsonl"), "cat '/p/a b.jsonl'");
-        assert_eq!(read_full_command("/p/it's.jsonl"), "cat '/p/it'\\''s.jsonl'");
+        assert_eq!(
+            read_full_command("/p/it's.jsonl"),
+            "cat '/p/it'\\''s.jsonl'"
+        );
         assert_eq!(delete_file_command("/p/a.jsonl"), "rm -f -- '/p/a.jsonl'");
         assert_eq!(
             delete_file_command("/p/x'y.jsonl"),
@@ -1581,7 +1687,10 @@ mod tests {
         assert_eq!(zst_window(bytes, 0, 10), &bytes[..10]);
         assert_eq!(zst_window(bytes, 20, 15), &bytes[20..35]);
         // len 超过解压尾：截到文件尾
-        assert_eq!(zst_window(bytes, total - 3, 1000), &bytes[bytes.len() - 3..]);
+        assert_eq!(
+            zst_window(bytes, total - 3, 1000),
+            &bytes[bytes.len() - 3..]
+        );
         // offset 恰好落在文件尾：空窗（不越界）
         assert!(zst_window(bytes, total, 10).is_empty());
         // offset 超过解压尾：空窗
