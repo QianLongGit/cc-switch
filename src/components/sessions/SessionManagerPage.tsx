@@ -616,10 +616,14 @@ export function SessionManagerPage({
 
       if (deletedKeys.length > 0) {
         const deletedKeySet = new Set(deletedKeys);
-        queryClient.setQueryData<SessionMeta[]>(["sessions"], (current) =>
-          (current ?? []).filter(
-            (session) => !deletedKeySet.has(getSessionKey(session)),
-          ),
+        // 批量删除可能横跨本机与远程主机（Task 12 引入主机切换前先按集合形态
+        // 覆盖全部主机变体）；getSessionKey 三元组匹配天然精确。
+        queryClient.setQueriesData<SessionMeta[]>(
+          { queryKey: sessionKeys.all },
+          (current) =>
+            (current ?? []).filter(
+              (session) => !deletedKeySet.has(getSessionKey(session)),
+            ),
         );
       }
       results
@@ -645,7 +649,7 @@ export function SessionManagerPage({
         return next;
       });
 
-      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: sessionKeys.all });
 
       if (deletedKeys.length > 0) {
         toast.success(

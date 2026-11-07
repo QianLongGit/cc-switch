@@ -613,6 +613,27 @@ export interface SessionMeta {
   resumeCommand?: string;
 }
 
+// ─── SSH 远程会话主机（对应 Rust settings.rs / ssh_config.rs，字段 camelCase） ───
+
+/** `~/.ssh/config` 中一个 Host 段的提取结果（list_ssh_config_hosts 返回） */
+export interface SshConfigHost {
+  /** Host 行的别名（即用户敲 `ssh <alias>` 用的名字） */
+  alias: string;
+  hostName?: string;
+  user?: string;
+  port?: number;
+}
+
+/** 已保存的 SSH 主机配置（设置层持久化，test_ssh_host / list_sessions 入参） */
+export interface SshHostConfig {
+  id: string;
+  label: string;
+  host: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+}
+
 // ─── 会话阅读页数据模型（对应 Rust session_manager/model.rs） ───
 
 export type ToolKind =

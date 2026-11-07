@@ -9,6 +9,7 @@ import {
 } from "@/lib/api";
 import type { Provider, Settings, UsageResult, SessionMeta } from "@/types";
 import { usageKeys } from "@/lib/query/usage";
+import { sessionKeys } from "@/lib/query/sessions";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 const sortProviders = (
@@ -305,10 +306,10 @@ export const useUsageQuery = (
   };
 };
 
-export const useSessionsQuery = () => {
+export const useSessionsQuery = (hostId?: string) => {
   return useQuery<SessionMeta[]>({
-    queryKey: ["sessions"],
-    queryFn: async () => sessionsApi.list(),
+    queryKey: sessionKeys.list(hostId),
+    queryFn: async () => sessionsApi.list(hostId),
     staleTime: 30 * 1000,
   });
 };
