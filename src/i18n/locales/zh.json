@@ -1133,6 +1133,7 @@
       "appConfig": "应用配置",
       "routing": "本地路由",
       "network": "网络",
+      "sshHosts": "SSH 主机",
       "data": "数据",
       "about": "关于"
     },
@@ -1144,6 +1145,47 @@
     },
     "data": {
       "location": "存储位置"
+    },
+    "sshHosts": {
+      "blockTitle": "SSH 远程主机",
+      "help": "配置会话页主机切换可用的远程机器。可从 ~/.ssh/config 导入或手动添加；删除主机不会清除它的远程会话缓存，重新添加后仍可查看。",
+      "add": "添加主机",
+      "addTitle": "添加 SSH 主机",
+      "addDescription": "从 ~/.ssh/config 导入已有主机，或手动填写一台新主机。",
+      "empty": "还没有 SSH 主机。添加后即可在会话页切换查看远程会话。",
+      "importTab": "从 SSH Config 导入",
+      "manualTab": "手动添加",
+      "import": {
+        "loading": "正在读取 ~/.ssh/config…",
+        "error": "读取 SSH Config 失败：{{error}}",
+        "empty": "~/.ssh/config 里没有可导入的 Host 段，可切到「手动添加」。",
+        "imported": "已导入",
+        "action": "导入所选 {{count}} 台主机"
+      },
+      "form": {
+        "label": "名称",
+        "labelPlaceholder": "如：build-box",
+        "host": "主机地址",
+        "hostPlaceholder": "IP 或域名",
+        "user": "用户名（可选）",
+        "port": "端口（可选）",
+        "identityFile": "私钥文件（可选）",
+        "submitAdd": "添加"
+      },
+      "testConnection": "测试连接",
+      "testing": "测试中",
+      "testSuccess": "连接成功",
+      "testFailed": "连接失败",
+      "edit": "编辑",
+      "editTitle": "编辑主机「{{label}}」",
+      "editDescription": "修改该主机的名称、地址与连接参数。",
+      "delete": "删除",
+      "deleteTitle": "删除主机「{{label}}」？",
+      "deleteLead": "仅从列表移除该主机；它的远程会话缓存会保留，重新添加同一主机后可再次查看。",
+      "deleteConfirm": "删除主机",
+      "badId": "主机 ID 含非法字符 “/”，已取消保存",
+      "addedToast": "已添加 {{count}} 台主机",
+      "deletedToast": "已删除主机「{{label}}」"
     }
   },
   "apps": {

@@ -1115,6 +1115,7 @@
       "appConfig": "Uygulama yapılandırması",
       "routing": "Yerel yönlendirme",
       "network": "Ağ",
+      "sshHosts": "SSH Sunucuları",
       "data": "Veri",
       "about": "Hakkında"
     },
@@ -1126,6 +1127,47 @@
     },
     "data": {
       "location": "Konum"
+    },
+    "sshHosts": {
+      "blockTitle": "SSH Uzak Sunucuları",
+      "help": "Oturum sayfasındaki sunucu değiştiricide kullanılacak uzak makineleri yönetin. ~/.ssh/config dosyasından içe aktarabilir veya elle ekleyebilirsiniz. Bir sunucuyu silmek önbelleğe alınmış uzak oturumlarını silmez; yeniden eklediğinizde geri görünür.",
+      "add": "Sunucu Ekle",
+      "addTitle": "SSH Sunucusu Ekle",
+      "addDescription": "Mevcut sunucuları ~/.ssh/config'ten içe aktarın veya yeni bir sunucuyu elle girin.",
+      "empty": "Henüz SSH sunucusu yok. Ekledikten sonra oturum sayfasından uzak oturumları görüntüleyebilirsiniz.",
+      "importTab": "SSH Config'ten İçe Aktar",
+      "manualTab": "Elle Ekle",
+      "import": {
+        "loading": "~/.ssh/config okunuyor…",
+        "error": "SSH config okunamadı: {{error}}",
+        "empty": "~/.ssh/config içinde içe aktarılabilir Host bölümü yok. \"Elle Ekle\" sekmesine geçin.",
+        "imported": "İçe aktarıldı",
+        "action": "{{count}} sunucuyu içe aktar"
+      },
+      "form": {
+        "label": "Ad",
+        "labelPlaceholder": "örn. build-box",
+        "host": "Sunucu adresi",
+        "hostPlaceholder": "IP veya alan adı",
+        "user": "Kullanıcı adı (isteğe bağlı)",
+        "port": "Port (isteğe bağlı)",
+        "identityFile": "Özel anahtar dosyası (isteğe bağlı)",
+        "submitAdd": "Ekle"
+      },
+      "testConnection": "Bağlantıyı Sına",
+      "testing": "Sınanıyor",
+      "testSuccess": "Bağlantı başarılı",
+      "testFailed": "Bağlantı başarısız",
+      "edit": "Düzenle",
+      "editTitle": "\"{{label}}\" sunucusunu düzenle",
+      "editDescription": "Bu sunucunun adını, adresini ve bağlantı ayarlarını değiştirin.",
+      "delete": "Sil",
+      "deleteTitle": "\"{{label}}\" sunucusu silinsin mi?",
+      "deleteLead": "Yalnızca listeden kaldırılır; bu sunucunun uzak oturum önbelleği korunur ve aynı sunucu yeniden eklendiğinde tekrar görüntülenebilir.",
+      "deleteConfirm": "Sunucuyu Sil",
+      "badId": "Sunucu kimliğinde geçersiz \"/\" karakteri var, kaydetme iptal edildi",
+      "addedToast": "{{count}} sunucu eklendi",
+      "deletedToast": "\"{{label}}\" sunucusu silindi"
     }
   },
   "apps": {

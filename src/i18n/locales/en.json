@@ -1133,6 +1133,7 @@
       "appConfig": "App config",
       "routing": "Local routing",
       "network": "Network",
+      "sshHosts": "SSH Hosts",
       "data": "Data",
       "about": "About"
     },
@@ -1144,6 +1145,47 @@
     },
     "data": {
       "location": "Location"
+    },
+    "sshHosts": {
+      "blockTitle": "SSH Remote Hosts",
+      "help": "Manage the remote machines offered by the session page host switcher. Import from ~/.ssh/config or add manually; deleting a host keeps its cached remote sessions, which become viewable again once you re-add it.",
+      "add": "Add Host",
+      "addTitle": "Add SSH Host",
+      "addDescription": "Import existing hosts from ~/.ssh/config, or fill in a new host manually.",
+      "empty": "No SSH hosts yet. Add one to browse remote sessions from the session page.",
+      "importTab": "Import from SSH Config",
+      "manualTab": "Add Manually",
+      "import": {
+        "loading": "Reading ~/.ssh/config…",
+        "error": "Failed to read SSH config: {{error}}",
+        "empty": "No Host entries in ~/.ssh/config. Switch to \"Add Manually\" instead.",
+        "imported": "Imported",
+        "action": "Import {{count}} Host(s)"
+      },
+      "form": {
+        "label": "Name",
+        "labelPlaceholder": "e.g. build-box",
+        "host": "Host",
+        "hostPlaceholder": "IP or domain",
+        "user": "User (optional)",
+        "port": "Port (optional)",
+        "identityFile": "Identity file (optional)",
+        "submitAdd": "Add"
+      },
+      "testConnection": "Test Connection",
+      "testing": "Testing",
+      "testSuccess": "Connected",
+      "testFailed": "Connection failed",
+      "edit": "Edit",
+      "editTitle": "Edit Host \"{{label}}\"",
+      "editDescription": "Change this host's name, address, and connection settings.",
+      "delete": "Delete",
+      "deleteTitle": "Delete host \"{{label}}\"?",
+      "deleteLead": "Removes the host from this list only; its cached remote sessions are kept and viewable again once you re-add the same host.",
+      "deleteConfirm": "Delete Host",
+      "badId": "Host ID contains the illegal character \"/\"; save cancelled",
+      "addedToast": "Added {{count}} host(s)",
+      "deletedToast": "Deleted host \"{{label}}\""
     }
   },
   "apps": {
