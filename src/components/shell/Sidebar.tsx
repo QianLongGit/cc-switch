@@ -699,11 +699,13 @@ function NavItem({
 
 // ─── 设置目录 ──────────────────────────────────────────────────────────────
 
-const SETTINGS_ITEMS: { section: SettingsSection; icon: IconComponent }[] = [
+// 导出供一致性测试使用：设置目录必须与 navigation.ts 的 SETTINGS_SECTIONS 保持同序同集
+export const SETTINGS_ITEMS: { section: SettingsSection; icon: IconComponent }[] = [
   { section: "general", icon: SlidersHorizontal },
   { section: "appConfig", icon: Folder },
   { section: "routing", icon: Route },
   { section: "network", icon: Globe },
+  { section: "sshHosts", icon: Server },
   { section: "data", icon: Database },
   { section: "about", icon: Info },
 ];
