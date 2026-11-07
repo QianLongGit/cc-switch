@@ -1467,6 +1467,12 @@
     "consequenceGeneric": "{{app}}'nin yerel kayıtlarından kalıcı olarak kaldırıldı.",
     "sessionDeletedNamed": "Silinen oturum “{{title}}”",
     "remoteImage": "Uzak görüntü",
+    "hostSelector": {
+      "local": "Yerel",
+      "choose": "Ana makine seç",
+      "sshUnavailable": "ssh bulunamadı. OpenSSH istemcisini yükleyin",
+      "loadFailed": "Uzak oturumlar yüklenemedi"
+    },
     "reader": {
       "timelineSummary": "Adımlar · {{steps}}",
       "summaryCommands": "{{count}} komutları",

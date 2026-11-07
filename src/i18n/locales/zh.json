@@ -1493,6 +1493,12 @@
     "consequenceGeneric": "从 {{app}} 的本地记录中永久删除。",
     "sessionDeletedNamed": "已删除会话「{{title}}」",
     "remoteImage": "远程图片",
+    "hostSelector": {
+      "local": "本机",
+      "choose": "选择主机",
+      "sshUnavailable": "未检测到 ssh，请安装 OpenSSH 客户端",
+      "loadFailed": "加载远程会话失败"
+    },
     "reader": {
       "timelineSummary": "执行过程 · {{steps}} 步",
       "summaryCommands": "{{count}} 个命令",

@@ -1493,6 +1493,12 @@
     "consequenceGeneric": "Permanently removed from {{app}}’s local records.",
     "sessionDeletedNamed": "Deleted session “{{title}}”",
     "remoteImage": "Remote image",
+    "hostSelector": {
+      "local": "Local",
+      "choose": "Choose host",
+      "sshUnavailable": "ssh not found. Install the OpenSSH client.",
+      "loadFailed": "Failed to load remote sessions"
+    },
     "reader": {
       "timelineSummary": "Steps · {{steps}}",
       "summaryCommands": "{{count}} commands",

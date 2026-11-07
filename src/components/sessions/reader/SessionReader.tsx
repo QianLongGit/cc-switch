@@ -21,7 +21,7 @@ import { useMoneyFormat } from "@/hooks/useMoneyFormat";
 import { cn } from "@/lib/utils";
 import type { SessionMessage, SessionMeta, TurnIndex } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { getBaseName } from "../utils";
+import { getBaseName, isRemoteSession } from "../utils";
 import { getAgentReaderStyle } from "./agentStyles";
 import { ReaderContext, type ReaderContextValue } from "./context";
 import { transcriptToMarkdown, turnToMarkdown } from "./exportMarkdown";
@@ -489,6 +489,8 @@ export function SessionReader({
       style,
       appName,
       searchQuery: highlightQuery || undefined,
+      // SSH 远程会话的路径不在本机：路径胶囊不出「在文件管理器中显示」
+      revealEnabled: !isRemoteSession(session),
       onCopy,
     }),
     [

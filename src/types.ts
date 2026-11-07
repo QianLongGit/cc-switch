@@ -552,6 +552,10 @@ export interface Settings {
   // Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
   preferredTerminal?: string;
 
+  // ===== SSH 远程会话 =====
+  // 会话页主机切换的数据源；未配置时不出现主机切换控件
+  sshHosts?: SshHostConfig[];
+
   // ===== 本机自动迁移状态 =====
   localMigrations?: {
     codexThirdPartyHistoryProviderBucketV1?: {

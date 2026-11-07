@@ -69,6 +69,10 @@ export interface SessionTimeGroup {
 export const getSessionKey = (session: SessionMeta) =>
   `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;
 
+/** SSH 远程来源的会话：后端给这类会话的 sourcePath 带 `ssh:` 前缀 */
+export const isRemoteSession = (session: SessionMeta) =>
+  Boolean(session.sourcePath?.startsWith("ssh:"));
+
 export const getSessionTime = (session: SessionMeta) =>
   session.lastActiveAt ?? session.createdAt ?? 0;
 

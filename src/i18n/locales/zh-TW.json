@@ -1494,6 +1494,12 @@
     "consequenceGeneric": "從 {{app}} 的本機記錄中永久刪除。",
     "sessionDeletedNamed": "已刪除工作階段「{{title}}」",
     "remoteImage": "遠端圖片",
+    "hostSelector": {
+      "local": "本機",
+      "choose": "選擇主機",
+      "sshUnavailable": "未偵測到 ssh，請安裝 OpenSSH 用戶端",
+      "loadFailed": "載入遠端工作階段失敗"
+    },
     "reader": {
       "timelineSummary": "執行過程 · {{steps}} 步",
       "summaryCommands": "{{count}} 個指令",

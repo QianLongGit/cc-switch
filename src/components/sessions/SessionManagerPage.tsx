@@ -58,6 +58,7 @@ import {
   SessionItem,
   sessionMenuItemClass,
 } from "./SessionItem";
+import { SessionHostMenu } from "./SessionHostMenu";
 import { SessionReader } from "./reader/SessionReader";
 import { sessionKeys, useSessionTranscript } from "@/lib/query/sessions";
 import { SessionDeleteDialog, SessionSourcesDialog } from "./SessionDialogs";
@@ -67,6 +68,7 @@ import {
   getSessionKey,
   groupSessionsByProject,
   groupSessionsByTime,
+  isRemoteSession,
   isSessionAppId,
   SESSION_APP_IDS,
   SESSION_SOURCE_PATHS,
@@ -156,8 +158,10 @@ export function SessionManagerPage({
 }: SessionManagerPageProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { data, dataUpdatedAt, isSuccess, isLoading, refetch } =
-    useSessionsQuery();
+  // null = 本机；远程主机 id 来自设置里的 sshHosts（Task 11 的 host 维度 query key）
+  const [hostId, setHostId] = useState<string | null>(null);
+  const { data, dataUpdatedAt, isSuccess, isLoading, isError, error, refetch } =
+    useSessionsQuery(hostId ?? undefined);
   const sessions = useMemo(() => data ?? [], [data]);
   const { data: settings } = useSettingsQuery();
   const { updateSettings, autoSaveSettings } = useSettings();
@@ -748,7 +752,8 @@ export function SessionManagerPage({
         isChecked={selectedKeys.has(key)}
         searchQuery={trimmedQuery}
         contentHit={trimmedQuery ? contentHitOf(session) : undefined}
-        launchTerminal={terminalName}
+        // SSH 远程会话的路径不在本机，隐藏「在终端中恢复」入口（复制命令保留）
+        launchTerminal={isRemoteSession(session) ? null : terminalName}
         bordered={bordered}
         openButtonId={openButtonId(key)}
         onOpen={() => openReader(session)}
@@ -1189,7 +1194,7 @@ export function SessionManagerPage({
             transcript={transcript}
             listQuery={trimmedQuery}
             initialFind={readerInitialFind}
-            launchTerminal={terminalName}
+            launchTerminal={isRemoteSession(readerSession) ? null : terminalName}
             hasPrev={readerIndex > 0}
             hasNext={
               readerIndex >= 0 && readerIndex < orderedSessions.length - 1
@@ -1308,6 +1313,13 @@ export function SessionManagerPage({
                 })}
               </DropdownMenuContent>
             </DropdownMenu>
+
+            {/* 配了 SSH 主机才有切换的意义（没配时组件自己不渲染） */}
+            <SessionHostMenu
+              hostId={hostId}
+              sshHosts={settings?.sshHosts}
+              onSelect={setHostId}
+            />
 
             <div className="relative min-w-0 flex-1">
               <SearchField
@@ -1491,6 +1503,28 @@ export function SessionManagerPage({
               {t("sessionManager.loadingSessions", {
                 defaultValue: "加载会话中...",
               })}
+            </div>
+          ) : isError && sessions.length === 0 ? (
+            // 远程主机连不上（或本机读取失败）且没有任何可展示的数据：
+            // 后端错误文案已是分类好的中文，直接展示 + 重试
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 pb-10 text-center">
+              <p className="m-0 max-w-[560px] text-section text-fg-1">
+                {t("sessionManager.hostSelector.loadFailed", {
+                  defaultValue: "加载远程会话失败",
+                })}
+              </p>
+              <code className="max-w-[560px] whitespace-pre-wrap rounded-[8px] bg-subtle px-2.5 py-1.5 text-left font-mono text-caption text-fg-2 [overflow-wrap:anywhere]">
+                {extractErrorMessage(error) || String(error ?? "")}
+              </code>
+              <div className="mt-2">
+                <Button
+                  variant="neutral"
+                  size="regular"
+                  onClick={() => void refetch()}
+                >
+                  {t("common.retry", { defaultValue: "重试" })}
+                </Button>
+              </div>
             </div>
           ) : matches.length === 0 ? (
             renderEmpty()

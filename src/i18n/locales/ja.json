@@ -1493,6 +1493,12 @@
     "consequenceGeneric": "{{app}} のローカル記録から完全に削除します。",
     "sessionDeletedNamed": "セッション「{{title}}」を削除しました",
     "remoteImage": "リモート画像",
+    "hostSelector": {
+      "local": "ローカル",
+      "choose": "ホストを選択",
+      "sshUnavailable": "ssh が見つかりません。OpenSSH クライアントをインストールしてください",
+      "loadFailed": "リモートセッションの読み込みに失敗しました"
+    },
     "reader": {
       "timelineSummary": "実行過程 · {{steps}} ステップ",
       "summaryCommands": "コマンド {{count}} 件",
