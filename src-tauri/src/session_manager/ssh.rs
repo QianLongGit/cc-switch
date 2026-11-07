@@ -1,4 +1,4 @@
-//! SSH 远程会话传输层：命令构造、远端路径转义与进程执行。
+//! SSH 远程会话传输层：命令构造、远端路径转义、进程执行与源路径解析。
 //!
 //! 仅依赖标准库 + Task 1 的 [`SshHostConfig`]：
 //!
@@ -6,10 +6,14 @@
 //! - [`escape_remote_path`]：POSIX 单引号转义，供远端命令内嵌路径
 //! - [`run_command`]：双线程读 stdout/stderr + `try_wait` 轮询 + 超时 kill
 //! - [`run_remote`]：组合上述两者，完成一次远端命令执行
+//! - [`parse_ssh_source`]：解析 `ssh:<hostId>/<远端绝对路径>` 源路径
+//! - [`SshScanRegistry`]：远端扫描清单的进程内存单例
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -107,7 +111,7 @@ fn is_executable(path: &Path) -> bool {
 
 /// 构造 `ssh <options> [user@]host <remote_cmd>`。
 ///
-/// - 基础参数：`BatchMode=yes`（禁止交互挂起）、`ConnectTimeout=10`
+/// - 基础参数：`BatchMode=yes`（禁止交互挂起）、`ConnectTimeout=8`
 /// - 非 Windows 追加连接复用三参数（`ControlMaster=auto` /
 ///   `ControlPath=<配置目录>/ssh/cm-%C` / `ControlPersist=10m`），
 ///   复用目录惰性创建，创建失败则降级为不复用（可用性优先）
@@ -237,6 +241,100 @@ pub(crate) fn run_remote(
     timeout: Duration,
 ) -> Result<Vec<u8>, SshError> {
     run_command(build_ssh_command(host, remote_cmd), timeout)
+}
+
+/* ===== 源路径解析 ===== */
+
+/// 解析 `ssh:<hostId>/<远端绝对路径>` 形态的源路径，返回 `(host_id, remote_path)`。
+///
+/// 规则：
+/// - 前缀必须是 `ssh:`
+/// - 按首个 `/` 切分出 hostId 与路径，hostId 由此天然不含 `/` 且必须非空
+/// - 路径必须为非空绝对路径（`/` 开头），且不含 `..` 段（防止逃逸目标目录）
+///
+/// 不合法返回 `None`，由上层映射为用户可读错误。
+// Task 6/7 接线 validate/scan 后移除
+#[allow(dead_code)]
+pub(crate) fn parse_ssh_source(raw: &str) -> Option<(String /*host_id*/, String /*remote_path*/)> {
+    let rest = raw.strip_prefix("ssh:")?;
+    // 首个 `/` 之前是 hostId；之后（含斜杠本体）是远端绝对路径
+    let (host_id, path) = rest.split_once('/')?;
+    if host_id.is_empty() || path.is_empty() {
+        return None;
+    }
+    let path = format!("/{path}");
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some((host_id.to_string(), path))
+}
+
+/* ===== 扫描清单 Registry ===== */
+
+/// 远端文件元数据：扫描时点的字节长度与修改时间（Unix 毫秒）。
+/// 供 fingerprint 判定「远端文件是否变化、缓存是否需失效」。
+// Task 6/7 接线 fingerprint 后移除
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteFileMeta {
+    pub len: u64,
+    pub mtime_ms: i64,
+}
+
+/// SSH 远端扫描清单（进程内存单例）：`hostId → { 路径 → 元数据 }`。
+///
+/// 扫描任务整体写入（[`SshScanRegistry::replace_manifest`]），
+/// validate / fingerprint / 删除会话按路径查询与摘除。
+// Task 6/7 接线后移除
+#[allow(dead_code)]
+pub(crate) struct SshScanRegistry {
+    /// 各主机的文件清单
+    manifests: RwLock<HashMap<String, HashMap<String, RemoteFileMeta>>>,
+}
+
+static GLOBAL: LazyLock<SshScanRegistry> =
+    LazyLock::new(|| SshScanRegistry {
+        manifests: RwLock::new(HashMap::new()),
+    });
+
+// Task 6/7 接线后移除
+#[allow(dead_code)]
+impl SshScanRegistry {
+    /// 进程级共享清单（单例参照 `cache.rs::global()` 的 LazyLock 方案）
+    pub(crate) fn global() -> &'static Self {
+        &GLOBAL
+    }
+
+    /// 全量替换某主机的清单，旧清单整体丢弃
+    pub(crate) fn replace_manifest(&self, host_id: &str, entries: HashMap<String, RemoteFileMeta>) {
+        self.lock_write().insert(host_id.to_string(), entries);
+    }
+
+    /// 查询某主机某路径的元数据
+    pub(crate) fn lookup(&self, host_id: &str, path: &str) -> Option<RemoteFileMeta> {
+        self.lock_read().get(host_id)?.get(path).copied()
+    }
+
+    /// 摘除单条条目（删除远端会话成功后调用）；返回条目原本是否存在
+    pub(crate) fn remove_entry(&self, host_id: &str, path: &str) -> bool {
+        self.lock_write()
+            .get_mut(host_id)
+            .is_some_and(|entries| entries.remove(path).is_some())
+    }
+
+    /// 取读锁；锁中毒时直接恢复数据继续用（清单为可重建的缓存态，无不变量需保护）
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
+        self.manifests
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 取写锁；中毒恢复策略同 [`Self::lock_read`]
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, HashMap<String, RemoteFileMeta>>> {
+        self.manifests
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[cfg(test)]
@@ -379,5 +477,101 @@ mod tests {
         assert!(SshError::Remote("x".into()).to_string().contains("远端"));
         assert!(SshError::Timeout.to_string().contains("超时"));
         assert!(SshError::SshUnavailable.to_string().contains("ssh"));
+    }
+
+    /* ===== 源路径解析 ===== */
+
+    #[test]
+    fn parse_valid_ssh_source() {
+        assert_eq!(
+            parse_ssh_source("ssh:h1/home/u/.claude/projects/x.jsonl"),
+            Some((
+                "h1".to_string(),
+                "/home/u/.claude/projects/x.jsonl".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_ssh_prefix() {
+        assert_eq!(parse_ssh_source("/home/u/x.jsonl"), None);
+        assert_eq!(parse_ssh_source("h1/home/u/x.jsonl"), None);
+    }
+
+    #[test]
+    fn parse_rejects_empty_host_id() {
+        // 前缀后直接是 /（含 //）：按首个 / 切分后 hostId 为空
+        assert_eq!(parse_ssh_source("ssh:/home/u"), None);
+        assert_eq!(parse_ssh_source("ssh://home/u"), None);
+    }
+
+    #[test]
+    fn parse_rejects_missing_path() {
+        // host 后无 /：取不出绝对路径
+        assert_eq!(parse_ssh_source("ssh:h1"), None);
+        assert_eq!(parse_ssh_source("ssh:h1.jsonl"), None);
+        // 仅根斜杠：路径为空
+        assert_eq!(parse_ssh_source("ssh:h1/"), None);
+    }
+
+    #[test]
+    fn parse_rejects_parent_dir_segments() {
+        assert_eq!(parse_ssh_source("ssh:h1/home/u/../x.jsonl"), None);
+        assert_eq!(parse_ssh_source("ssh:h1/a/b/../c.jsonl"), None);
+        // 仅独立的 ".." 段被拒；".claude" 这类单点前缀合法
+        assert!(parse_ssh_source("ssh:h1/home/u/.claude/x.jsonl").is_some());
+    }
+
+    /* ===== 扫描清单 Registry ===== */
+
+    /// 构造远端文件元数据
+    fn meta(len: u64, mtime_ms: i64) -> RemoteFileMeta {
+        RemoteFileMeta { len, mtime_ms }
+    }
+
+    /// 测试间共享 global 单例：各测试用独立 host_id，避免并行互扰
+    #[test]
+    fn registry_replace_manifest_swaps_whole_list() {
+        let reg = SshScanRegistry::global();
+        let host = "t-replace";
+        reg.replace_manifest(
+            host,
+            HashMap::from([("/a.jsonl".to_string(), meta(10, 100))]),
+        );
+        // 第二次写入应整体丢弃旧清单
+        reg.replace_manifest(
+            host,
+            HashMap::from([("/b.jsonl".to_string(), meta(20, 200))]),
+        );
+        assert!(reg.lookup(host, "/a.jsonl").is_none(), "旧清单条目应被全量替换");
+        assert_eq!(reg.lookup(host, "/b.jsonl"), Some(meta(20, 200)));
+    }
+
+    #[test]
+    fn registry_lookup_hit_and_miss() {
+        let reg = SshScanRegistry::global();
+        let host = "t-lookup";
+        reg.replace_manifest(
+            host,
+            HashMap::from([("/a.jsonl".to_string(), meta(10, 100))]),
+        );
+        assert_eq!(reg.lookup(host, "/a.jsonl"), Some(meta(10, 100)));
+        // 路径未命中 / 主机未命中
+        assert_eq!(reg.lookup(host, "/missing.jsonl"), None);
+        assert_eq!(reg.lookup("t-lookup-other", "/a.jsonl"), None);
+    }
+
+    #[test]
+    fn registry_remove_entry_then_lookup_misses() {
+        let reg = SshScanRegistry::global();
+        let host = "t-remove";
+        reg.replace_manifest(
+            host,
+            HashMap::from([("/a.jsonl".to_string(), meta(10, 100))]),
+        );
+        assert!(reg.remove_entry(host, "/a.jsonl"));
+        assert_eq!(reg.lookup(host, "/a.jsonl"), None);
+        // 删除不存在的条目返回 false，不 panic
+        assert!(!reg.remove_entry(host, "/a.jsonl"));
     }
 }
