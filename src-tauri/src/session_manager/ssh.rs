@@ -36,8 +36,13 @@ use super::SessionMeta;
 
 /* ===== 常量 ===== */
 
-/// stdout 采集上限（16MB，防御大输出拖垮内存；会话文件远小于此）
-const MAX_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+/// stdout 采集上限（40MB，防御大输出拖垮内存）。口径：语义上限 32MB
+/// （`content::MAX_TEXT_BYTES` 全文）+ 远程图片 20MB 级读取 + 余量，单一
+/// 常量取其上界。上限语义：读线程 `take` 满 40MB 后关闭管道读端 → 远端
+/// ssh 继续写 stdout 收 SIGPIPE 非零退出 → [`SshError::Remote`] 显式报错
+/// （而非静默截断）；极端时序下恰好在读满时正常收尾，后续
+/// [`enforce_fetch_limit`] 的 32MB 二次上限仍会在语义处拒绝。
+const MAX_STDOUT_BYTES: u64 = 40 * 1024 * 1024;
 /// stderr 采集上限（4KB，仅用于错误文案）
 const MAX_STDERR_BYTES: u64 = 4096;
 /// `try_wait` 轮询间隔
@@ -143,8 +148,15 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
 
+    // 测试开关命中时跳过连接复用（直连）；生产恒为 None 走复用
     #[cfg(not(windows))]
-    if let Some(control_path) = control_socket_dir() {
+    let control_path = if mux_disabled_for_test() {
+        None
+    } else {
+        control_socket_dir()
+    };
+    #[cfg(not(windows))]
+    if let Some(control_path) = control_path {
         cmd.arg("-o").arg("ControlMaster=auto");
         cmd.arg("-o")
             .arg(format!("ControlPath={}/cm-%C", control_path.display()));
@@ -174,10 +186,36 @@ fn control_socket_dir() -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).ok().map(|_| dir)
 }
 
+/* ===== 测试钩子：ControlMaster 禁用开关 ===== */
+
+/// 测试专用全局开关：置 true 时 [`build_ssh_command`] 跳过连接复用三参数。
+///
+/// 动机：macOS 上从多线程进程 spawn 的 ssh 走 mux（unix socket 传 fd）时
+/// `sendmsg` 偶发 `EMSGSIZE`（`mm_send_fd: sendmsg(1): Message too long`），
+/// libtest 默认并发的多线程语境可触发——localhost 冒烟测试
+/// （`ssh_localtest.rs`）置 true 直连 localhost 以免疫该偶发类别；CM 三参数
+/// 的命令形态由 `build_adds_control_master_triple_on_unix` 单测覆盖，
+/// 生产代码不受影响。
+#[cfg(all(test, not(windows)))]
+pub(crate) static DISABLE_CONTROL_MASTER_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 读取测试开关（生产构建恒 false，编译期消除）
+#[cfg(all(not(windows), test))]
+fn mux_disabled_for_test() -> bool {
+    DISABLE_CONTROL_MASTER_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 生产构建占位：恒 false
+#[cfg(all(not(windows), not(test)))]
+fn mux_disabled_for_test() -> bool {
+    false
+}
+
 /* ===== 进程执行 ===== */
 
-/// 执行命令：双线程并发读 stdout（截 16MB）/ stderr（截 4KB），
-/// `try_wait` 轮询直到退出或超时，超时 kill 整个进程组。
+/// 执行命令：双线程并发读 stdout（截 40MB，超限语义见 [`MAX_STDOUT_BYTES`]）/
+/// stderr（截 4KB），`try_wait` 轮询直到退出或超时，超时 kill 整个进程组。
 ///
 /// 退出码映射：255 → [`SshError::ConnectOrAuth`]，其余非零 → [`SshError::Remote`]。
 pub(crate) fn run_command(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, SshError> {
@@ -1085,6 +1123,25 @@ mod tests {
         cmd.arg("ok");
         let out = run_command(cmd, Duration::from_secs(5)).unwrap();
         assert_eq!(out, b"ok\n");
+    }
+
+    /// stdout 上限回归（16MB→40MB 提升）：17MB 输出落在旧上限之上、新上限
+    /// 之下，必须完整回传——旧值下读线程 take 满关管道会让 cat 收 SIGPIPE
+    /// 报 Remote。本地 `/bin/cat` 直测传输层，无需 ssh 环境。
+    #[test]
+    fn run_captures_stdout_over_old_16mb_cap() {
+        let dir = tempfile::Builder::new()
+            .prefix("ccsw-stdout-cap-")
+            .tempdir()
+            .expect("创建 tempdir");
+        let big = vec![b'x'; 17 * 1024 * 1024];
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, &big).unwrap();
+        let mut cmd = std::process::Command::new("/bin/cat");
+        cmd.arg(&file);
+        let out = run_command(cmd, Duration::from_secs(30)).expect("17MB 应在 40MB 上限内完整回传");
+        assert_eq!(out.len(), big.len(), "字节数应完整无截断");
+        assert_eq!(out, big, "内容应逐字节一致");
     }
 
     #[test]

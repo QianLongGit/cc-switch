@@ -758,7 +758,7 @@ mod tests {
 
         // 解析失败不缓存：cached_fresh 仍 miss（与 scan_remote 语义一致）
         let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
-            Err(io::Error::new(io::ErrorKind::Other, "boom"))
+            Err(std::io::Error::other("boom"))
         };
         assert!(cache.scan_remote(files.clone(), failing).is_empty());
         assert!(

@@ -22,17 +22,23 @@
 //! - `CC_SWITCH_TEST_HOME`：落盘重定向到 `/tmp` 下短前缀 tempdir（长
 //!   tempdir 前缀会让 ControlMaster socket 路径超过 unix 域 104 字节上限），
 //!   真实 settings.json 零接触
+//! - ControlMaster：测试窗口内全局禁用（macOS 多线程进程下 ssh mux 传 fd
+//!   偶发 `EMSGSIZE`，libtest 并发语境曾整批失败），直连 localhost 免疫；
+//!   Drop 时仍防御性点杀 socket 目录下的残留 master
 //! - 远端夹具目录：带 `cc-switch-localtest-<uuid>` 唯一前缀，断言失败也清理
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serial_test::serial;
 
 use crate::settings::SshHostConfig;
 
-use super::ssh::{escape_remote_path, read_block, run_remote, SshScanRegistry};
+use super::ssh::{
+    escape_remote_path, read_block, run_remote, SshScanRegistry, DISABLE_CONTROL_MASTER_FOR_TEST,
+};
 
 /* ===== 远端命令超时（与 mod.rs 链路口径对齐）===== */
 
@@ -101,10 +107,13 @@ fn localhost_ssh_available() -> bool {
 
 /// 无论断言成败，Drop 按序恢复全部副作用：
 ///
-/// 1. `rm -rf` 远端夹具目录（失败仅告警——目录带唯一前缀，残留可人工识别）
-/// 2. 恢复 settings 原值（此时 `CC_SWITCH_TEST_HOME` 仍指 tempdir，
+/// 1. 恢复 ControlMaster 测试开关（最先——后续清理自身的 ssh 调用回默认行为）
+/// 2. `rm -rf` 远端夹具目录（失败仅告警——目录带唯一前缀，残留可人工识别）
+/// 3. 点杀 socket 目录下残留的 ControlMaster（防泄漏；须在恢复
+///    `CC_SWITCH_TEST_HOME` 之前——socket 路径随它变化）
+/// 4. 恢复 settings 原值（此时 `CC_SWITCH_TEST_HOME` 仍指 tempdir，
 ///    `update_settings` 的落盘只写 tempdir，真实 settings.json 零接触）
-/// 3. 恢复 `CC_SWITCH_TEST_HOME` 原值
+/// 5. 恢复 `CC_SWITCH_TEST_HOME` 原值、删除 tempdir
 struct FixtureGuard {
     host: SshHostConfig,
     remote_dirs: Vec<String>,
@@ -115,8 +124,45 @@ struct FixtureGuard {
     local_temp: std::path::PathBuf,
 }
 
+impl FixtureGuard {
+    /// 遍历本测试 socket 目录（`<tempdir>/.cc-switch/ssh`）下的 `cm-*`
+    /// socket，逐个 `ssh -O exit` 请求 master 退出。
+    ///
+    /// `%C` hash 无法本地反推，按文件名前缀枚举；socket 失效 / 无 master
+    /// 返回非零属正常态（静默），仅成功退出时打印一行确认。
+    fn shutdown_control_masters(&self) {
+        let dir = crate::config::get_app_config_dir().join("ssh");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("cm-") {
+                continue;
+            }
+            let socket = entry.path();
+            let Ok(out) = Command::new("ssh")
+                .arg("-o")
+                .arg(format!("ControlPath={}", socket.display()))
+                .arg("-O")
+                .arg("exit")
+                .arg(&self.host.host)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            if out.status.success() {
+                eprintln!("localtest: 已退出残留 ControlMaster ({})", socket.display());
+            }
+        }
+    }
+}
+
 impl Drop for FixtureGuard {
     fn drop(&mut self) {
+        DISABLE_CONTROL_MASTER_FOR_TEST.store(false, Ordering::Relaxed);
         if !self.remote_dirs.is_empty() {
             let mut cmd = String::from("rm -rf --");
             for dir in &self.remote_dirs {
@@ -127,6 +173,9 @@ impl Drop for FixtureGuard {
                 eprintln!("warn: 清理远端夹具目录失败（残留可人工删除）: {e}");
             }
         }
+        // ControlPersist=10m 下 master 会存活到超时（失败运行曾累积 8 个残留
+        // 进程）；此刻若走 mux，上面的 rm 已用完连接，此处点杀不再产生新 master
+        self.shutdown_control_masters();
         if let Err(e) = crate::settings::update_settings(self.original_settings.clone()) {
             eprintln!("warn: 恢复 settings 失败: {e}");
         }
@@ -186,6 +235,13 @@ fn localhost_ssh_full_chain_smoke() {
         local_temp,
     };
 
+    // ── 禁用 ControlMaster：macOS 上多线程进程 spawn 的 ssh 走 mux 传 fd ──
+    // 时 sendmsg 偶发 EMSGSIZE（mm_send_fd: sendmsg(1): Message too long），
+    // libtest 默认并发的多线程语境曾整批触发；直连 localhost 免疫该偶发
+    // 类别。开关在 guard 创建之后打开、Drop 最先关闭——任何后续 panic 都
+    // 由 guard 恢复，不影响同进程其他测试的 CM 断言
+    DISABLE_CONTROL_MASTER_FOR_TEST.store(true, Ordering::Relaxed);
+
     // ── 远端夹具：$HOME 下唯一前缀目录 + 最小合法 JSONL ──
     // 扫描根固定为远端 $HOME 下的 .claude/projects 与 .codex/sessions，
     // 夹具必须落在其内（mktemp 独立目录扫不到）；唯一前缀保证断言可过滤、
@@ -201,6 +257,10 @@ fn localhost_ssh_full_chain_smoke() {
     let claude_file = format!("{claude_dir}/sess-localtest.jsonl");
     let codex_file = format!("{codex_dir}/rollout-localtest.jsonl");
 
+    // 先登记待清理目录再执行 mkdir：setup 半途失败（首个目录已建、第二个
+    // 未建）时 panic 前已入册，guard 仍能 rm 掉已建目录，不残留
+    guard.remote_dirs.push(claude_dir.clone());
+    guard.remote_dirs.push(codex_dir.clone());
     let setup = format!(
         "mkdir -p {} {} && printf '%s' {} > {} && printf '%s' {} > {}",
         escape_remote_path(&claude_dir),
@@ -211,8 +271,6 @@ fn localhost_ssh_full_chain_smoke() {
         escape_remote_path(&codex_file),
     );
     run_remote(&host, &setup, SETUP_CMD_TIMEOUT).expect("构造远端夹具");
-    guard.remote_dirs.push(claude_dir.clone());
-    guard.remote_dirs.push(codex_dir.clone());
 
     // ── 1. 扫描：夹具会话 ≥2 条 + source_path 前缀 + manifest 写入 ──
     let scan = super::scan_remote_sessions(&host).expect("远程扫描应成功");
