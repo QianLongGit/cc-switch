@@ -1019,6 +1019,7 @@ pub(crate) fn fetch_to_temp_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /* ===== 测试辅助 ===== */
 
@@ -1060,7 +1061,12 @@ mod tests {
 
     /* ===== 命令构造 ===== */
 
+    // #[serial]：这两个断言 CM 三参数的单测与 ssh_localtest 冒烟共享同一把
+    // serial 全局锁——冒烟窗口内 DISABLE_CONTROL_MASTER_FOR_TEST=true，libtest
+    // 默认并发调度到此处会读到 true 而 CM 参数缺失（flag 默认值无法覆盖
+    // 并行窗口，须互斥）
     #[test]
+    #[serial]
     fn build_contains_common_options_and_user_at_host() {
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "cat /tmp/x");
         let argv = args(&cmd);
@@ -1095,6 +1101,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    #[serial]
     fn build_adds_control_master_triple_on_unix() {
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "true");
         let argv = args(&cmd);
