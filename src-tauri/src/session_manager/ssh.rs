@@ -151,12 +151,13 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
         .arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
 
     // 测试开关命中时跳过连接复用（直连）；生产恒为 None 走复用。
-    // 目录超长 / 含空格或非 ASCII 时同样降级直连（见 [`control_path_safe`]）
+    // 目录超长 / 含空格或非 ASCII 时同样降级直连——安全判定内聚在
+    // [`control_socket_dir`]（先判后建，降级不落盘）
     #[cfg(not(windows))]
     let control_path = if mux_disabled_for_test() {
         None
     } else {
-        control_socket_dir().filter(|dir| control_path_safe(dir))
+        control_socket_dir()
     };
     #[cfg(not(windows))]
     if let Some(control_path) = control_path {
@@ -183,22 +184,34 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
     cmd
 }
 
-/// 返回连接复用 socket 目录并惰性创建；不可用（Windows / 创建失败）返回 None
-/// （调用方降级为不复用）。
+/// 纯推导 socket 目录路径（无副作用）：`/tmp/cc-switch-ssh-<USER|LOGNAME|"user">`。
+///
+/// build 侧创建与 localtest 点杀（`ssh_localtest.rs::shutdown_control_masters`）
+/// 共用同一推导，保证 socket 位置与清理目标永不漂移。
+#[cfg(not(windows))]
+pub(crate) fn control_socket_dir_path() -> PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    PathBuf::from("/tmp").join(format!("cc-switch-ssh-{user}"))
+}
+
+/// 返回连接复用 socket 目录并惰性创建；不可用（Windows / 创建失败 /
+/// 路径越出 unix 域安全区）返回 None（调用方降级为不复用）。
 ///
 /// 目录刻意选 `/tmp` 下按用户隔离的短路径而非应用配置目录——配置目录可能被
 /// override 到深层路径（线上事故：`unix_listener: path "..." too long for
 /// Unix domain socket`），叠加 `cm-` + `%C` 展开的 40 字符 hash + ssh 追加的
 /// 随机后缀后会超出 unix 域 socket `sun_path` 的 104 字节上限，导致复用
 /// 初始化整体失败。`/tmp` 全局可写，故目录权限收紧到 700 防 socket 被其他
-/// 用户探测接管。
+/// 用户探测接管。安全判定先于落盘：降级路径不残留空目录。
 #[cfg(not(windows))]
 fn control_socket_dir() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "user".to_string());
-    let dir = PathBuf::from("/tmp").join(format!("cc-switch-ssh-{user}"));
+    let dir = control_socket_dir_path();
+    if !control_path_safe(&dir) {
+        return None;
+    }
     std::fs::create_dir_all(&dir)
         .and_then(|_| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)))
         .ok()
@@ -1116,6 +1129,9 @@ mod tests {
     #[test]
     #[serial]
     fn build_contains_common_options_and_user_at_host() {
+        // 锁定注入用户名：目录安全上限仅 36 字节，宿主机超长 USER 会触发
+        // 直连降级使 ControlPersist 断言失败
+        let _guard = UserEnvGuard::new(Some("dev"));
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "cat /tmp/x");
         let argv = args(&cmd);
         assert!(argv.contains(&"BatchMode=yes".to_string()));
@@ -1224,7 +1240,8 @@ mod tests {
     #[test]
     #[serial]
     fn build_omits_control_master_triple_when_dir_too_long() {
-        let _guard = UserEnvGuard::new(Some(&"u".repeat(80)));
+        let long_user = "u".repeat(80);
+        let _guard = UserEnvGuard::new(Some(&long_user));
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "true");
         let argv = args(&cmd);
         assert!(
@@ -1239,6 +1256,11 @@ mod tests {
             !argv.iter().any(|a| a.starts_with("ControlPersist=")),
             "目录超长时应省略 ControlPersist: {argv:?}"
         );
+        // 安全判定先于落盘：降级路径不得残留空 socket 目录。
+        // 前置清残留：/tmp 跨运行持久，先建后判的历史版本可能留有同名目录
+        let leaked = PathBuf::from(format!("/tmp/cc-switch-ssh-{long_user}"));
+        let _ = std::fs::remove_dir_all(&leaked);
+        assert!(!leaked.exists(), "降级路径不应创建 socket 目录");
         // 直连降级下基础参数与目的地不受影响（功能完整）
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"dev@example.com".to_string()));

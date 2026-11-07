@@ -37,7 +37,8 @@ use serial_test::serial;
 use crate::settings::SshHostConfig;
 
 use super::ssh::{
-    escape_remote_path, read_block, run_remote, SshScanRegistry, DISABLE_CONTROL_MASTER_FOR_TEST,
+    control_socket_dir_path, escape_remote_path, read_block, run_remote, SshScanRegistry,
+    DISABLE_CONTROL_MASTER_FOR_TEST,
 };
 
 /* ===== 远端命令超时（与 mod.rs 链路口径对齐）===== */
@@ -125,13 +126,14 @@ struct FixtureGuard {
 }
 
 impl FixtureGuard {
-    /// 遍历本测试 socket 目录（`<tempdir>/.cc-switch/ssh`）下的 `cm-*`
-    /// socket，逐个 `ssh -O exit` 请求 master 退出。
+    /// 遍历本测试 socket 目录（`/tmp/cc-switch-ssh-<user>`，与 build 侧
+    /// [`control_socket_dir_path`] 同一推导）下的 `cm-*` socket，逐个
+    /// `ssh -O exit` 请求 master 退出。
     ///
     /// `%C` hash 无法本地反推，按文件名前缀枚举；socket 失效 / 无 master
     /// 返回非零属正常态（静默），仅成功退出时打印一行确认。
     fn shutdown_control_masters(&self) {
-        let dir = crate::config::get_app_config_dir().join("ssh");
+        let dir = control_socket_dir_path();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
