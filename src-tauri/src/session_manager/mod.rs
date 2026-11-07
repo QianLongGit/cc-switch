@@ -7,6 +7,8 @@ pub mod providers;
 pub mod search;
 mod search_revision;
 pub mod ssh;
+#[cfg(all(test, unix))]
+mod ssh_localtest;
 pub mod terminal;
 
 use serde::{Deserialize, Serialize};
@@ -190,9 +192,7 @@ fn remote_parse_cache(host_id: &str) -> Arc<FileParseCache> {
 /// 4. 排序 + 写入 `SshScanRegistry` 清单（validate / fingerprint / 删除共用）
 ///
 /// 任一 ssh 命令失败整体报错；成功即 claude 与 codex 双 provider 完整。
-pub fn scan_remote_sessions(
-    host: &crate::settings::SshHostConfig,
-) -> Result<SessionScan, String> {
+pub fn scan_remote_sessions(host: &crate::settings::SshHostConfig) -> Result<SessionScan, String> {
     // ── 1. 远端 HOME 下的三个会话根目录 ──
     let dirs_raw = ssh::run_remote(host, &ssh::home_dirs_command(), REMOTE_DIRS_TIMEOUT)
         .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
@@ -311,14 +311,15 @@ fn build_missing_requests(
     fresh: &HashSet<PathBuf>,
 ) -> Vec<ssh::HeadTailRequest> {
     let mut requests = Vec::new();
-    let push_missing =
-        |entries: &[ssh::RemoteFileEntry], provider: &str, requests: &mut Vec<ssh::HeadTailRequest>| {
-            for entry in entries {
-                if !fresh.contains(Path::new(&entry.path)) {
-                    requests.push(ssh::remote_head_tail_request(provider, entry));
-                }
+    let push_missing = |entries: &[ssh::RemoteFileEntry],
+                        provider: &str,
+                        requests: &mut Vec<ssh::HeadTailRequest>| {
+        for entry in entries {
+            if !fresh.contains(Path::new(&entry.path)) {
+                requests.push(ssh::remote_head_tail_request(provider, entry));
             }
-        };
+        }
+    };
     push_missing(claude_files, "claude", &mut requests);
     push_missing(codex_files, "codex", &mut requests);
     requests
@@ -343,13 +344,10 @@ fn parse_claude_entry(
         .tail_bytes
         .as_deref()
         .and_then(|window| claude::parse_relocated_from_tail_bytes(window, entry.size));
-    Ok(claude::parse_session_lines(
-        path,
-        file.head.clone(),
-        file.tail.clone(),
-        relocated,
+    Ok(
+        claude::parse_session_lines(path, file.head.clone(), file.tail.clone(), relocated)
+            .map(|meta| ssh::rebind_remote_meta(meta, host_id, &entry.path)),
     )
-    .map(|meta| ssh::rebind_remote_meta(meta, host_id, &entry.path)))
 }
 
 /// codex 单条远程解析：未压缩走 head/tail 行；压缩形态用 zst 前缀解出的
@@ -368,9 +366,10 @@ fn parse_codex_entry(
         ));
     };
     let lines = if entry.path.ends_with(".jsonl.zst") {
-        let prefix = file.tail_bytes.as_deref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "压缩前缀缺失")
-        })?;
+        let prefix = file
+            .tail_bytes
+            .as_deref()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "压缩前缀缺失"))?;
         let text = ssh::decode_zst_prefix(prefix)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         codex::SessionLines {
@@ -743,8 +742,16 @@ mod tests {
     fn remote_scan_second_pass_fetches_nothing() {
         let cache = FileParseCache::new();
         let files = vec![
-            (PathBuf::from("/h/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64),
-            (PathBuf::from("/h/b.jsonl.zst"), Some(SystemTime::UNIX_EPOCH), 20u64),
+            (
+                PathBuf::from("/h/a.jsonl"),
+                Some(SystemTime::UNIX_EPOCH),
+                10u64,
+            ),
+            (
+                PathBuf::from("/h/b.jsonl.zst"),
+                Some(SystemTime::UNIX_EPOCH),
+                20u64,
+            ),
         ];
         assert!(cache.cached_fresh(&files).is_empty(), "首轮全 miss");
         cache.scan_remote(files.clone(), |_| Ok(None));
@@ -758,7 +765,11 @@ mod tests {
 
     #[test]
     fn parse_claude_entry_rebinds_remote_identity() {
-        let entry = remote_entry("/h/.claude/projects/p/sess-1.jsonl", 70_000, 1_700_000_000_000);
+        let entry = remote_entry(
+            "/h/.claude/projects/p/sess-1.jsonl",
+            70_000,
+            1_700_000_000_000,
+        );
         let tail_window = concat!(
             "{\"type\":\"assistant\",\"cwd\":\"/start\"}\n",
             "{\"type\":\"relocated\",\"relocatedCwd\":\"/after/cd\"}\n",
@@ -767,7 +778,10 @@ mod tests {
         data.insert(
             entry.path.clone(),
             ssh::HeadTailData {
-                head: vec![r#"{"sessionId":"inner-id","cwd":"/start","timestamp":"2026-03-06T10:00:00Z"}"#.to_string()],
+                head: vec![
+                    r#"{"sessionId":"inner-id","cwd":"/start","timestamp":"2026-03-06T10:00:00Z"}"#
+                        .to_string(),
+                ],
                 tail: vec![],
                 tail_bytes: Some(tail_window.as_bytes().to_vec()),
             },
@@ -824,7 +838,10 @@ mod tests {
         // 压缩形态无 tail 行：最后活跃时间以清单 mtime 兜底
         assert_eq!(meta.last_active_at, Some(1_700_000_123_456));
         // 标题来自解压出的首条 user message（远程无 state.db 线程标题）
-        assert!(meta.title.as_deref().is_some_and(|t| t.contains("hello codex")));
+        assert!(meta
+            .title
+            .as_deref()
+            .is_some_and(|t| t.contains("hello codex")));
     }
 
     #[test]
