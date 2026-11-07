@@ -160,6 +160,8 @@ const REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(120);
 const REMOTE_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// 头尾拉取批大小上限（spec §5.4：单批 ≤ 50 个文件）
 const REMOTE_HEAD_TAIL_BATCH: usize = 50;
+/// 远端删除命令超时（单文件 rm 亚秒级，留足连接建立余量）
+const REMOTE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 远程解析缓存：按 hostId 隔离。不同主机的远端绝对路径可能完全相同
 /// （都是 `/root/...`），共用实例会跨主机串缓存；与各 provider 的本地
@@ -510,6 +512,10 @@ pub fn delete_session(
     session_id: &str,
     source_path: &str,
 ) -> Result<bool, String> {
+    // SSH 远程源：走清单白名单 + rm 链路（缓存清理在远端分支内完成）
+    if source_path.starts_with("ssh:") {
+        return delete_remote_session(provider_id, session_id, source_path);
+    }
     let deleted = delete_session_source(provider_id, session_id, source_path)?;
     if deleted {
         cache::global().remove(provider_id, source_path);
@@ -550,6 +556,35 @@ fn delete_session_source(
 
     let roots = provider_roots(provider_id)?;
     delete_session_with_roots(provider_id, session_id, Path::new(source_path), &roots)
+}
+
+/// `ssh:` 源的删除（spec §5.4）：解析源 → settings 查主机 → stem 防误删校验 →
+/// registry 白名单（清单未命中须先刷新）→ `rm -f` → 成功后摘清单条目并清本地
+/// 解析缓存（与本地删除序列对齐；远端源不在本地索引，`forget_source` 幂等无害）。
+///
+/// 非叶子校验全部下沉为 `ssh.rs` 纯函数（[`ssh::session_id_matches_stem`] /
+/// [`ssh::ensure_deletable`]），本函数仅做编排，不单独设测。
+fn delete_remote_session(provider_id: &str, session_id: &str, raw: &str) -> Result<bool, String> {
+    let (host_id, remote_path) =
+        ssh::parse_ssh_source(raw).ok_or_else(|| "无效的 SSH 会话源".to_string())?;
+    let host = ssh_host_by_id(&host_id).ok_or_else(|| "SSH 主机不存在或已移除".to_string())?;
+    // 防误删：session_id 必须与远端文件 stem 一致（abc.jsonl / abc.jsonl.zst → abc）
+    if !ssh::session_id_matches_stem(session_id, &remote_path) {
+        return Err("会话 ID 与远端文件名不匹配".to_string());
+    }
+    // 白名单：只允许删除扫描清单确认过的路径
+    ssh::ensure_deletable(ssh::SshScanRegistry::global().lookup(&host_id, &remote_path))?;
+    ssh::run_remote(
+        &host,
+        &ssh::delete_file_command(&remote_path),
+        REMOTE_DELETE_TIMEOUT,
+    )
+    .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+    // 删除成功：清单摘条目 + 本地解析缓存清理
+    ssh::SshScanRegistry::global().remove_entry(&host_id, &remote_path);
+    cache::global().remove(provider_id, raw);
+    search::forget_source(provider_id, raw);
+    Ok(true)
 }
 
 pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {

@@ -12,6 +12,8 @@
 //! - [`head_tail_batch_command`] / [`parse_head_tail_output`]：批量头尾帧协议（哨兵标记分帧）
 //! - [`decode_zst_prefix`]：zst 压缩前缀的截断容忍解压
 //! - [`read_full_command`] / [`read_range_command`] / [`delete_file_command`]：全文 / 区间 / 删除命令
+//! - [`session_id_matches_stem`] / [`ensure_deletable`]：远程删除的 stem 防误删校验
+//!   与清单白名单判定（由 `mod.rs::delete_remote_session` 编排）
 //! - [`fetch_to_temp_file`]：全文拉取落临时文件（路径生成与上限检查拆出
 //!   [`temp_file_path`] / [`enforce_fetch_limit`] 纯函数，便于确定性测试）
 //! - [`home_dirs_command`] / [`parse_home_dirs`] / [`classify_remote_provider`] /
@@ -318,8 +320,6 @@ impl SshScanRegistry {
     }
 
     /// 摘除单条条目（删除远端会话成功后调用）；返回条目原本是否存在
-    // Task 10 接线远端删除后移除
-    #[allow(dead_code)]
     pub(crate) fn remove_entry(&self, host_id: &str, path: &str) -> bool {
         self.lock_write()
             .get_mut(host_id)
@@ -808,10 +808,27 @@ pub(crate) fn read_range_command(path: &str, offset: u64, len: u64) -> String {
 }
 
 /// `rm -f -- '<path>'`：删除远端文件（路径白名单由调用方把关）。
-// Task 10 接线远程删除后移除
-#[allow(dead_code)]
 pub(crate) fn delete_file_command(path: &str) -> String {
     format!("rm -f -- {}", escape_remote_path(path))
+}
+
+/* ===== 远程删除：stem 校验与白名单判定（Task 10）===== */
+
+/// 删除前的防误删校验（纯函数）：`session_id` 必须与远端文件 stem 完全一致
+/// ——stem 复用 [`remote_session_stem`]（即 `rebind_remote_meta` 生成远程
+/// `session_id` 的同一来源，校验与生成同源，杜绝算法漂移缝隙）；空 id 直接
+/// 拒绝（隐藏文件 stem 为空的退化形态）。
+pub(crate) fn session_id_matches_stem(session_id: &str, remote_path: &str) -> bool {
+    !session_id.is_empty()
+        && remote_session_stem(remote_path).is_some_and(|stem| stem == session_id)
+}
+
+/// 删除白名单判定（纯函数）：registry lookup 命中 → 放行；未命中 → 拒绝并
+/// 要求先刷新——清单里没有的路径不允许 `rm`，防止删除未经扫描确认的文件。
+pub(crate) fn ensure_deletable(lookup_result: Option<RemoteFileMeta>) -> Result<(), String> {
+    lookup_result
+        .map(|_| ())
+        .ok_or_else(|| "请先刷新该主机的会话列表".to_string())
 }
 
 /* ===== 远程块读取与图片字节（Task 9）===== */
@@ -1506,6 +1523,50 @@ mod tests {
         assert_eq!(
             read_range_command("/p/a.jsonl", 10, 100),
             "tail -c +11 '/p/a.jsonl' | head -c 100"
+        );
+    }
+
+    /* ===== 远程删除：stem 校验与白名单判定（Task 10）===== */
+
+    /// stem 校验：普通 `.jsonl` / `.jsonl.zst` 双段剥扩展名后须与 session_id 完全一致
+    #[test]
+    fn stem_check_accepts_plain_and_zst_with_matching_id() {
+        assert!(session_id_matches_stem(
+            "abc",
+            "/home/u/.claude/projects/p/abc.jsonl"
+        ));
+        // .jsonl.zst 双段整体剥除（与 remote_extension 的双段口径互逆）
+        assert!(session_id_matches_stem(
+            "abc",
+            "/h/.codex/sessions/2026/abc.jsonl.zst"
+        ));
+        // 多段文件名取完整 stem（同 Path::file_stem 语义）
+        assert!(session_id_matches_stem("a.b", "/p/a.b.jsonl"));
+    }
+
+    /// stem 校验拒绝面：id 与 stem 不等、路径尾斜杠 / 无扩展名 / 隐藏文件（stem 空）
+    #[test]
+    fn stem_check_rejects_mismatch_or_degenerate_paths() {
+        // id 与 stem 不等（含 id 自带扩展名、大小写差异、空 id）
+        assert!(!session_id_matches_stem("abc.jsonl", "/p/abc.jsonl"));
+        assert!(!session_id_matches_stem("ABC", "/p/abc.jsonl"));
+        assert!(!session_id_matches_stem("", "/p/abc.jsonl"));
+        // 路径退化形态：尾斜杠（无文件名）/ 无扩展名 / 隐藏文件（stem 为空）
+        assert!(!session_id_matches_stem("dir", "/p/dir/"));
+        assert!(!session_id_matches_stem("abc", "/p/abc"));
+        assert!(!session_id_matches_stem("jsonl", "/p/.jsonl"));
+        assert!(!session_id_matches_stem("jsonl.zst", "/p/.jsonl.zst"));
+        // 空 id 遇隐藏文件的空 stem：两端同为空串也拒绝（退化形态不放行）
+        assert!(!session_id_matches_stem("", "/p/.jsonl"));
+    }
+
+    /// 白名单判定：清单命中放行，未命中给出「先刷新」文案
+    #[test]
+    fn ensure_deletable_allows_hit_and_rejects_miss() {
+        assert!(ensure_deletable(Some(meta(1, 0))).is_ok());
+        assert_eq!(
+            ensure_deletable(None).unwrap_err(),
+            "请先刷新该主机的会话列表"
         );
     }
 
