@@ -6,6 +6,8 @@ import type {
   SessionIndexStatus,
   SessionMessage,
   SessionMeta,
+  SshConfigHost,
+  SshHostConfig,
   TranscriptChunk,
 } from "@/types";
 
@@ -37,8 +39,24 @@ export interface BlockContentPage {
 }
 
 export const sessionsApi = {
-  async list(): Promise<SessionMeta[]> {
-    return await invoke("list_sessions");
+  /** hostId 省略时列本机会话；传主机 id 时列该 SSH 主机上的会话 */
+  async list(hostId?: string): Promise<SessionMeta[]> {
+    return await invoke("list_sessions", { hostId: hostId ?? null });
+  },
+
+  /** 解析 ~/.ssh/config 的 Host 段（主机选择下拉的数据源） */
+  async listSshConfigHosts(): Promise<SshConfigHost[]> {
+    return await invoke("list_ssh_config_hosts");
+  },
+
+  /** 测试单台主机连通性；失败文案来自后端，直接给 UI 展示 */
+  async testSshHost(host: SshHostConfig): Promise<boolean> {
+    return await invoke("test_ssh_host", { host });
+  },
+
+  /** 本机 ssh 二进制是否可用（远程功能入口的可用性开关） */
+  async checkSshAvailability(): Promise<boolean> {
+    return await invoke("check_ssh_availability");
   },
 
   /** 后台同步正文索引；立即返回当前进度，之后的进度走 session-index-status 事件 */

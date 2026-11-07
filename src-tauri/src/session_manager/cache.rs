@@ -10,7 +10,7 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::content::{SourceLocation, ValidatedSource, GROK_CHAT_HISTORY};
 use super::model::{EventKind, SessionBlock, SessionMessage, ToolStatus, TurnIndex};
@@ -97,6 +97,7 @@ impl Fingerprint {
 /// - 普通文件：自身的 mtime / len
 /// - 目录（OpenCode 旧版消息目录）：目录本身 + 一级子项；子项增删或改写都会改变指纹
 /// - SQLite：数据库文件 + `-wal` 文件（WAL 模式下新写入先落在 wal 里，主库 mtime 不变）
+/// - SSH 远程：来自扫描清单的元数据，不触本地文件系统
 pub fn fingerprint(location: &SourceLocation) -> io::Result<Fingerprint> {
     match location {
         SourceLocation::Path { path, .. } => {
@@ -122,7 +123,33 @@ pub fn fingerprint(location: &SourceLocation) -> io::Result<Fingerprint> {
             }
             Ok(fp)
         }
+        SourceLocation::Ssh { host_id, path } => {
+            // 清单条目已在 validate 拦截过；这里防御性再查，缺条目报错而不是
+            // 静默当作「没有变化」让旧缓存一直命中
+            let meta = super::ssh::SshScanRegistry::global()
+                .lookup(host_id, path)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "SSH 扫描清单没有该会话文件，请先刷新会话列表",
+                    )
+                })?;
+            Ok(Fingerprint {
+                modified: remote_mtime(meta.mtime_ms),
+                len: meta.len,
+            })
+        }
     }
+}
+
+/// 远端 mtime（Unix 毫秒）转 `SystemTime`：负值（epoch 前的异常时间戳）或加法
+/// 溢出时返回 `None`——与本地 `modified().ok()` 的 Option 语义一致，缓存对比按
+/// 「未知」处理而不失配。
+fn remote_mtime(mtime_ms: i64) -> Option<SystemTime> {
+    if mtime_ms < 0 {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(mtime_ms as u64))
 }
 
 /// 会话源的指纹：在 [`fingerprint`] 的基础上补上「正文不在 sourcePath 里」的情况。
@@ -810,6 +837,69 @@ mod tests {
         let before = fingerprint(&location).unwrap();
         std::fs::write(dir.path().join("state.db-wal"), "wal").unwrap();
         assert_ne!(fingerprint(&location).unwrap(), before);
+    }
+
+    /// SSH 源指纹来自扫描清单：不触本地 fs；mtime 按 Unix 毫秒换算，
+    /// 负值 / 溢出按「未知」处理；清单缺条目（validate 已拦，防御性）报 NotFound
+    #[test]
+    fn ssh_fingerprint_comes_from_scan_manifest() {
+        use crate::session_manager::ssh::{RemoteFileMeta, SshScanRegistry};
+        use std::collections::HashMap;
+
+        let reg = SshScanRegistry::global();
+        reg.replace_manifest(
+            "t-task6-fp",
+            HashMap::from([(
+                "/home/u/a.jsonl".to_string(),
+                RemoteFileMeta {
+                    len: 1234,
+                    mtime_ms: 1_700_000_000_123,
+                },
+            )]),
+        );
+        let source = ValidatedSource {
+            provider_id: "claude".to_string(),
+            raw: "ssh:t-task6-fp/home/u/a.jsonl".to_string(),
+            location: SourceLocation::Ssh {
+                host_id: "t-task6-fp".into(),
+                path: "/home/u/a.jsonl".into(),
+            },
+        };
+
+        let fp = source_fingerprint(&source).unwrap();
+        assert_eq!(
+            fp,
+            Fingerprint {
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
+                len: 1234,
+            }
+        );
+
+        // 负值 mtime（epoch 前的异常时间戳）：modified 按未知处理，len 仍参与对比
+        reg.replace_manifest(
+            "t-task6-fp",
+            HashMap::from([(
+                "/neg.jsonl".to_string(),
+                RemoteFileMeta {
+                    len: 5,
+                    mtime_ms: -1,
+                },
+            )]),
+        );
+        let neg = fingerprint(&SourceLocation::Ssh {
+            host_id: "t-task6-fp".into(),
+            path: "/neg.jsonl".into(),
+        })
+        .unwrap();
+        assert_eq!(neg, Fingerprint { modified: None, len: 5 });
+
+        // 清单没有该条目：防御性报错，而不是静默当作没变化
+        let err = fingerprint(&SourceLocation::Ssh {
+            host_id: "t-task6-fp".into(),
+            path: "/missing.jsonl".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     fn text(role: &str, text: &str) -> SessionMessage {

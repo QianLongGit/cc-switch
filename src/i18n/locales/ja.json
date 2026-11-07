@@ -1133,6 +1133,7 @@
       "appConfig": "アプリ設定",
       "routing": "ローカルルーティング",
       "network": "ネットワーク",
+      "sshHosts": "SSH ホスト",
       "data": "データ",
       "about": "情報"
     },
@@ -1144,6 +1145,47 @@
     },
     "data": {
       "location": "保存場所"
+    },
+    "sshHosts": {
+      "blockTitle": "SSH リモートホスト",
+      "help": "セッションページのホスト切替で使うリモートマシンを管理します。~/.ssh/config からインポートするか手動で追加できます。ホストを削除してもリモートセッションのキャッシュは保持され、再追加すれば再表示されます。",
+      "add": "ホストを追加",
+      "addTitle": "SSH ホストを追加",
+      "addDescription": "~/.ssh/config から既存のホストをインポートするか、手動で新しいホストを入力します。",
+      "empty": "SSH ホストがまだありません。追加するとセッションページでリモートセッションを切り替えて表示できます。",
+      "importTab": "SSH Config からインポート",
+      "manualTab": "手動で追加",
+      "import": {
+        "loading": "~/.ssh/config を読み込み中…",
+        "error": "SSH Config の読み込みに失敗しました：{{error}}",
+        "empty": "~/.ssh/config にインポート可能な Host セクションがありません。「手動で追加」をご利用ください。",
+        "imported": "インポート済み",
+        "action": "選択した {{count}} 台をインポート"
+      },
+      "form": {
+        "label": "名前",
+        "labelPlaceholder": "例：build-box",
+        "host": "ホストアドレス",
+        "hostPlaceholder": "IP またはドメイン",
+        "user": "ユーザー名（任意）",
+        "port": "ポート（任意）",
+        "identityFile": "秘密鍵ファイル（任意）",
+        "submitAdd": "追加"
+      },
+      "testConnection": "接続テスト",
+      "testing": "テスト中",
+      "testSuccess": "接続成功",
+      "testFailed": "接続失敗",
+      "edit": "編集",
+      "editTitle": "ホスト「{{label}}」を編集",
+      "editDescription": "このホストの名前・アドレス・接続設定を変更します。",
+      "delete": "削除",
+      "deleteTitle": "ホスト「{{label}}」を削除しますか？",
+      "deleteLead": "リストから取り除くだけです。このホストのリモートセッションキャッシュは保持され、同じホストを再追加すると再表示できます。",
+      "deleteConfirm": "ホストを削除",
+      "badId": "ホスト ID に不正な文字「/」が含まれるため保存を中止しました",
+      "addedToast": "{{count}} 台のホストを追加しました",
+      "deletedToast": "ホスト「{{label}}」を削除しました"
     }
   },
   "apps": {
@@ -1493,6 +1535,12 @@
     "consequenceGeneric": "{{app}} のローカル記録から完全に削除します。",
     "sessionDeletedNamed": "セッション「{{title}}」を削除しました",
     "remoteImage": "リモート画像",
+    "hostSelector": {
+      "local": "ローカル",
+      "choose": "ホストを選択",
+      "sshUnavailable": "ssh が見つかりません。OpenSSH クライアントをインストールしてください",
+      "loadFailed": "リモートセッションの読み込みに失敗しました"
+    },
     "reader": {
       "timelineSummary": "実行過程 · {{steps}} ステップ",
       "summaryCommands": "コマンド {{count}} 件",

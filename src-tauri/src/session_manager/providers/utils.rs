@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -99,6 +99,72 @@ impl FileParseCache {
     where
         F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
     {
+        // 本地扫描：metadata 现场读文件系统；读不到的按扫描不完整处理并跳过
+        let mut entries = Vec::with_capacity(files.len());
+        for path in files {
+            match std::fs::metadata(&path) {
+                Ok(meta) => entries.push((path, meta.modified().ok(), meta.len())),
+                Err(error) => {
+                    status.record::<(), _>(Err(error));
+                }
+            }
+        }
+        self.scan_pre_metadata(entries, parse, &mut |path: &Path, err: &io::Error| {
+            status.incomplete = true;
+            log::debug!("会话文件暂时读取失败，下轮重试 {}: {err}", path.display());
+        })
+    }
+
+    /// 远端清单扫描：`(路径, mtime, len)` 由扫描清单供给而非本地文件系统，
+    /// 缓存命中判定与本地 [`Self::scan_with_status`] 完全一致；解析失败的文件
+    /// 同样不缓存、下一轮重试（远端任务的扫描状态由调用方聚合，这里只记日志）。
+    pub(crate) fn scan_remote<F>(
+        &self,
+        files: Vec<(PathBuf, Option<SystemTime>, u64)>,
+        parse: F,
+    ) -> Vec<SessionMeta>
+    where
+        F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
+    {
+        self.scan_pre_metadata(files, parse, &mut |path: &Path, err: &io::Error| {
+            log::debug!("远端会话文件解析失败，下轮重试 {}: {err}", path.display());
+        })
+    }
+
+    /// 远程扫描两阶段支持：返回 `(mtime, len)` 与当前缓存一致——即下一次
+    /// [`Self::scan_remote`] 会直接复用上次结果、不会调用 parse——的文件键集。
+    ///
+    /// 只读查询、不改缓存表；命中判定与 [`Self::scan_pre_metadata`] 完全一致，
+    /// 供调用方在拉取数据前跳过这些文件（spec §5.4 缓存命中轮免 fetch）。
+    pub(crate) fn cached_fresh(
+        &self,
+        files: &[(PathBuf, Option<SystemTime>, u64)],
+    ) -> HashSet<PathBuf> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        files
+            .iter()
+            .filter_map(|(path, modified, len)| {
+                entries
+                    .get(path)
+                    .filter(|cached| &cached.modified == modified && cached.len == *len)
+                    .map(|_| path.clone())
+            })
+            .collect()
+    }
+
+    /// metadata 已取得的扫描核心：`(mtime, len)` 与缓存条目一致时复用上次的
+    /// 解析结果，不一致（或没缓存过）调用 `parse`；解析失败经 `on_error` 回调，
+    /// 不缓存——否则恢复后文件没变也会一直命中「没有会话」。
+    fn scan_pre_metadata<F, E>(
+        &self,
+        files: Vec<(PathBuf, Option<SystemTime>, u64)>,
+        parse: F,
+        mut on_error: E,
+    ) -> Vec<SessionMeta>
+    where
+        F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
+        E: FnMut(&Path, &io::Error),
+    {
         // 锁中毒（上次扫描 panic）时丢掉旧缓存重来，不影响本次结果
         let mut previous = match self.entries.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
@@ -111,23 +177,13 @@ impl FileParseCache {
 
         let mut next = HashMap::with_capacity(files.len());
         let mut sessions = Vec::new();
-        for path in files {
-            let (modified, len) = match std::fs::metadata(&path) {
-                Ok(meta) => (meta.modified().ok(), meta.len()),
-                Err(error) => {
-                    status.record::<(), _>(Err(error));
-                    continue;
-                }
-            };
+        for (path, modified, len) in files {
             let meta = match previous.remove(&path) {
                 Some(entry) if entry.modified == modified && entry.len == len => entry.meta,
                 _ => match parse(&path) {
                     Ok(meta) => meta,
-                    // 读不了（权限、被占用等）不缓存：否则恢复读取后文件没变，
-                    // 会一直命中「没有会话」，直到文件改动或重启
                     Err(err) => {
-                        status.incomplete = true;
-                        log::debug!("会话文件暂时读取失败，下轮重试 {}: {err}", path.display());
+                        on_error(&path, &err);
                         continue;
                     }
                 },
@@ -609,5 +665,130 @@ mod tests {
             extract_text(&json!([{ "type": "toolCall", "name": "read" }])),
             "[Tool: read]"
         );
+    }
+
+    /// 远端清单扫描：metadata 来自参数而非本地 fs，缓存命中判定与本地扫描一致——
+    /// 同 (mtime, len) 二次命中不重 parse，任一变化重新解析，失败不缓存
+    #[test]
+    fn scan_remote_hits_cache_until_manifest_meta_changes() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let remote_session = |path: &Path| {
+            Some(SessionMeta {
+                provider_id: "claude".to_string(),
+                session_id: path.to_string_lossy().to_string(),
+                title: None,
+                summary: None,
+                project_dir: None,
+                created_at: None,
+                last_active_at: None,
+                source_path: Some(path.to_string_lossy().to_string()),
+                resume_command: None,
+            })
+        };
+
+        let cache = FileParseCache::new();
+        let calls = Cell::new(0);
+        let parse = |path: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(remote_session(path))
+        };
+
+        // 首轮解析；同 meta 二次扫描命中缓存
+        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+        assert_eq!(cache.scan_remote(files.clone(), parse).len(), 1);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.scan_remote(files, parse).len(), 1);
+        assert_eq!(calls.get(), 1, "清单 meta 未变不应重新解析");
+
+        // len 变化：重新解析
+        let grown = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            11u64,
+        )];
+        assert_eq!(cache.scan_remote(grown, parse).len(), 1);
+        assert_eq!(calls.get(), 2);
+
+        // mtime 变化（len 不变）：同样失效
+        let touched = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            11u64,
+        )];
+        assert_eq!(cache.scan_remote(touched, parse).len(), 1);
+        assert_eq!(calls.get(), 3);
+
+        // 解析失败不缓存：恢复后同 meta 也要重新解析（对齐本地扫描语义）
+        let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        };
+        assert!(cache
+            .scan_remote(
+                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
+                failing
+            )
+            .is_empty());
+        assert_eq!(
+            cache.scan_remote(
+                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
+                parse
+            )
+            .len(),
+            1
+        );
+        assert_eq!(calls.get(), 4, "失败的文件下一轮要重试，不能命中缓存");
+    }
+
+    /// 两阶段协同契约：`cached_fresh` 的命中判定必须与 `scan_remote` 的复用
+    /// 判定一致——查询为命中的文件在 scan_remote 中不得触发 parse（免 fetch
+    /// 决策以此为前提），查询为 miss 的文件才需要重新拉取解析。
+    #[test]
+    fn cached_fresh_agrees_with_scan_remote_reuse() {
+        use std::time::Duration;
+
+        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+
+        let cache = FileParseCache::new();
+        assert!(
+            cache.cached_fresh(&files).is_empty(),
+            "首轮无缓存，全 miss"
+        );
+
+        // 解析失败不缓存：cached_fresh 仍 miss（与 scan_remote 语义一致）
+        let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
+            Err(std::io::Error::other("boom"))
+        };
+        assert!(cache.scan_remote(files.clone(), failing).is_empty());
+        assert!(
+            cache.cached_fresh(&files).is_empty(),
+            "解析失败的文件不得被报告为命中"
+        );
+
+        // 成功一轮后同 meta 全命中；len / mtime 任一变化即 miss
+        cache.scan_remote(files.clone(), |_| Ok(None));
+        assert_eq!(
+            cache.cached_fresh(&files),
+            HashSet::from([PathBuf::from("/home/u/a.jsonl")])
+        );
+        assert!(cache
+            .cached_fresh(&[(
+                PathBuf::from("/home/u/a.jsonl"),
+                Some(SystemTime::UNIX_EPOCH),
+                11u64
+            )])
+            .is_empty());
+        assert!(cache
+            .cached_fresh(&[(
+                PathBuf::from("/home/u/a.jsonl"),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                10u64
+            )])
+            .is_empty());
+        // mtime 未知（None）与已知（Some）不得互相命中
+        assert!(cache
+            .cached_fresh(&[(PathBuf::from("/home/u/a.jsonl"), None, 10u64)])
+            .is_empty());
     }
 }

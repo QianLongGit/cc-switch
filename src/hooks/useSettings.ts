@@ -9,6 +9,7 @@ import {
   useSettingsQuery,
   useSaveSettingsMutation,
 } from "@/lib/query";
+import { sessionKeys } from "@/lib/query/sessions";
 import type { Settings } from "@/types";
 import { useSettingsForm, type SettingsFormState } from "./useSettingsForm";
 import {
@@ -513,7 +514,7 @@ export function useSettings(): UseSettingsResult {
             queryClient.invalidateQueries({
               queryKey: ["skills", "installed"],
             }),
-            queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+            queryClient.invalidateQueries({ queryKey: sessionKeys.all }),
             // DSH_ACCOUNT_STATUS_KEY：登录凭据也在 DSH 主目录里，不刷新会显示旧目录的账号
             queryClient.invalidateQueries({
               queryKey: ["dsh-account-status"],

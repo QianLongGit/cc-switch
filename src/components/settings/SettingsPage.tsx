@@ -15,6 +15,7 @@ import {
   Info,
   Loader2,
   Route,
+  Server,
   SlidersHorizontal,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
@@ -37,6 +38,7 @@ import { BackupListSection } from "@/components/settings/BackupListSection";
 import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
 import { AboutSection } from "@/components/settings/AboutSection";
 import { RoutingSection } from "@/components/settings/sections/RoutingSection";
+import { SshHostsSection } from "@/components/settings/SshHostsSection";
 import { GlobalProxySettings } from "@/components/settings/GlobalProxySettings";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { GeneralSection } from "@/components/settings/sections/GeneralSection";
@@ -60,6 +62,7 @@ const SECTION_ICON: Record<
   appConfig: Folder,
   routing: Route,
   network: Globe,
+  sshHosts: Server,
   data: Database,
   about: Info,
 };
@@ -404,6 +407,10 @@ export function SettingsPage({
               <GlobalProxySettings />
             </div>
           </SettingsBlock>
+        );
+      case "sshHosts":
+        return (
+          <SshHostsSection settings={settings} onAutoSave={handleAutoSave} />
         );
       case "data":
         return (

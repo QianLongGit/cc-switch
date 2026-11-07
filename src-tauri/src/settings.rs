@@ -206,6 +206,21 @@ impl WebDavSyncSettings {
     }
 }
 
+/// SSH 远程会话主机配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshHostConfig {
+    pub id: String,
+    pub label: String,
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+}
+
 /// S3 同步设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -667,6 +682,10 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdav_backup: Option<serde_json::Value>,
 
+    // ===== SSH 远程会话主机 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_hosts: Option<Vec<SshHostConfig>>,
+
     // ===== 备份策略设置 =====
     /// Auto-backup interval in hours (default 24, 0 = disabled)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -770,6 +789,7 @@ impl Default for AppSettings {
             webdav_sync: None,
             s3_sync: None,
             webdav_backup: None,
+            ssh_hosts: None,
             backup_interval_hours: None,
             backup_retain_count: None,
             preferred_terminal: None,
@@ -1944,5 +1964,88 @@ mod tests {
         );
         let entries = fs::read_dir(dir.path()).expect("read dir").count();
         assert_eq!(entries, 1, "no temp or backup files left behind");
+    }
+
+    // ===== SSH 远程会话主机配置 =====
+
+    #[test]
+    fn ssh_hosts_missing_in_old_settings_stays_none() {
+        // 旧版 settings.json 没有 sshHosts 键：反序列化必须得到 None，而不是空数组
+        let old: AppSettings = serde_json::from_value(serde_json::json!({})).expect("old settings");
+        assert!(old.ssh_hosts.is_none());
+        assert!(AppSettings::default().ssh_hosts.is_none());
+        // None 不落盘：序列化结果里不出现 sshHosts
+        assert!(serde_json::to_value(&old)
+            .expect("serialize")
+            .get("sshHosts")
+            .is_none());
+    }
+
+    #[test]
+    fn ssh_hosts_round_trips_as_camel_case() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "sshHosts": [
+                {
+                    "id": "host-1",
+                    "label": "生产机",
+                    "host": "prod.example.com",
+                    "user": "deploy",
+                    "port": 22,
+                    "identityFile": "~/.ssh/id_ed25519"
+                },
+                {
+                    "id": "host-2",
+                    "label": "跳板机",
+                    "host": "bastion.example.com"
+                }
+            ]
+        }))
+        .expect("ssh settings");
+
+        let hosts = settings.ssh_hosts.as_ref().expect("ssh hosts");
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].id, "host-1");
+        assert_eq!(hosts[0].label, "生产机");
+        assert_eq!(hosts[0].host, "prod.example.com");
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+        assert_eq!(hosts[0].port, Some(22));
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
+        // 可选字段缺省 → None
+        assert_eq!(hosts[1].user, None);
+        assert_eq!(hosts[1].port, None);
+        assert_eq!(hosts[1].identity_file, None);
+
+        // round-trip：camelCase 字段名保持（identityFile），None 字段不写出
+        let saved = serde_json::to_value(&settings).expect("serialize");
+        assert_eq!(
+            saved["sshHosts"],
+            serde_json::json!([
+                {
+                    "id": "host-1",
+                    "label": "生产机",
+                    "host": "prod.example.com",
+                    "user": "deploy",
+                    "port": 22,
+                    "identityFile": "~/.ssh/id_ed25519"
+                },
+                {
+                    "id": "host-2",
+                    "label": "跳板机",
+                    "host": "bastion.example.com"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn ssh_hosts_empty_array_survives_serialization() {
+        // skip_serializing_if 只对 None 生效：空数组要原样写回 "sshHosts": []
+        let settings: AppSettings =
+            serde_json::from_value(serde_json::json!({ "sshHosts": [] })).expect("empty hosts");
+        assert_eq!(settings.ssh_hosts.as_ref().expect("ssh hosts").len(), 0);
+        assert_eq!(
+            serde_json::to_value(&settings).expect("serialize")["sshHosts"],
+            serde_json::json!([])
+        );
     }
 }

@@ -15,6 +15,8 @@ export interface ReaderContextValue {
   appName: string;
   /** 当前高亮词：查找框打开时是查找词，否则是列表搜索词 */
   searchQuery?: string;
+  /** false 时隐藏路径胶囊上的「在文件管理器中显示」（SSH 远程会话的路径不在本机） */
+  revealEnabled?: boolean;
   onCopy: (text: string, message: string) => void;
 }
 

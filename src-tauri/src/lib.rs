@@ -45,6 +45,7 @@ mod proxy;
 mod services;
 mod session_manager;
 mod settings;
+mod ssh_config;
 mod store;
 
 mod tray;
@@ -1887,6 +1888,10 @@ pub fn run() {
             commands::prepare_tool_uninstall,
             commands::probe_tool_installations,
             commands::list_tool_installations,
+            // SSH remote hosts
+            commands::list_ssh_config_hosts,
+            commands::test_ssh_host,
+            commands::check_ssh_availability,
             // Provider terminal
             commands::open_provider_terminal,
             // Universal Provider management

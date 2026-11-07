@@ -1134,6 +1134,7 @@
       "appConfig": "應用設定",
       "routing": "本地路由",
       "network": "網路",
+      "sshHosts": "SSH 主機",
       "data": "資料",
       "about": "關於"
     },
@@ -1145,6 +1146,47 @@
     },
     "data": {
       "location": "儲存位置"
+    },
+    "sshHosts": {
+      "blockTitle": "SSH 遠端主機",
+      "help": "設定工作階段頁主機切換可用的遠端機器。可從 ~/.ssh/config 匯入或手動新增；刪除主機不會清除它的遠端工作階段快取，重新新增後仍可檢視。",
+      "add": "新增主機",
+      "addTitle": "新增 SSH 主機",
+      "addDescription": "從 ~/.ssh/config 匯入已有主機，或手動填寫一台新主機。",
+      "empty": "還沒有 SSH 主機。新增後即可在工作階段頁切換檢視遠端工作階段。",
+      "importTab": "從 SSH Config 匯入",
+      "manualTab": "手動新增",
+      "import": {
+        "loading": "正在讀取 ~/.ssh/config…",
+        "error": "讀取 SSH Config 失敗：{{error}}",
+        "empty": "~/.ssh/config 裡沒有可匯入的 Host 段，可切到「手動新增」。",
+        "imported": "已匯入",
+        "action": "匯入所選 {{count}} 台主機"
+      },
+      "form": {
+        "label": "名稱",
+        "labelPlaceholder": "如：build-box",
+        "host": "主機位址",
+        "hostPlaceholder": "IP 或網域",
+        "user": "使用者名稱（可選）",
+        "port": "連接埠（可選）",
+        "identityFile": "私鑰檔案（可選）",
+        "submitAdd": "新增"
+      },
+      "testConnection": "測試連線",
+      "testing": "測試中",
+      "testSuccess": "連線成功",
+      "testFailed": "連線失敗",
+      "edit": "編輯",
+      "editTitle": "編輯主機「{{label}}」",
+      "editDescription": "修改該主機的名稱、位址與連線參數。",
+      "delete": "刪除",
+      "deleteTitle": "刪除主機「{{label}}」？",
+      "deleteLead": "僅從列表移除該主機；它的遠端工作階段快取會保留，重新新增同一主機後可再次檢視。",
+      "deleteConfirm": "刪除主機",
+      "badId": "主機 ID 含非法字元「/」，已取消儲存",
+      "addedToast": "已新增 {{count}} 台主機",
+      "deletedToast": "已刪除主機「{{label}}」"
     }
   },
   "apps": {
@@ -1494,6 +1536,12 @@
     "consequenceGeneric": "從 {{app}} 的本機記錄中永久刪除。",
     "sessionDeletedNamed": "已刪除工作階段「{{title}}」",
     "remoteImage": "遠端圖片",
+    "hostSelector": {
+      "local": "本機",
+      "choose": "選擇主機",
+      "sshUnavailable": "未偵測到 ssh，請安裝 OpenSSH 用戶端",
+      "loadFailed": "載入遠端工作階段失敗"
+    },
     "reader": {
       "timelineSummary": "執行過程 · {{steps}} 步",
       "summaryCommands": "{{count}} 個指令",

@@ -8,6 +8,7 @@ import { copyText } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { highlightText } from "../utils";
+import { useReaderContext } from "./context";
 
 const MAX_DISPLAY_LENGTH = 48;
 
@@ -82,6 +83,9 @@ export const PathChip = memo(function PathChip({
   className,
 }: PathChipProps) {
   const { t } = useTranslation();
+  // SSH 远程会话的路径不在本机：阅读上下文声明 revealEnabled=false 时不出「在文件管理器中显示」
+  const { revealEnabled } = useReaderContext();
+  const canReveal = revealEnabled !== false;
   const localPath = fileUrlToPath(path);
   const display = shortenPath(localPath, projectDir);
 
@@ -135,7 +139,10 @@ export const PathChip = memo(function PathChip({
         title={localPath}
         aria-label={`${copyLabel}: ${localPath}`}
         onClick={() => void handleCopy()}
-        className="inline-flex min-w-0 items-center gap-1 rounded-s-control py-px pe-1 ps-1.5 font-mono transition-colors hover:bg-selected focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className={cn(
+          "inline-flex min-w-0 items-center gap-1 py-px pe-1 ps-1.5 font-mono transition-colors hover:bg-selected focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          canReveal ? "rounded-s-control" : "rounded-control",
+        )}
       >
         <FileText aria-hidden className="size-3 shrink-0 text-fg-3" />
         <span className="truncate">
@@ -143,16 +150,18 @@ export const PathChip = memo(function PathChip({
             (searchQuery ? highlightText(display, searchQuery) : display)}
         </span>
       </button>
-      <HoverTip content={revealLabel}>
-        <button
-          type="button"
-          aria-label={revealLabel}
-          onClick={() => void handleReveal()}
-          className="inline-flex h-full shrink-0 items-center rounded-e-control border-s border-border px-1 py-0.5 text-fg-3 transition-colors hover:bg-selected hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <FolderOpen aria-hidden className="size-3" />
-        </button>
-      </HoverTip>
+      {canReveal && (
+        <HoverTip content={revealLabel}>
+          <button
+            type="button"
+            aria-label={revealLabel}
+            onClick={() => void handleReveal()}
+            className="inline-flex h-full shrink-0 items-center rounded-e-control border-s border-border px-1 py-0.5 text-fg-3 transition-colors hover:bg-selected hover:text-fg-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <FolderOpen aria-hidden className="size-3" />
+          </button>
+        </HoverTip>
+      )}
     </span>
   );
 });

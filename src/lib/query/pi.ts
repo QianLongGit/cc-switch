@@ -1,5 +1,6 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { piApi, type PiFamilyAppId } from "@/lib/api/pi";
+import { sessionKeys } from "@/lib/query/sessions";
 
 export const piKeys = {
   all: ["pi"] as const,
@@ -25,7 +26,7 @@ export const invalidatePiDirectoryCaches = async (
     queryClient.invalidateQueries({ queryKey: [app] }),
     queryClient.invalidateQueries({ queryKey: ["providers", app] }),
     queryClient.invalidateQueries({ queryKey: ["skills", "installed"] }),
-    queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+    queryClient.invalidateQueries({ queryKey: sessionKeys.all }),
   ]);
 };
 

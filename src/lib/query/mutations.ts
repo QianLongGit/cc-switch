@@ -431,24 +431,29 @@ export const useDeleteSessionMutation = () => {
       return input;
     },
     onSuccess: async (input) => {
+      // 会话列表按主机分维缓存；mutation 不持有组件 hostId 上下文，
+      // 故对全部主机变体做集合操作——三元组匹配天然精确，不会误伤其它主机条目。
       const deleted = queryClient
-        .getQueryData<SessionMeta[]>(["sessions"])
-        ?.find(
+        .getQueriesData<SessionMeta[]>({ queryKey: sessionKeys.all })
+        .flatMap(([, sessions]) => sessions ?? [])
+        .find(
           (session) =>
             session.providerId === input.providerId &&
             session.sessionId === input.sessionId &&
             session.sourcePath === input.sourcePath,
         );
       const deletedTitle = deleted?.title?.trim() || deleted?.summary?.trim();
-      queryClient.setQueryData<SessionMeta[]>(["sessions"], (current) =>
-        (current ?? []).filter(
-          (session) =>
-            !(
-              session.providerId === input.providerId &&
-              session.sessionId === input.sessionId &&
-              session.sourcePath === input.sourcePath
-            ),
-        ),
+      queryClient.setQueriesData<SessionMeta[]>(
+        { queryKey: sessionKeys.all },
+        (current) =>
+          (current ?? []).filter(
+            (session) =>
+              !(
+                session.providerId === input.providerId &&
+                session.sessionId === input.sessionId &&
+                session.sourcePath === input.sourcePath
+              ),
+          ),
       );
       queryClient.removeQueries({
         queryKey: sessionKeys.messages(input.providerId, input.sourcePath),
@@ -457,7 +462,7 @@ export const useDeleteSessionMutation = () => {
         queryKey: sessionKeys.transcript(input.providerId, input.sourcePath),
       });
 
-      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: sessionKeys.all });
 
       toast.success(
         deletedTitle

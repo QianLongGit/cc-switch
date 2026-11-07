@@ -19,6 +19,10 @@ import { buildTurnIndex, buildTurns } from "@/components/sessions/reader/turns";
  */
 
 export const sessionKeys = {
+  /** 前缀形态：命中所有主机（本机 + 各远程）的会话列表缓存 */
+  all: ["sessions"] as const,
+  /** 会话列表按主机分维；本机用 "local" 占位，远程用主机 id */
+  list: (hostId?: string) => ["sessions", hostId ?? "local"] as const,
   messages: (providerId?: string, sourcePath?: string) =>
     ["sessionMessages", providerId, sourcePath] as const,
   transcript: (providerId?: string, sourcePath?: string) =>

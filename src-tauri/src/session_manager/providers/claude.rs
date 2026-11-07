@@ -105,7 +105,17 @@ fn last_relocated_cwd(path: &Path) -> Option<String> {
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
+    parse_relocated_from_tail_bytes(&buf, len)
+}
+
+/// 解析已取得的 64 KiB 尾窗字节中最后一条 relocated 记录（远程链路复用：
+/// 尾窗字节经 ssh 头尾帧协议拉回后直接喂这里）。
+///
+/// `file_len_hint` 为文件总长：大于窗口说明窗口从文件中间起读，首行是半截
+/// 记录须跳过——与 [`last_relocated_cwd`] 的本地读取行为完全一致。
+pub(crate) fn parse_relocated_from_tail_bytes(tail: &[u8], file_len_hint: u64) -> Option<String> {
+    let start = file_len_hint.saturating_sub(RELOCATED_TAIL_BYTES);
+    let text = String::from_utf8_lossy(tail);
     let mut lines: Vec<&str> = text.lines().collect();
     // Seeking into the middle of a line leaves a partial first line.
     if start > 0 && !lines.is_empty() {
@@ -138,7 +148,8 @@ fn scan_session_file(path: &Path) -> std::io::Result<Option<SessionMeta>> {
     Ok(parse_session_lines(path, head, tail, relocated_cwd))
 }
 
-fn parse_session_lines(
+/// 解析头尾行窗口为会话元数据（远程链路复用：行数据来自 ssh 头尾帧协议）。
+pub(crate) fn parse_session_lines(
     path: &Path,
     head: Vec<String>,
     tail: Vec<String>,
@@ -1998,6 +2009,44 @@ mod tests {
         let meta = parse_session(&path).unwrap();
         // A Bash `cd` into a subdirectory must not move the session's project.
         assert_eq!(meta.project_dir.as_deref(), Some("/tmp/project-a"));
+    }
+
+    #[test]
+    fn relocated_tail_bytes_takes_last_record() {
+        let tail = b"{\"type\":\"user\",\"cwd\":\"/tmp/a\"}\n\
+                     {\"type\":\"relocated\",\"relocatedCwd\":\"/tmp/b\"}\n\
+                     {\"type\":\"relocated\",\"relocatedCwd\":\"/tmp/c\"}\n";
+        // 倒序取最后一条 relocated；多条记录时最新的胜出
+        assert_eq!(
+            parse_relocated_from_tail_bytes(tail, 64 * 1024 + tail.len() as u64),
+            Some("/tmp/c".to_string())
+        );
+    }
+
+    #[test]
+    fn relocated_tail_bytes_none_without_record() {
+        let tail = b"{\"type\":\"user\",\"cwd\":\"/tmp/a\"}\n{\"type\":\"assistant\"}\n";
+        assert_eq!(
+            parse_relocated_from_tail_bytes(tail, 64 * 1024),
+            None,
+            "无 relocated 记录返回 None"
+        );
+    }
+
+    #[test]
+    fn relocated_tail_bytes_boundary_depends_on_window_start() {
+        let single = b"{\"type\":\"relocated\",\"relocatedCwd\":\"/only\"}\n";
+        // 文件本体就是窗口（start = 0）：首行是完整记录，参与解析
+        assert_eq!(
+            parse_relocated_from_tail_bytes(single, single.len() as u64),
+            Some("/only".to_string())
+        );
+        // 同样字节、hint 显示前面还有整窗数据（start > 0）：首行判为半截丢弃 → 无记录
+        assert_eq!(
+            parse_relocated_from_tail_bytes(single, 64 * 1024 + single.len() as u64),
+            None,
+            "从中间起读的首行是半截记录，必须跳过"
+        );
     }
 
     #[test]

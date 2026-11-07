@@ -33,6 +33,7 @@ export type SettingsSection =
   | "appConfig"
   | "routing"
   | "network"
+  | "sshHosts"
   | "data"
   | "about";
 
@@ -41,6 +42,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   "appConfig",
   "routing",
   "network",
+  "sshHosts",
   "data",
   "about",
 ];
