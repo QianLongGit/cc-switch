@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -131,6 +131,27 @@ impl FileParseCache {
         self.scan_pre_metadata(files, parse, &mut |path: &Path, err: &io::Error| {
             log::debug!("远端会话文件解析失败，下轮重试 {}: {err}", path.display());
         })
+    }
+
+    /// 远程扫描两阶段支持：返回 `(mtime, len)` 与当前缓存一致——即下一次
+    /// [`Self::scan_remote`] 会直接复用上次结果、不会调用 parse——的文件键集。
+    ///
+    /// 只读查询、不改缓存表；命中判定与 [`Self::scan_pre_metadata`] 完全一致，
+    /// 供调用方在拉取数据前跳过这些文件（spec §5.4 缓存命中轮免 fetch）。
+    pub(crate) fn cached_fresh(
+        &self,
+        files: &[(PathBuf, Option<SystemTime>, u64)],
+    ) -> HashSet<PathBuf> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        files
+            .iter()
+            .filter_map(|(path, modified, len)| {
+                entries
+                    .get(path)
+                    .filter(|cached| &cached.modified == modified && cached.len == *len)
+                    .map(|_| path.clone())
+            })
+            .collect()
     }
 
     /// metadata 已取得的扫描核心：`(mtime, len)` 与缓存条目一致时复用上次的
@@ -720,5 +741,56 @@ mod tests {
             1
         );
         assert_eq!(calls.get(), 4, "失败的文件下一轮要重试，不能命中缓存");
+    }
+
+    /// 两阶段协同契约：`cached_fresh` 的命中判定必须与 `scan_remote` 的复用
+    /// 判定一致——查询为命中的文件在 scan_remote 中不得触发 parse（免 fetch
+    /// 决策以此为前提），查询为 miss 的文件才需要重新拉取解析。
+    #[test]
+    fn cached_fresh_agrees_with_scan_remote_reuse() {
+        use std::time::Duration;
+
+        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+
+        let cache = FileParseCache::new();
+        assert!(
+            cache.cached_fresh(&files).is_empty(),
+            "首轮无缓存，全 miss"
+        );
+
+        // 解析失败不缓存：cached_fresh 仍 miss（与 scan_remote 语义一致）
+        let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
+            Err(io::Error::new(io::ErrorKind::Other, "boom"))
+        };
+        assert!(cache.scan_remote(files.clone(), failing).is_empty());
+        assert!(
+            cache.cached_fresh(&files).is_empty(),
+            "解析失败的文件不得被报告为命中"
+        );
+
+        // 成功一轮后同 meta 全命中；len / mtime 任一变化即 miss
+        cache.scan_remote(files.clone(), |_| Ok(None));
+        assert_eq!(
+            cache.cached_fresh(&files),
+            HashSet::from([PathBuf::from("/home/u/a.jsonl")])
+        );
+        assert!(cache
+            .cached_fresh(&[(
+                PathBuf::from("/home/u/a.jsonl"),
+                Some(SystemTime::UNIX_EPOCH),
+                11u64
+            )])
+            .is_empty());
+        assert!(cache
+            .cached_fresh(&[(
+                PathBuf::from("/home/u/a.jsonl"),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                10u64
+            )])
+            .is_empty());
+        // mtime 未知（None）与已知（Some）不得互相命中
+        assert!(cache
+            .cached_fresh(&[(PathBuf::from("/home/u/a.jsonl"), None, 10u64)])
+            .is_empty());
     }
 }
