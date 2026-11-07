@@ -99,6 +99,53 @@ impl FileParseCache {
     where
         F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
     {
+        // 本地扫描：metadata 现场读文件系统；读不到的按扫描不完整处理并跳过
+        let mut entries = Vec::with_capacity(files.len());
+        for path in files {
+            match std::fs::metadata(&path) {
+                Ok(meta) => entries.push((path, meta.modified().ok(), meta.len())),
+                Err(error) => {
+                    status.record::<(), _>(Err(error));
+                }
+            }
+        }
+        self.scan_pre_metadata(entries, parse, &mut |path: &Path, err: &io::Error| {
+            status.incomplete = true;
+            log::debug!("会话文件暂时读取失败，下轮重试 {}: {err}", path.display());
+        })
+    }
+
+    /// 远端清单扫描：`(路径, mtime, len)` 由扫描清单供给而非本地文件系统，
+    /// 缓存命中判定与本地 [`Self::scan_with_status`] 完全一致；解析失败的文件
+    /// 同样不缓存、下一轮重试（远端任务的扫描状态由调用方聚合，这里只记日志）。
+    // Task 7 接线远端扫描任务后移除（当前仅测试调用）
+    #[allow(dead_code)]
+    pub(crate) fn scan_remote<F>(
+        &self,
+        files: Vec<(PathBuf, Option<SystemTime>, u64)>,
+        parse: F,
+    ) -> Vec<SessionMeta>
+    where
+        F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
+    {
+        self.scan_pre_metadata(files, parse, &mut |path: &Path, err: &io::Error| {
+            log::debug!("远端会话文件解析失败，下轮重试 {}: {err}", path.display());
+        })
+    }
+
+    /// metadata 已取得的扫描核心：`(mtime, len)` 与缓存条目一致时复用上次的
+    /// 解析结果，不一致（或没缓存过）调用 `parse`；解析失败经 `on_error` 回调，
+    /// 不缓存——否则恢复后文件没变也会一直命中「没有会话」。
+    fn scan_pre_metadata<F, E>(
+        &self,
+        files: Vec<(PathBuf, Option<SystemTime>, u64)>,
+        parse: F,
+        mut on_error: E,
+    ) -> Vec<SessionMeta>
+    where
+        F: Fn(&Path) -> io::Result<Option<SessionMeta>>,
+        E: FnMut(&Path, &io::Error),
+    {
         // 锁中毒（上次扫描 panic）时丢掉旧缓存重来，不影响本次结果
         let mut previous = match self.entries.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
@@ -111,23 +158,13 @@ impl FileParseCache {
 
         let mut next = HashMap::with_capacity(files.len());
         let mut sessions = Vec::new();
-        for path in files {
-            let (modified, len) = match std::fs::metadata(&path) {
-                Ok(meta) => (meta.modified().ok(), meta.len()),
-                Err(error) => {
-                    status.record::<(), _>(Err(error));
-                    continue;
-                }
-            };
+        for (path, modified, len) in files {
             let meta = match previous.remove(&path) {
                 Some(entry) if entry.modified == modified && entry.len == len => entry.meta,
                 _ => match parse(&path) {
                     Ok(meta) => meta,
-                    // 读不了（权限、被占用等）不缓存：否则恢复读取后文件没变，
-                    // 会一直命中「没有会话」，直到文件改动或重启
                     Err(err) => {
-                        status.incomplete = true;
-                        log::debug!("会话文件暂时读取失败，下轮重试 {}: {err}", path.display());
+                        on_error(&path, &err);
                         continue;
                     }
                 },
@@ -609,5 +646,79 @@ mod tests {
             extract_text(&json!([{ "type": "toolCall", "name": "read" }])),
             "[Tool: read]"
         );
+    }
+
+    /// 远端清单扫描：metadata 来自参数而非本地 fs，缓存命中判定与本地扫描一致——
+    /// 同 (mtime, len) 二次命中不重 parse，任一变化重新解析，失败不缓存
+    #[test]
+    fn scan_remote_hits_cache_until_manifest_meta_changes() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let remote_session = |path: &Path| {
+            Some(SessionMeta {
+                provider_id: "claude".to_string(),
+                session_id: path.to_string_lossy().to_string(),
+                title: None,
+                summary: None,
+                project_dir: None,
+                created_at: None,
+                last_active_at: None,
+                source_path: Some(path.to_string_lossy().to_string()),
+                resume_command: None,
+            })
+        };
+
+        let cache = FileParseCache::new();
+        let calls = Cell::new(0);
+        let parse = |path: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(remote_session(path))
+        };
+
+        // 首轮解析；同 meta 二次扫描命中缓存
+        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+        assert_eq!(cache.scan_remote(files.clone(), parse).len(), 1);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.scan_remote(files, parse).len(), 1);
+        assert_eq!(calls.get(), 1, "清单 meta 未变不应重新解析");
+
+        // len 变化：重新解析
+        let grown = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            11u64,
+        )];
+        assert_eq!(cache.scan_remote(grown, parse).len(), 1);
+        assert_eq!(calls.get(), 2);
+
+        // mtime 变化（len 不变）：同样失效
+        let touched = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            11u64,
+        )];
+        assert_eq!(cache.scan_remote(touched, parse).len(), 1);
+        assert_eq!(calls.get(), 3);
+
+        // 解析失败不缓存：恢复后同 meta 也要重新解析（对齐本地扫描语义）
+        let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        };
+        assert!(cache
+            .scan_remote(
+                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
+                failing
+            )
+            .is_empty());
+        assert_eq!(
+            cache.scan_remote(
+                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
+                parse
+            )
+            .len(),
+            1
+        );
+        assert_eq!(calls.get(), 4, "失败的文件下一轮要重试，不能命中缓存");
     }
 }

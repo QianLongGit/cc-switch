@@ -54,6 +54,9 @@ pub enum SourceLocation {
     Path { path: PathBuf, root: PathBuf },
     /// SQLite 中的一个会话；`db` 已规范化且等于 provider 自己的数据库
     Sqlite { db: PathBuf, session_id: String },
+    /// SSH 远程会话：`host_id` 已确认仍在设置中，`path` 为远端绝对路径（无 `..` 段）。
+    /// 内容不在本地文件系统，读取与指纹走远端通道（扫描清单 / ssh 传输）
+    Ssh { host_id: String, path: String },
 }
 
 impl ValidatedSource {
@@ -61,7 +64,7 @@ impl ValidatedSource {
     pub fn load_path(&self) -> String {
         match &self.location {
             SourceLocation::Path { path, .. } => path.to_string_lossy().into_owned(),
-            SourceLocation::Sqlite { .. } => self.raw.clone(),
+            SourceLocation::Sqlite { .. } | SourceLocation::Ssh { .. } => self.raw.clone(),
         }
     }
 
@@ -70,42 +73,47 @@ impl ValidatedSource {
         match &self.location {
             SourceLocation::Path { path, .. } if path.is_file() => Some(path.with_extension("")),
             SourceLocation::Path { path, .. } => Some(path.clone()),
-            SourceLocation::Sqlite { .. } => None,
+            SourceLocation::Sqlite { .. } | SourceLocation::Ssh { .. } => None,
         }
     }
 }
 
 /// 校验 `sourcePath` 归属，见模块文档。
 pub fn validate_source(provider_id: &str, source_path: &str) -> Result<ValidatedSource, String> {
-    let location = match provider_id {
-        "mcode" => {
-            let id = source_path
-                .strip_prefix("mcode:")
-                .filter(|id| !id.is_empty())
-                .ok_or("Invalid MCode session source")?;
-            SourceLocation::Sqlite {
-                db: canonicalize_existing_path(
-                    &super::providers::mcode::database_path(),
-                    "MCode database",
-                )?,
-                session_id: id.to_string(),
+    // `ssh:` 源在任何 provider 分发前拦截：内容不在本地 fs，按 host 配置 + 扫描清单校验
+    let location = if source_path.starts_with("ssh:") {
+        validate_ssh_source(source_path)?
+    } else {
+        match provider_id {
+            "mcode" => {
+                let id = source_path
+                    .strip_prefix("mcode:")
+                    .filter(|id| !id.is_empty())
+                    .ok_or("Invalid MCode session source")?;
+                SourceLocation::Sqlite {
+                    db: canonicalize_existing_path(
+                        &super::providers::mcode::database_path(),
+                        "MCode database",
+                    )?,
+                    session_id: id.to_string(),
+                }
             }
-        }
-        "opencode" if source_path.starts_with("sqlite:") => validate_sqlite_source(
-            source_path,
-            opencode::parse_sqlite_source(source_path),
-            &crate::opencode_config::get_opencode_db_path(),
-        )?,
-        "hermes" if source_path.starts_with("sqlite:") => validate_sqlite_source(
-            source_path,
-            hermes::parse_sqlite_source(source_path),
-            &crate::hermes_config::get_hermes_dir().join("state.db"),
-        )?,
-        _ => {
-            let roots = provider_roots(provider_id)?;
-            let source = codex_source_or_sibling(provider_id, Path::new(source_path));
-            let (root, path) = resolve_under_roots(provider_id, &source, &roots)?;
-            SourceLocation::Path { path, root }
+            "opencode" if source_path.starts_with("sqlite:") => validate_sqlite_source(
+                source_path,
+                opencode::parse_sqlite_source(source_path),
+                &crate::opencode_config::get_opencode_db_path(),
+            )?,
+            "hermes" if source_path.starts_with("sqlite:") => validate_sqlite_source(
+                source_path,
+                hermes::parse_sqlite_source(source_path),
+                &crate::hermes_config::get_hermes_dir().join("state.db"),
+            )?,
+            _ => {
+                let roots = provider_roots(provider_id)?;
+                let source = codex_source_or_sibling(provider_id, Path::new(source_path));
+                let (root, path) = resolve_under_roots(provider_id, &source, &roots)?;
+                SourceLocation::Path { path, root }
+            }
         }
     };
     Ok(ValidatedSource {
@@ -113,6 +121,27 @@ pub fn validate_source(provider_id: &str, source_path: &str) -> Result<Validated
         raw: source_path.to_string(),
         location,
     })
+}
+
+/// `ssh:<hostId>/<远端绝对路径>` 的三层校验：格式 → hostId 仍在设置中（删除主机后
+/// 残留的旧源直接报错）→ 扫描清单有条目（重启后清单为空 / 清单过期时提示先刷新）。
+/// 通过后返回不落本地文件系统的 [`SourceLocation::Ssh`]。
+fn validate_ssh_source(raw: &str) -> Result<SourceLocation, String> {
+    let (host_id, path) = super::ssh::parse_ssh_source(raw).ok_or("无效的 SSH 会话源")?;
+    let host_configured = crate::settings::get_settings()
+        .ssh_hosts
+        .as_deref()
+        .is_some_and(|hosts| hosts.iter().any(|host| host.id == host_id));
+    if !host_configured {
+        return Err("SSH 主机不存在或已移除".to_string());
+    }
+    if super::ssh::SshScanRegistry::global()
+        .lookup(&host_id, &path)
+        .is_none()
+    {
+        return Err("请先刷新该主机的会话列表".to_string());
+    }
+    Ok(SourceLocation::Ssh { host_id, path })
 }
 
 /// 前端拿到 `sourcePath` 后 Codex 可能把它压成 `.jsonl.zst`（或在恢复对话时解压回去），
@@ -1351,5 +1380,160 @@ mod tests {
         assert!(canonical_local_image("relative.png").is_err());
         assert!(canonical_local_image("/tmp/x.svg").is_err());
         assert!(canonical_local_image("/etc/passwd").is_err());
+    }
+
+    // ── SSH 源校验 ─────────────────────────────────────────────────────
+
+    /// settings 单例的临时注入域：进入时快照真实设置并在临时 home 下写入带测试
+    /// ssh 主机的版本；drop 时先恢复 store（此时 HOME 仍指向临时目录，恢复写盘
+    /// 绝不落真实 settings.json），再复位环境变量，临时目录随之删除。
+    /// 注入窗口内与真实值的差异只有 `ssh_hosts` 一个字段（无其它测试消费），并靠
+    /// `#[serial_test::serial]` 与其它 settings 测试互斥。
+    struct SshSettingsSandbox {
+        home: tempfile::TempDir,
+        previous_home: Option<std::ffi::OsString>,
+        previous: crate::settings::AppSettings,
+    }
+
+    impl SshSettingsSandbox {
+        fn enter(host_id: &str) -> Self {
+            let previous = crate::settings::get_settings();
+            let home = tempfile::tempdir().unwrap();
+            let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+            let mut injected = previous.clone();
+            injected.ssh_hosts = Some(vec![crate::settings::SshHostConfig {
+                id: host_id.to_string(),
+                label: host_id.to_string(),
+                host: "example.invalid".to_string(),
+                user: None,
+                port: None,
+                identity_file: None,
+            }]);
+            crate::settings::update_settings(injected).expect("注入测试 ssh 主机");
+            Self {
+                home,
+                previous_home,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SshSettingsSandbox {
+        fn drop(&mut self) {
+            // drop 可能由断言失败触发：恢复失败只打日志，避免双重 panic 中止进程
+            if let Err(err) = crate::settings::update_settings(self.previous.clone()) {
+                eprintln!("SshSettingsSandbox 恢复 settings 失败: {err:?}");
+            }
+            match self.previous_home.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+        }
+    }
+
+    /// `ssh:` 源的三层校验顺序：格式 → host 在 settings → 扫描清单有条目；
+    /// 合法时 `raw` 原样保留、location 为 [`SourceLocation::Ssh`]
+    #[serial_test::serial]
+    #[test]
+    fn validate_ssh_source_checks_format_host_then_manifest() {
+        let _sandbox = SshSettingsSandbox::enter("t-task6");
+        let reg = super::super::ssh::SshScanRegistry::global();
+        reg.replace_manifest(
+            "t-task6",
+            std::collections::HashMap::from([(
+                "/home/u/a.jsonl".to_string(),
+                super::super::ssh::RemoteFileMeta {
+                    len: 10,
+                    mtime_ms: 100,
+                },
+            )]),
+        );
+
+        // 合法：location 为 Ssh，raw 原样保序，load_path 直接回传 raw
+        let ok = validate_source("claude", "ssh:t-task6/home/u/a.jsonl").unwrap();
+        assert_eq!(ok.raw, "ssh:t-task6/home/u/a.jsonl");
+        assert_eq!(
+            ok.location,
+            SourceLocation::Ssh {
+                host_id: "t-task6".into(),
+                path: "/home/u/a.jsonl".into(),
+            }
+        );
+        assert_eq!(ok.load_path(), "ssh:t-task6/home/u/a.jsonl");
+        assert_eq!(ok.sidecar_base(), None);
+
+        // 第一层：格式非法（`..` 段 / 空 hostId / 非 ssh 前缀不进此分支）
+        assert_eq!(
+            validate_source("claude", "ssh:t-task6/home/../a.jsonl").unwrap_err(),
+            "无效的 SSH 会话源"
+        );
+        assert_eq!(
+            validate_source("claude", "ssh:/home/u/a.jsonl").unwrap_err(),
+            "无效的 SSH 会话源"
+        );
+
+        // 第二层：hostId 不在 settings（主机已删除后残留的旧源）
+        assert_eq!(
+            validate_source("claude", "ssh:t-task6-other/home/u/a.jsonl").unwrap_err(),
+            "SSH 主机不存在或已移除"
+        );
+
+        // 第三层：host 合法但清单没有该路径（重启后清单为空 / 清单过期）
+        assert_eq!(
+            validate_source("claude", "ssh:t-task6/home/u/missing.jsonl").unwrap_err(),
+            "请先刷新该主机的会话列表"
+        );
+        reg.replace_manifest("t-task6", std::collections::HashMap::new());
+        assert_eq!(
+            validate_source("claude", "ssh:t-task6/home/u/a.jsonl").unwrap_err(),
+            "请先刷新该主机的会话列表"
+        );
+    }
+
+    /// Ssh location 对本地专属的 ContentRef 就近报错：不 panic、不触本地 fs
+    #[test]
+    fn ssh_source_rejects_local_content_refs() {
+        let source = ValidatedSource {
+            provider_id: "claude".into(),
+            raw: "ssh:h1/home/u/a.jsonl".into(),
+            location: SourceLocation::Ssh {
+                host_id: "h1".into(),
+                path: "/home/u/a.jsonl".into(),
+            },
+        };
+        assert_eq!(
+            resolve_content_ref(
+                &source,
+                &ContentRef::File {
+                    rel_path: "a.jsonl".into(),
+                    pointer: String::new(),
+                },
+            )
+            .unwrap_err(),
+            OUTSIDE
+        );
+        assert_eq!(
+            resolve_content_ref(
+                &source,
+                &ContentRef::Sidecar {
+                    rel_path: "out.txt".into(),
+                },
+            )
+            .unwrap_err(),
+            OUTSIDE
+        );
+        assert_eq!(
+            resolve_content_ref(
+                &source,
+                &ContentRef::Jsonl {
+                    offset: 0,
+                    len: 8,
+                    pointer: String::new(),
+                },
+            )
+            .unwrap_err(),
+            STALE
+        );
     }
 }

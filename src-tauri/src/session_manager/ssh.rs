@@ -259,8 +259,6 @@ pub(crate) fn run_remote(
 /// - 路径必须为非空绝对路径（`/` 开头），且不含 `..` 段（防止逃逸目标目录）
 ///
 /// 不合法返回 `None`，由上层映射为用户可读错误。
-// Task 6/7 接线 validate/scan 后移除
-#[allow(dead_code)]
 pub(crate) fn parse_ssh_source(raw: &str) -> Option<(String /*host_id*/, String /*remote_path*/)> {
     let rest = raw.strip_prefix("ssh:")?;
     // 首个 `/` 之前是 hostId；之后（含斜杠本体）是远端绝对路径
@@ -279,8 +277,6 @@ pub(crate) fn parse_ssh_source(raw: &str) -> Option<(String /*host_id*/, String 
 
 /// 远端文件元数据：扫描时点的字节长度与修改时间（Unix 毫秒）。
 /// 供 fingerprint 判定「远端文件是否变化、缓存是否需失效」。
-// Task 6/7 接线 fingerprint 后移除
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteFileMeta {
     pub len: u64,
@@ -291,8 +287,6 @@ pub(crate) struct RemoteFileMeta {
 ///
 /// 扫描任务整体写入（[`SshScanRegistry::replace_manifest`]），
 /// validate / fingerprint / 删除会话按路径查询与摘除。
-// Task 6/7 接线后移除
-#[allow(dead_code)]
 pub(crate) struct SshScanRegistry {
     /// 各主机的文件清单
     manifests: RwLock<HashMap<String, HashMap<String, RemoteFileMeta>>>,
@@ -303,8 +297,6 @@ static GLOBAL: LazyLock<SshScanRegistry> =
         manifests: RwLock::new(HashMap::new()),
     });
 
-// Task 6/7 接线后移除
-#[allow(dead_code)]
 impl SshScanRegistry {
     /// 进程级共享清单（单例参照 `cache.rs::global()` 的 LazyLock 方案）
     pub(crate) fn global() -> &'static Self {
@@ -312,6 +304,8 @@ impl SshScanRegistry {
     }
 
     /// 全量替换某主机的清单，旧清单整体丢弃
+    // Task 7 接线远端扫描任务后移除（当前仅测试写入）
+    #[allow(dead_code)]
     pub(crate) fn replace_manifest(&self, host_id: &str, entries: HashMap<String, RemoteFileMeta>) {
         self.lock_write().insert(host_id.to_string(), entries);
     }
@@ -322,6 +316,8 @@ impl SshScanRegistry {
     }
 
     /// 摘除单条条目（删除远端会话成功后调用）；返回条目原本是否存在
+    // Task 10 接线远端删除后移除
+    #[allow(dead_code)]
     pub(crate) fn remove_entry(&self, host_id: &str, path: &str) -> bool {
         self.lock_write()
             .get_mut(host_id)
