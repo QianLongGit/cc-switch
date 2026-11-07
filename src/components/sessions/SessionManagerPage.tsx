@@ -70,6 +70,7 @@ import {
   groupSessionsByTime,
   isRemoteSession,
   isSessionAppId,
+  normalizeHostId,
   SESSION_APP_IDS,
   SESSION_SOURCE_PATHS,
   shortenHomePath,
@@ -158,12 +159,14 @@ export function SessionManagerPage({
 }: SessionManagerPageProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  // null = 本机；远程主机 id 来自设置里的 sshHosts（Task 11 的 host 维度 query key）
+  // null = 本机；远程主机 id 来自设置里的 sshHosts（Task 11 的 host 维度 query key）。
+  // 选中主机被删后归一回本机，查询与菜单都用归一值（见 utils.normalizeHostId）
   const [hostId, setHostId] = useState<string | null>(null);
-  const { data, dataUpdatedAt, isSuccess, isLoading, isError, error, refetch } =
-    useSessionsQuery(hostId ?? undefined);
-  const sessions = useMemo(() => data ?? [], [data]);
   const { data: settings } = useSettingsQuery();
+  const effectiveHostId = normalizeHostId(hostId, settings?.sshHosts);
+  const { data, dataUpdatedAt, isSuccess, isLoading, isError, error, refetch } =
+    useSessionsQuery(effectiveHostId ?? undefined);
+  const sessions = useMemo(() => data ?? [], [data]);
   const { updateSettings, autoSaveSettings } = useSettings();
   const contentSearchEnabled = settings?.sessionContentSearchEnabled ?? false;
 
@@ -1316,7 +1319,7 @@ export function SessionManagerPage({
 
             {/* 配了 SSH 主机才有切换的意义（没配时组件自己不渲染） */}
             <SessionHostMenu
-              hostId={hostId}
+              hostId={effectiveHostId}
               sshHosts={settings?.sshHosts}
               onSelect={setHostId}
             />

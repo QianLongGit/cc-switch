@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { createElement } from "react";
 import type { AppId } from "@/lib/api";
-import type { SessionMeta, SessionTextRange } from "@/types";
+import type { SessionMeta, SessionTextRange, SshHostConfig } from "@/types";
 
 export const UNKNOWN_PROJECT_DIR_KEY = "__unknown_project_dir__";
 
@@ -72,6 +72,19 @@ export const getSessionKey = (session: SessionMeta) =>
 /** SSH 远程来源的会话：后端给这类会话的 sourcePath 带 `ssh:` 前缀 */
 export const isRemoteSession = (session: SessionMeta) =>
   Boolean(session.sourcePath?.startsWith("ssh:"));
+
+/**
+ * 选中的主机已不在设置里（被删）时归一回本机（null）。
+ * 归一后的值同时喂给会话查询与主机菜单，避免界面显示「本机」、
+ * 数据层却还拿着旧主机 id 请求远程（错误面板重试永远失败）。
+ */
+export const normalizeHostId = (
+  hostId: string | null,
+  sshHosts: SshHostConfig[] | undefined,
+): string | null =>
+  hostId && (sshHosts ?? []).some((host) => host.id === hostId)
+    ? hostId
+    : null;
 
 export const getSessionTime = (session: SessionMeta) =>
   session.lastActiveAt ?? session.createdAt ?? 0;
