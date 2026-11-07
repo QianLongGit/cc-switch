@@ -284,9 +284,27 @@
 - [ ] **Step 4: 手动 QA 清单输出**（不阻塞）：真机连一台服务器，走查：添加主机（导入+手填）/测试连接/切换主机/列表/阅读大会话/zst 会话/图片/导出/删除/断网错误态。清单写入交付报告
 - [ ] **Step 5: Commit** — `test(sessions): localhost ssh integration smoke test`
 
----
+### Task 15: 编译构建 + GitHub Release + DMG 上传（用户指令追加，2026-11-07）
+
+**Files:**
+- Modify: `src-tauri/tauri.conf.json` + `src-tauri/Cargo.toml`（version 4.0.27 → 4.1.0，Cargo.lock 随之更新）
+- Create: `docs/release-notes/v4.1.0-zh.md`、`docs/release-notes/v4.1.0-en.md`（遵循现有 release notes 惯例，从 ledger 的任务完成记录提炼变更列表）
+- 产物：`src-tauri/target/release/bundle/dmg/*.dmg`
+
+**Interfaces:**
+- Consumes: 全部 14 任务完成 + final review clean + main 合并后
+- 发布目标：origin（QianLongGit/cc-switch），gh 已认证
+
+- [ ] **Step 1: 版本号 bump**（tauri.conf.json + Cargo.toml → 4.1.0；`cargo check` 刷新 Cargo.lock）
+- [ ] **Step 2: release notes**（zh/en 双语；内容 = SSH 远程会话管理功能 + 内部改进摘要，从 spec 与 ledger 提炼）
+- [ ] **Step 3: 合并 main**（feat/ssh-remote-sessions → main，merge commit，遵循用户「main 直接 merge」偏好）+ tag `v4.1.0`
+- [ ] **Step 4: push**（main + tag → origin；用户发布指令已授权）
+- [ ] **Step 5: 构建**（`npm run tauri build`，产出 DMG；构建失败按 fix loop 处理）
+- [ ] **Step 6: Release**（`gh release create v4.1.0` 附 DMG + release notes 正文，发布到 origin）
+- [ ] **Step 7: Commit**（版本号 + release notes：`chore(release): bump version to 4.1.0`，在 Step 3 合并前完成）
 
 ## 执行说明
+
 
 - 执行方式：subagent-driven（每任务 fresh implementer + fresh reviewer，用户全局规范钦定子代理执行；并发 ≤ 4）
 - 任务依赖链：1 → 2 → 3 → 4 → 5（1-4 后 5 可并行）；6 依赖 3；7 依赖 4+6；8 依赖 6；9 依赖 8；10 依赖 3；11 独立（可早于 7 并行）；12 依赖 11+5；13 依赖 5+11；14 最后
