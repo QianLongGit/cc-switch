@@ -201,9 +201,9 @@ fn localhost_ssh_full_chain_smoke() {
     eprintln!("localtest: ssh localhost 可用，执行全链路冒烟");
 
     // ── 全局态准备：落盘重定向短 tempdir + settings 注入 localtest 主机 ──
-    // ControlMaster socket 落在 tempdir 内（`<temp>/.cc-switch/ssh/cm-<40位
-    // hash>`），macOS 常规 tempdir 的 `/var/folders/...` 长前缀会撞 unix 域
-    // 104 字节上限，必须用 `/tmp` 下短前缀目录
+    // ControlMaster socket 已独立落在 `/tmp/cc-switch-ssh-<user>` 短目录
+    // （规避 unix 域 104 字节上限），tempdir 仅承载配置/settings 落盘，
+    // 仍取 `/tmp` 短前缀以保持路径简短
     let local_temp = tempfile::Builder::new()
         .prefix("ccsw-lt-")
         .tempdir_in("/tmp")

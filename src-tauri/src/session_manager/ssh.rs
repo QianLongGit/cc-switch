@@ -132,8 +132,10 @@ fn is_executable(path: &Path) -> bool {
 ///
 /// - 基础参数：`BatchMode=yes`（禁止交互挂起）、`ConnectTimeout=8`
 /// - 非 Windows 追加连接复用三参数（`ControlMaster=auto` /
-///   `ControlPath=<配置目录>/ssh/cm-%C` / `ControlPersist=10m`），
-///   复用目录惰性创建，创建失败则降级为不复用（可用性优先）
+///   `ControlPath=<tmp 短目录>/cm-%C` / `ControlPersist=10m`），
+///   复用目录惰性创建；创建失败或路径越出 unix 域 socket 安全区
+///   （超长 / 空格 / 非 ASCII，见 [`control_path_safe`]）则降级为不复用
+///   （可用性优先）
 /// - `remote_cmd` 原样作为最后一个参数传递，内嵌路径由调用方经
 ///   [`escape_remote_path`] 转义
 pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Command {
@@ -148,12 +150,13 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
 
-    // 测试开关命中时跳过连接复用（直连）；生产恒为 None 走复用
+    // 测试开关命中时跳过连接复用（直连）；生产恒为 None 走复用。
+    // 目录超长 / 含空格或非 ASCII 时同样降级直连（见 [`control_path_safe`]）
     #[cfg(not(windows))]
     let control_path = if mux_disabled_for_test() {
         None
     } else {
-        control_socket_dir()
+        control_socket_dir().filter(|dir| control_path_safe(dir))
     };
     #[cfg(not(windows))]
     if let Some(control_path) = control_path {
@@ -180,10 +183,55 @@ pub(crate) fn build_ssh_command(host: &SshHostConfig, remote_cmd: &str) -> Comma
     cmd
 }
 
-/// 返回连接复用 socket 目录并惰性创建；创建失败返回 None（调用方降级为不复用）。
+/// 返回连接复用 socket 目录并惰性创建；不可用（Windows / 创建失败）返回 None
+/// （调用方降级为不复用）。
+///
+/// 目录刻意选 `/tmp` 下按用户隔离的短路径而非应用配置目录——配置目录可能被
+/// override 到深层路径（线上事故：`unix_listener: path "..." too long for
+/// Unix domain socket`），叠加 `cm-` + `%C` 展开的 40 字符 hash + ssh 追加的
+/// 随机后缀后会超出 unix 域 socket `sun_path` 的 104 字节上限，导致复用
+/// 初始化整体失败。`/tmp` 全局可写，故目录权限收紧到 700 防 socket 被其他
+/// 用户探测接管。
+#[cfg(not(windows))]
 fn control_socket_dir() -> Option<PathBuf> {
-    let dir = crate::config::get_app_config_dir().join("ssh");
-    std::fs::create_dir_all(&dir).ok().map(|_| dir)
+    use std::os::unix::fs::PermissionsExt;
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let dir = PathBuf::from("/tmp").join(format!("cc-switch-ssh-{user}"));
+    std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)))
+        .ok()
+        .map(|_| dir)
+}
+
+/// Windows 无 ControlMaster 复用，无需 socket 目录
+#[cfg(windows)]
+fn control_socket_dir() -> Option<PathBuf> {
+    None
+}
+
+/// socket 路径展开长度上界（字节）：unix 域 `sun_path` 上限取各平台最小值
+/// （macOS 104 / Linux 108）再留余量
+#[cfg(not(windows))]
+const CONTROL_PATH_MAX: usize = 100;
+
+/// 判定 socket 目录是否仍处于 unix 域 socket 路径安全区。
+///
+/// 展开上界 = 目录字节数 + `/`(1) + `cm-`(3) + `%C` 展开的 hash(40) +
+/// ssh 追加的随机后缀余量(20)。超长会在 mux 初始化时报
+/// `unix_listener: path too long` 使整体连接失败；空格会被 `ControlPath=`
+/// 的单参数值截断，非 ASCII 在部分 locale 下同理——命中任一即不安全，
+/// 调用方应降级为直连（牺牲复用、功能完整）。
+#[cfg(not(windows))]
+fn control_path_safe(dir: &Path) -> bool {
+    let projected = dir.as_os_str().len() + 1 + 3 + 40 + 20;
+    projected <= CONTROL_PATH_MAX
+        && dir
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_whitespace())
 }
 
 /* ===== 测试钩子：ControlMaster 禁用开关 ===== */
@@ -1099,14 +1147,55 @@ mod tests {
         assert_eq!(argv[ident_idx + 1], "/Users/dev/.ssh/id_ed25519");
     }
 
+    /// 测试窗口内重写 USER / 清空 LOGNAME，drop 时恢复原值。
+    ///
+    /// [`control_socket_dir`] 按 USER → LOGNAME → "user" 次序取用户名，注入
+    /// 需同时清掉 LOGNAME 才能锁定分支；`#[serial]` 已保证窗口不与其他
+    /// env 敏感测试交叠。
+    struct UserEnvGuard {
+        user: Option<std::ffi::OsString>,
+        logname: Option<std::ffi::OsString>,
+    }
+
+    impl UserEnvGuard {
+        fn new(user: Option<&str>) -> Self {
+            let guard = UserEnvGuard {
+                user: std::env::var_os("USER"),
+                logname: std::env::var_os("LOGNAME"),
+            };
+            match user {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+            std::env::remove_var("LOGNAME");
+            guard
+        }
+    }
+
+    impl Drop for UserEnvGuard {
+        fn drop(&mut self) {
+            match self.user.take() {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+            match self.logname.take() {
+                Some(v) => std::env::set_var("LOGNAME", v),
+                None => std::env::remove_var("LOGNAME"),
+            }
+        }
+    }
+
     #[cfg(not(windows))]
     #[test]
     #[serial]
     fn build_adds_control_master_triple_on_unix() {
+        // 锁定注入用户名，避免宿主机超长 USER 触发降级使三参数缺失
+        let _guard = UserEnvGuard::new(Some("dev"));
         let cmd = build_ssh_command(&host(Some("dev"), None, None), "true");
         let argv = args(&cmd);
         assert!(argv.contains(&"ControlMaster=auto".to_string()));
-        // ControlPath 落在应用配置目录的 ssh 子目录，且惰性创建该目录
+        // ControlPath 落在 /tmp 下按用户隔离的短 socket 目录（规避 unix 域
+        // sun_path 长度上限），且惰性创建该目录
         let cp_idx = argv
             .iter()
             .position(|a| a.starts_with("ControlPath="))
@@ -1117,9 +1206,98 @@ mod tests {
             .trim_start_matches("ControlPath=")
             .trim_end_matches("/cm-%C");
         assert!(
+            dir.starts_with("/tmp/cc-switch-ssh-"),
+            "应使用 /tmp 短前缀 socket 目录: {dir}"
+        );
+        assert!(
             std::path::Path::new(dir).is_dir(),
             "目录应被惰性创建: {dir}"
         );
+    }
+
+    /// 降级回归：目录展开后超出 sun_path 安全区时必须省略复用三参数。
+    ///
+    /// 注入超长 USER 使 socket 目录长度越界，模拟配置目录被 override 到
+    /// 深路径的线上场景——若不降级，mux 初始化将报
+    /// `unix_listener: path too long` 导致整体连接失败。
+    #[cfg(not(windows))]
+    #[test]
+    #[serial]
+    fn build_omits_control_master_triple_when_dir_too_long() {
+        let _guard = UserEnvGuard::new(Some(&"u".repeat(80)));
+        let cmd = build_ssh_command(&host(Some("dev"), None, None), "true");
+        let argv = args(&cmd);
+        assert!(
+            !argv.iter().any(|a| a.starts_with("ControlMaster=")),
+            "目录超长时应省略 ControlMaster: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("ControlPath=")),
+            "目录超长时应省略 ControlPath: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("ControlPersist=")),
+            "目录超长时应省略 ControlPersist: {argv:?}"
+        );
+        // 直连降级下基础参数与目的地不受影响（功能完整）
+        assert!(argv.contains(&"BatchMode=yes".to_string()));
+        assert!(argv.contains(&"dev@example.com".to_string()));
+    }
+
+    /* ===== socket 目录与路径安全 ===== */
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_path_safe_accepts_short_tmp_dir() {
+        assert!(control_path_safe(Path::new("/tmp/cc-switch-ssh-dev")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_path_safe_rejects_long_dir() {
+        // 80 字符目录：80 + 1('/') + 3("cm-") + 40(hash) + 20(后缀余量) > 100
+        let long = PathBuf::from("a".repeat(80));
+        assert!(!control_path_safe(&long));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_path_safe_rejects_dir_with_whitespace() {
+        assert!(!control_path_safe(Path::new("/tmp/cc switch")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn control_path_safe_rejects_non_ascii_dir() {
+        assert!(!control_path_safe(Path::new("/tmp/cc-切换")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[serial]
+    fn control_socket_dir_uses_short_tmp_path_per_user() {
+        let _guard = UserEnvGuard::new(Some("cctest"));
+        let dir = control_socket_dir().expect("应返回 socket 目录");
+        assert_eq!(dir, PathBuf::from("/tmp/cc-switch-ssh-cctest"));
+        assert!(dir.is_dir(), "目录应被惰性创建: {dir:?}");
+        // /tmp 全局可写，目录必须收紧到 700 防 socket 被其他用户探测接管
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "socket 目录权限应为 700");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[serial]
+    fn control_socket_dir_falls_back_to_generic_user() {
+        let _guard = UserEnvGuard::new(None);
+        let dir = control_socket_dir().expect("应返回 fallback 目录");
+        assert_eq!(dir, PathBuf::from("/tmp/cc-switch-ssh-user"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /* ===== 进程执行 ===== */
