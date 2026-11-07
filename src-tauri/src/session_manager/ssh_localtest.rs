@@ -37,7 +37,8 @@ use serial_test::serial;
 use crate::settings::SshHostConfig;
 
 use super::ssh::{
-    escape_remote_path, read_block, run_remote, SshScanRegistry, DISABLE_CONTROL_MASTER_FOR_TEST,
+    control_socket_dir_path, escape_remote_path, read_block, run_remote, SshScanRegistry,
+    DISABLE_CONTROL_MASTER_FOR_TEST,
 };
 
 /* ===== 远端命令超时（与 mod.rs 链路口径对齐）===== */
@@ -125,13 +126,14 @@ struct FixtureGuard {
 }
 
 impl FixtureGuard {
-    /// 遍历本测试 socket 目录（`<tempdir>/.cc-switch/ssh`）下的 `cm-*`
-    /// socket，逐个 `ssh -O exit` 请求 master 退出。
+    /// 遍历本测试 socket 目录（`/tmp/cc-switch-ssh-<user>`，与 build 侧
+    /// [`control_socket_dir_path`] 同一推导）下的 `cm-*` socket，逐个
+    /// `ssh -O exit` 请求 master 退出。
     ///
     /// `%C` hash 无法本地反推，按文件名前缀枚举；socket 失效 / 无 master
     /// 返回非零属正常态（静默），仅成功退出时打印一行确认。
     fn shutdown_control_masters(&self) {
-        let dir = crate::config::get_app_config_dir().join("ssh");
+        let dir = control_socket_dir_path();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
@@ -201,9 +203,9 @@ fn localhost_ssh_full_chain_smoke() {
     eprintln!("localtest: ssh localhost 可用，执行全链路冒烟");
 
     // ── 全局态准备：落盘重定向短 tempdir + settings 注入 localtest 主机 ──
-    // ControlMaster socket 落在 tempdir 内（`<temp>/.cc-switch/ssh/cm-<40位
-    // hash>`），macOS 常规 tempdir 的 `/var/folders/...` 长前缀会撞 unix 域
-    // 104 字节上限，必须用 `/tmp` 下短前缀目录
+    // ControlMaster socket 已独立落在 `/tmp/cc-switch-ssh-<user>` 短目录
+    // （规避 unix 域 104 字节上限），tempdir 仅承载配置/settings 落盘，
+    // 仍取 `/tmp` 短前缀以保持路径简短
     let local_temp = tempfile::Builder::new()
         .prefix("ccsw-lt-")
         .tempdir_in("/tmp")
