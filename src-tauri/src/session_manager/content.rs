@@ -4,8 +4,10 @@
 //!
 //! - [`validate_source`]：`sourcePath` 必须落在对应 provider 的会话根目录下（规范化后比较，
 //!   符号链接解析到真实位置再判断），SQLite 源只认 provider 自己的数据库
-//! - [`resolve_content_ref`]：按 kind 校验后读取全文，单次 ≤ 32MB
-//! - [`load_image`]：内联图片走 ContentRef 校验并解码，本地图片只允许会话相关目录，≤ 20MB
+//! - [`resolve_content_ref`]：按 kind 校验后读取全文，单次 ≤ 32MB；
+//!   `ssh:` 源的 Jsonl 引用走远端块读取通道（`ssh::read_block`）
+//! - [`load_image`]：内联图片走 ContentRef 校验并解码，本地图片只允许会话相关目录，
+//!   ≤ 20MB；`ssh:` 源的本地路径图片按远端白名单校验后拉回字节
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -248,8 +250,13 @@ pub fn resolve_content_ref(
             len,
             pointer,
         } => {
-            let path = jsonl_path(source)?;
-            let line = read_jsonl_line(&path, *offset, *len)?;
+            // Ssh 源：内容不在本地 fs，走远端块读取通道（每次实时读，无 stale 缓存）
+            let line = match &source.location {
+                SourceLocation::Ssh { host_id, path } => {
+                    read_remote_jsonl_line(host_id, path, *offset, *len)?
+                }
+                _ => read_jsonl_line(&jsonl_path(source)?, *offset, *len)?,
+            };
             let value: Value = serde_json::from_slice(&line).map_err(|_| STALE.to_string())?;
             extract_text(&value, pointer)
         }
@@ -370,8 +377,24 @@ fn read_jsonl_line(path: &Path, offset: u64, len: u32) -> Result<Vec<u8>, String
     } else {
         read_plain_window(path, start, end)?
     };
+    jsonl_line_from_window(&buf, start, offset, len, more_after_end)
+}
 
+/// 窗口字节 → JSONL 行的边界校验（本地窗口与 Ssh 远程窗口共用）：
+/// `buf` 覆盖 `[start, min(end+1, 文件尾))`（含行首前一字节与行尾后一字节，若有），
+/// `more_after_end` 表示 `end` 之后文件还有内容。规则见 [`read_jsonl_line`]；
+/// 窗口比声明的 `len` 短（远程短读）同样按会话已更新处理，不 panic。
+fn jsonl_line_from_window(
+    buf: &[u8],
+    start: u64,
+    offset: u64,
+    len: u32,
+    more_after_end: bool,
+) -> Result<Vec<u8>, String> {
     let line_start = (offset - start) as usize;
+    if buf.len() < line_start + len as usize {
+        return Err(STALE.to_string());
+    }
     if offset > 0 && buf[0] != b'\n' {
         return Err(STALE.to_string());
     }
@@ -391,6 +414,38 @@ fn read_jsonl_line(path: &Path, offset: u64, len: u32) -> Result<Vec<u8>, String
         return Err(STALE.to_string());
     }
     Ok(line.to_vec())
+}
+
+/// Ssh 源的 JSONL 行读取：窗口语义与本地 [`read_jsonl_line`] 严格一致
+/// （多读前后各一字节判行边界、行校验共用 [`jsonl_line_from_window`]），
+/// 区别仅在窗口来源——远程每次实时读，无 stale 缓存；窗口拉不齐说明
+/// 文件已变短或 offset 越界，同样按会话已更新处理。
+fn read_remote_jsonl_line(
+    host_id: &str,
+    remote_path: &str,
+    offset: u64,
+    len: u32,
+) -> Result<Vec<u8>, String> {
+    if len == 0 {
+        return Err(STALE.to_string());
+    }
+    if u64::from(len) > MAX_TEXT_BYTES {
+        return Err(TOO_LARGE_TEXT.to_string());
+    }
+    let end = offset
+        .checked_add(u64::from(len))
+        .ok_or_else(|| STALE.to_string())?;
+    let start = offset.saturating_sub(1);
+    let host =
+        super::ssh_host_by_id(host_id).ok_or_else(|| "SSH 主机不存在或已移除".to_string())?;
+    let compressed = remote_path.ends_with(".jsonl.zst");
+    let buf = super::ssh::read_block(&host, remote_path, start, end + 1 - start, compressed)
+        .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+    let wanted = (end - start) as usize;
+    if buf.len() < wanted {
+        return Err(STALE.to_string());
+    }
+    jsonl_line_from_window(&buf, start, offset, len, buf.len() > wanted)
 }
 
 /// 读 `[start, end]`（含结尾后一个字节，若有）；第二项表示 `end` 之后还有内容。
@@ -587,6 +642,10 @@ pub fn load_image(source: &ValidatedSource, image: &ImageRef) -> Result<Vec<u8>,
             decode_inline_image(&encoded, MAX_IMAGE_BYTES)
         }
         ImageSource::LocalFile { path } => {
+            // Ssh 源的路径是远端绝对路径：不触本地 fs，走远端白名单 + 拉取
+            if let SourceLocation::Ssh { host_id, .. } = &source.location {
+                return load_remote_image(host_id, path);
+            }
             let canonical = canonical_local_image(path)?;
             let mut allowed = local_image_dirs(source);
             if !allowed.iter().any(|dir| canonical.starts_with(dir)) {
@@ -598,6 +657,58 @@ pub fn load_image(source: &ValidatedSource, image: &ImageRef) -> Result<Vec<u8>,
             read_local_image(&canonical, &allowed, MAX_IMAGE_BYTES)
         }
     }
+}
+
+// ── SSH 远程图片 ────────────────────────────────────────────────────
+
+/// 远端图片允许的会话根目录（带前后斜杠的中缀形态，斜杠保证目录边界）：
+/// claude 一个会话根 + codex 两个会话根，与 `ssh::home_dirs_command` 的三目录一致。
+/// 中缀形态适配任意 HOME 位置（/home/*、/Users/*、/root 等）。
+const REMOTE_IMAGE_ROOT_MARKERS: &[&str] = &[
+    "/.claude/projects/",
+    "/.codex/sessions/",
+    "/.codex/archived_sessions/",
+];
+
+/// 远端图片路径白名单（纯函数）：路径必须落在三个会话根目录中缀内、
+/// 无 `..` 逃逸段、扩展名在位图白名单内（大小写不敏感；SVG 与其它格式
+/// 拒绝，与本地 [`IMAGE_EXTENSIONS`] 同口径）。`host_id` 按调用方接线形态
+/// 保留：白名单按远端路径形态判定，不区分主机。
+fn remote_image_allowed(_host_id: &str, path: &str) -> bool {
+    if path.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    if !REMOTE_IMAGE_ROOT_MARKERS
+        .iter()
+        .any(|marker| path.contains(marker))
+    {
+        return false;
+    }
+    let ext = remote_image_extension(path);
+    IMAGE_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// 远端路径的扩展名（小写）：取最后一个 `.` 之后的段；无 `.` → 空串
+fn remote_image_extension(path: &str) -> String {
+    path.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Ssh 源的 `ImageSource::LocalFile`：路径是远端绝对路径，不触本地 fs——
+/// SVG 单独拒绝（文案与本地一致），白名单校验后全量拉回字节
+/// （≤ [`MAX_IMAGE_BYTES`]，与本地同上限）。
+fn load_remote_image(host_id: &str, path: &str) -> Result<Vec<u8>, String> {
+    if remote_image_extension(path) == "svg" {
+        return Err("SVG 图片不直接显示".to_string());
+    }
+    if !remote_image_allowed(host_id, path) {
+        return Err("图片不在会话项目或工具目录内，无法预览".to_string());
+    }
+    let host =
+        super::ssh_host_by_id(host_id).ok_or_else(|| "SSH 主机不存在或已移除".to_string())?;
+    super::ssh::read_remote_bytes(&host, path, MAX_IMAGE_BYTES)
+        .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))
 }
 
 /// 去掉 `data:<mime>;base64,` 前缀后解码；编码长度先粗检，解码后再精确检查上限。
@@ -1492,7 +1603,8 @@ mod tests {
         );
     }
 
-    /// Ssh location 对本地专属的 ContentRef 就近报错：不 panic、不触本地 fs
+    /// Ssh location 对本地专属的 ContentRef 就近报错：不 panic、不触本地 fs。
+    /// Jsonl 接线远端通道后就近报主机错误（本例 host 不在 settings）。
     #[test]
     fn ssh_source_rejects_local_content_refs() {
         let source = ValidatedSource {
@@ -1524,6 +1636,20 @@ mod tests {
             .unwrap_err(),
             OUTSIDE
         );
+        // Jsonl 走远端读取通道：先做引用形态检查（len=0 仍按会话已更新），
+        // 合法形态继续查主机——h1 不在 settings，就近报主机错误而非 STALE
+        assert_eq!(
+            resolve_content_ref(
+                &source,
+                &ContentRef::Jsonl {
+                    offset: 0,
+                    len: 0,
+                    pointer: String::new(),
+                },
+            )
+            .unwrap_err(),
+            STALE
+        );
         assert_eq!(
             resolve_content_ref(
                 &source,
@@ -1534,7 +1660,108 @@ mod tests {
                 },
             )
             .unwrap_err(),
+            "SSH 主机不存在或已移除"
+        );
+    }
+
+    // ── SSH 远程块读取与图片（Task 9）─────────────────────────────────
+
+    /// 提出的行校验纯函数：窗口 `[start, min(end+1, 文件尾))` → JSONL 行，
+    /// 与本地 `read_jsonl_line` 的行边界语义逐条对齐（远程窗口共用同一实现）
+    #[test]
+    fn jsonl_line_from_window_validates_boundaries() {
+        let full = b"{\"a\":1}\n{\"b\":2}\n";
+        // 首行（offset=0 无前置换行约束），行含尾换行：剥离后返回
+        assert_eq!(
+            jsonl_line_from_window(full, 0, 0, 7, true).unwrap(),
+            b"{\"a\":1}".to_vec()
+        );
+        // 次行：窗口从换行符开始（`{"b":2}` 首字节在 offset=8），行尾恰为
+        // 文件尾（无尾换行）也接受
+        assert_eq!(
+            jsonl_line_from_window(&full[7..], 7, 8, 7, false).unwrap(),
+            b"{\"b\":2}".to_vec()
+        );
+        // offset 落在行中间（窗口首字节不是 \n）→ 会话已更新
+        assert_eq!(
+            jsonl_line_from_window(&full[1..], 1, 1, 5, true).unwrap_err(),
             STALE
+        );
+        // 行内容未以 \n 结束、其后也不是 \n / \r → 会话已更新
+        assert_eq!(
+            jsonl_line_from_window(b"\nCDX", 0, 1, 2, true).unwrap_err(),
+            STALE
+        );
+        // 窗口比声明的 len 短（远程短读防御）：报错不 panic
+        assert_eq!(
+            jsonl_line_from_window(b"ab", 0, 0, 7, true).unwrap_err(),
+            STALE
+        );
+        assert_eq!(
+            jsonl_line_from_window(b"", 7, 8, 4, false).unwrap_err(),
+            STALE
+        );
+    }
+
+    /// 远端图片白名单：三个会话根目录中缀内 + 位图扩展名才放行
+    #[test]
+    fn remote_image_allowed_matches_session_roots_only() {
+        // 三个远端会话根目录（claude 一个 + codex 两个）内的位图 → true
+        assert!(remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects/p1/img.png"
+        ));
+        assert!(remote_image_allowed(
+            "h1",
+            "/home/u/.codex/sessions/2026/01/rollout-dir/shot.jpg"
+        ));
+        assert!(remote_image_allowed(
+            "h1",
+            "/home/u/.codex/archived_sessions/2026/a/b.webp"
+        ));
+        // 扩展名大小写不敏感；HOME 形态不限 /home
+        assert!(remote_image_allowed(
+            "h1",
+            "/Users/carol/.claude/projects/p/IMG.PNG"
+        ));
+
+        // 根目录外 / 目录边界（projects-evil）/ 逃逸段 → false
+        assert!(!remote_image_allowed("h1", "/tmp/evil.png"));
+        assert!(!remote_image_allowed("h1", "/home/u/.config/screen.png"));
+        assert!(!remote_image_allowed("h1", "/home/u/.claude/projects-evil/a.png"));
+        assert!(!remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects/p/../../etc/passwd.png"
+        ));
+
+        // SVG 与非位图扩展名 → false（与本地 IMAGE_EXTENSIONS 同口径）
+        assert!(!remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects/p/diagram.svg"
+        ));
+        assert!(!remote_image_allowed(
+            "h1",
+            "/home/u/.claude/projects/p/notes.txt"
+        ));
+        assert!(!remote_image_allowed("h1", "/home/u/.claude/projects/p/noext"));
+    }
+
+    /// Ssh 图片加载：白名单 / SVG 检查在前（确定性文案），主机缺失就近报错
+    #[test]
+    fn remote_image_load_checks_whitelist_then_host() {
+        assert_eq!(
+            load_remote_image("h1", "/tmp/evil.png").unwrap_err(),
+            "图片不在会话项目或工具目录内，无法预览"
+        );
+        assert_eq!(
+            load_remote_image("h1", "/home/u/.claude/projects/a/x.svg").unwrap_err(),
+            "SVG 图片不直接显示"
+        );
+        // 白名单内但 host 不在 settings（不注入 sandbox，读取并发安全）
+        assert_eq!(
+            load_remote_image("cc-switch-test-no-host", "/home/u/.claude/projects/a/ok.png")
+                .unwrap_err(),
+            "SSH 主机不存在或已移除"
         );
     }
 }

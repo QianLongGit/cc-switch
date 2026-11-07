@@ -798,8 +798,6 @@ pub(crate) fn read_full_command(path: &str) -> String {
 
 /// `tail -c +<offset+1> '<path>' | head -c <len>`：字节区间拉取
 ///（0-based offset 换算为 `tail -c` 的 1-based 起点）。仅适用未压缩文件。
-// Task 9 接线分页后移除
-#[allow(dead_code)]
 pub(crate) fn read_range_command(path: &str, offset: u64, len: u64) -> String {
     format!(
         "tail -c +{} {} | head -c {}",
@@ -814,6 +812,54 @@ pub(crate) fn read_range_command(path: &str, offset: u64, len: u64) -> String {
 #[allow(dead_code)]
 pub(crate) fn delete_file_command(path: &str) -> String {
     format!("rm -f -- {}", escape_remote_path(path))
+}
+
+/* ===== 远程块读取与图片字节（Task 9）===== */
+
+/// zst 全解压后的内存取窗（纯函数）：`[offset, min(offset+len, 总长))`；
+/// offset 超过总长返回空切片。[`read_block`] 压缩路径的窗口语义与此严格一致。
+pub(crate) fn zst_window(decompressed: &[u8], offset: u64, len: u64) -> &[u8] {
+    let total = decompressed.len() as u64;
+    let start = offset.min(total) as usize;
+    let end = offset.saturating_add(len).min(total) as usize;
+    &decompressed[start..end]
+}
+
+/// 远端块内容读取（块全文分页的后端，`content::read_remote_jsonl_line` 调用）：
+/// - 未压缩：[`read_range_command`] 区间拉取；offset 超文件尾时远端自然返回短 / 空输出
+/// - 压缩（`.jsonl.zst`）：zst 帧无法远端随机定位——`cat` 全量压缩字节
+///   （上限与本地全文防护同口径 32MB）→ 本地全解压 → [`zst_window`] 内存取窗
+pub(crate) fn read_block(
+    host: &SshHostConfig,
+    remote_path: &str,
+    offset: u64,
+    len: u64,
+    compressed: bool,
+) -> Result<Vec<u8>, SshError> {
+    if !compressed {
+        return run_remote(
+            host,
+            &read_range_command(remote_path, offset, len),
+            FETCH_FULL_TIMEOUT,
+        );
+    }
+    let raw = run_remote(host, &read_full_command(remote_path), FETCH_FULL_TIMEOUT)?;
+    enforce_fetch_limit(raw.len() as u64, super::content::MAX_TEXT_BYTES)?;
+    let decompressed = zstd::stream::decode_all(raw.as_slice())
+        .map_err(|e| SshError::Local(format!("zstd 解压失败: {e}")))?;
+    Ok(zst_window(&decompressed, offset, len).to_vec())
+}
+
+/// 拉取远端文件全文字节（[`fetch_to_temp_file`] 的内存版，不落盘）：
+/// 超过 `max_bytes` 直接拒绝。远程图片等二进制小文件读取用。
+pub(crate) fn read_remote_bytes(
+    host: &SshHostConfig,
+    remote_path: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, SshError> {
+    let bytes = run_remote(host, &read_full_command(remote_path), FETCH_FULL_TIMEOUT)?;
+    enforce_fetch_limit(bytes.len() as u64, max_bytes)?;
+    Ok(bytes)
 }
 
 /* ===== 远程正文读取：全文拉取落临时文件 ===== */
@@ -1460,6 +1506,37 @@ mod tests {
         assert_eq!(
             read_range_command("/p/a.jsonl", 10, 100),
             "tail -c +11 '/p/a.jsonl' | head -c 100"
+        );
+    }
+
+    /* ===== 远程块读取：zst 内存取窗（Task 9）===== */
+
+    #[test]
+    fn zst_window_slices_decompressed_bytes() {
+        let text = numbered_lines(1, 100);
+        let bytes = text.as_bytes();
+        let total = bytes.len() as u64;
+        // 头窗 / 中窗与原文切片逐字节一致
+        assert_eq!(zst_window(bytes, 0, 10), &bytes[..10]);
+        assert_eq!(zst_window(bytes, 20, 15), &bytes[20..35]);
+        // len 超过解压尾：截到文件尾
+        assert_eq!(zst_window(bytes, total - 3, 1000), &bytes[bytes.len() - 3..]);
+        // offset 恰好落在文件尾：空窗（不越界）
+        assert!(zst_window(bytes, total, 10).is_empty());
+        // offset 超过解压尾：空窗
+        assert!(zst_window(bytes, total + 1, 10).is_empty());
+    }
+
+    #[test]
+    fn zst_window_matches_original_after_full_decode() {
+        // read_block 压缩路径核心语义：压缩字节 → 全解压 → 内存取窗 == 原文对应切片
+        let text = numbered_lines(1, 50);
+        let decompressed =
+            zstd::stream::decode_all(zstd_compress(&text).as_slice()).expect("decode");
+        assert_eq!(zst_window(&decompressed, 6, 6), b"line2\n");
+        assert_eq!(
+            zst_window(&decompressed, 0, decompressed.len() as u64),
+            text.as_bytes()
         );
     }
 
