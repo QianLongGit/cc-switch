@@ -414,6 +414,10 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
     if provider_id == "mcode" {
         return mcode::load_messages(source_path);
     }
+    // SSH 远程源：拉原始字节落临时文件，转交对应 provider 的本地解析入口
+    if source_path.starts_with("ssh:") {
+        return load_remote_messages(provider_id, source_path);
+    }
     // SQLite sessions use a "sqlite:" prefixed source_path
     if provider_id == "opencode" && source_path.starts_with("sqlite:") {
         return opencode::load_messages_sqlite(source_path);
@@ -438,6 +442,41 @@ pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<Session
         "dsh" => dsh::load_messages(path),
         _ => Err(format!("Unsupported provider: {provider_id}")),
     }
+}
+
+/// `ssh:` 源的正文读取（spec §5.4）：解析源 → settings 查主机 → ssh 全文
+/// 拉取落临时文件 → 按 provider 走本地解析入口 → 无论成败删除临时文件。
+///
+/// 分支保持薄：合法性已由 `content::validate_source` 三层校验前置保证，
+/// 这里仅做防御性兜底（绕过 validate 的直接调用、设置漂移时给出可读错误）。
+/// 注意入参 `raw` 即完整 `ssh:` 源（`load_transcript` 的 load 闭包传
+/// `load_path()` 的原样返回），不得二次拼接前缀。
+fn load_remote_messages(provider_id: &str, raw: &str) -> Result<Vec<SessionMessage>, String> {
+    let (host_id, remote_path) =
+        ssh::parse_ssh_source(raw).ok_or_else(|| "无效的 SSH 会话源".to_string())?;
+    let host = ssh_host_by_id(&host_id).ok_or_else(|| "SSH 主机不存在或已移除".to_string())?;
+    let temp = ssh::fetch_to_temp_file(&host, &remote_path, content::MAX_TEXT_BYTES)
+        .map_err(|e| format!("SSH 主机「{}」: {e}", host.label))?;
+
+    let parsed = match provider_id {
+        "claude" => claude::load_messages(&temp),
+        "codex" => codex::load_messages(&temp),
+        other => Err(format!("SSH 远程会话不支持该 provider: {other}")),
+    };
+    // 临时文件用后即删（uuid 命名不会复用，残留仅占磁盘）；删除失败仅告警
+    if let Err(e) = std::fs::remove_file(&temp) {
+        log::warn!("删除 SSH 临时文件失败 {}: {e}", temp.display());
+    }
+    parsed
+}
+
+/// 按 id 查设置中的 SSH 主机配置（找不到返回 None，由调用方给出可读错误）
+fn ssh_host_by_id(host_id: &str) -> Option<crate::settings::SshHostConfig> {
+    crate::settings::get_settings()
+        .ssh_hosts?
+        .iter()
+        .find(|host| host.id == host_id)
+        .cloned()
 }
 
 /// 一次读取的结果：解析结果、是否命中缓存、耗时（含校验与指纹）

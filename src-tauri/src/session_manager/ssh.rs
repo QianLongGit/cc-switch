@@ -12,6 +12,8 @@
 //! - [`head_tail_batch_command`] / [`parse_head_tail_output`]：批量头尾帧协议（哨兵标记分帧）
 //! - [`decode_zst_prefix`]：zst 压缩前缀的截断容忍解压
 //! - [`read_full_command`] / [`read_range_command`] / [`delete_file_command`]：全文 / 区间 / 删除命令
+//! - [`fetch_to_temp_file`]：全文拉取落临时文件（路径生成与上限检查拆出
+//!   [`temp_file_path`] / [`enforce_fetch_limit`] 纯函数，便于确定性测试）
 //! - [`home_dirs_command`] / [`parse_home_dirs`] / [`classify_remote_provider`] /
 //!   [`prefer_plain_entries`] / [`remote_head_tail_request`] / [`rebind_remote_meta`]：
 //!   远程扫描链路的清单归类与请求组装纯函数（由 `mod.rs::scan_remote_sessions` 编排）
@@ -61,13 +63,15 @@ pub(crate) enum SshError {
     Timeout,
     #[error("系统未安装 ssh")]
     SshUnavailable,
+    /// 本地侧失败（大小上限拦截、临时文件落盘失败等），文案即最终用户提示
+    #[error("{0}")]
+    Local(String),
 }
 
 /* ===== 路径转义 ===== */
 
 /// POSIX 单引号转义：整体包一层单引号，内部 `'` 替换为 `'\''`。
 /// 空串返回 `''`，保证语义为空参数而非缺参数。
-// 后续任务构造远端命令时接线，届时移除
 pub(crate) fn escape_remote_path(p: &str) -> String {
     let mut out = String::with_capacity(p.len() + 2);
     out.push('\'');
@@ -85,8 +89,6 @@ pub(crate) fn escape_remote_path(p: &str) -> String {
 /* ===== 二进制探测 ===== */
 
 /// 遍历 `PATH` 各段查找 ssh 可执行文件（Windows 找 `ssh.exe`），不引入新依赖。
-// 后续任务接线 UI 层后移除
-#[allow(dead_code)]
 pub(crate) fn ssh_binary_available() -> bool {
     let name = if cfg!(windows) { "ssh.exe" } else { "ssh" };
     let separator = if cfg!(windows) { ';' } else { ':' };
@@ -243,7 +245,6 @@ pub(crate) fn run_command(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>
 /* ===== 组合入口 ===== */
 
 /// 在指定主机上执行远端命令并取回 stdout。
-// 后续任务接线数据层后移除
 pub(crate) fn run_remote(
     host: &SshHostConfig,
     remote_cmd: &str,
@@ -791,8 +792,6 @@ pub(crate) fn rebind_remote_meta(
 /* ===== 远端原语：全文 / 区间 / 删除 ===== */
 
 /// `cat '<path>'`：全文拉取（大小上限由调用方把关）。
-// Task 6/9 接线后移除
-#[allow(dead_code)]
 pub(crate) fn read_full_command(path: &str) -> String {
     format!("cat {}", escape_remote_path(path))
 }
@@ -811,10 +810,81 @@ pub(crate) fn read_range_command(path: &str, offset: u64, len: u64) -> String {
 }
 
 /// `rm -f -- '<path>'`：删除远端文件（路径白名单由调用方把关）。
-// Task 8 接线删除后移除
+// Task 10 接线远程删除后移除
 #[allow(dead_code)]
 pub(crate) fn delete_file_command(path: &str) -> String {
     format!("rm -f -- {}", escape_remote_path(path))
+}
+
+/* ===== 远程正文读取：全文拉取落临时文件 ===== */
+
+/// 全文拉取超时：与扫描链路大文件口径（`REMOTE_LIST_TIMEOUT` 120s）一致
+const FETCH_FULL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 远端文件名的扩展名：`.jsonl.zst` 双段整体保留（codex 压缩形态），
+/// 其余取最后一段；无扩展名 / 隐藏文件（stem 为空）/ 空段 → 空串。
+fn remote_extension(remote_path: &str) -> String {
+    let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    if name
+        .strip_suffix(".jsonl.zst")
+        .is_some_and(|stem| !stem.is_empty())
+    {
+        return "jsonl.zst".to_string();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => ext.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 临时文件路径生成（纯函数；uuid 由调用方注入，便于确定性测试）：
+/// `<配置目录>/cache/ssh-tmp/<hostId>/<uuid>.<原扩展名>`，
+/// 无扩展名时文件名仅 uuid；host_id 作子目录实现跨主机隔离。
+pub(crate) fn temp_file_path(host_id: &str, remote_path: &str, uuid: &str) -> PathBuf {
+    let ext = remote_extension(remote_path);
+    let file_name = if ext.is_empty() {
+        uuid.to_string()
+    } else {
+        format!("{uuid}.{ext}")
+    };
+    crate::config::get_app_config_dir()
+        .join("cache")
+        .join("ssh-tmp")
+        .join(host_id)
+        .join(file_name)
+}
+
+/// 拉回字节数的大小上限检查：超限文案与本地全文防护
+/// （`content::TOO_LARGE_TEXT`，同一常量）逐字一致，本地与远程提示不分叉。
+pub(crate) fn enforce_fetch_limit(len: u64, max_bytes: u64) -> Result<(), SshError> {
+    if len > max_bytes {
+        return Err(SshError::Local(super::content::TOO_LARGE_TEXT.to_string()));
+    }
+    Ok(())
+}
+
+/// 拉取远端文件全文并落盘临时文件，返回本地路径喂给 provider 的 `&Path`
+/// 解析入口（`mod.rs::load_messages` 与 Task 9 区间读取复用）。
+///
+/// - `cat` 全文 + 120s 超时（与扫描链路大文件口径一致）
+/// - 字节数超 `max_bytes` → Err（文案与本地 32MB 防护一致）
+/// - 写入 `cache/ssh-tmp/<hostId>/<uuid>.<原扩展名>`，目录惰性创建；
+///   调用方用后自行删除（失败仅告警，不影响解析结果）
+pub(crate) fn fetch_to_temp_file(
+    host: &SshHostConfig,
+    remote_path: &str,
+    max_bytes: u64,
+) -> Result<PathBuf, SshError> {
+    let bytes = run_remote(host, &read_full_command(remote_path), FETCH_FULL_TIMEOUT)?;
+    enforce_fetch_limit(bytes.len() as u64, max_bytes)?;
+    let dest = temp_file_path(&host.id, remote_path, &uuid::Uuid::new_v4().to_string());
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SshError::Local(format!("创建 SSH 临时目录失败: {e}")))?;
+    }
+    std::fs::write(&dest, &bytes)
+        .map_err(|e| SshError::Local(format!("写入 SSH 临时文件失败: {e}")))?;
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -1390,6 +1460,80 @@ mod tests {
         assert_eq!(
             read_range_command("/p/a.jsonl", 10, 100),
             "tail -c +11 '/p/a.jsonl' | head -c 100"
+        );
+    }
+
+    /* ===== 远程正文读取：临时文件路径与上限（Task 8）===== */
+
+    #[test]
+    fn temp_path_keeps_double_segment_extension() {
+        let p = temp_file_path("h1", "/u/.codex/sessions/2026/rollout.jsonl.zst", "uid-1");
+        // `.jsonl.zst` 双段扩展整体保留：文件名 = <uuid>.jsonl.zst
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "uid-1.jsonl.zst");
+    }
+
+    #[test]
+    fn temp_path_plain_or_missing_extension() {
+        assert_eq!(
+            temp_file_path("h1", "/u/x.jsonl", "uid-2")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "uid-2.jsonl"
+        );
+        // 无扩展名：文件名仅 uuid
+        assert_eq!(
+            temp_file_path("h1", "/u/readme", "uid-3")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "uid-3"
+        );
+        // 隐藏文件（stem 为空）与点结尾的空扩展段都不算扩展名
+        assert_eq!(
+            temp_file_path("h1", "/u/.hidden", "uid-4")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "uid-4"
+        );
+        assert_eq!(
+            temp_file_path("h1", "/u/a.", "uid-5")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "uid-5"
+        );
+    }
+
+    #[test]
+    fn temp_path_isolates_hosts_under_ssh_tmp_cache() {
+        let root = crate::config::get_app_config_dir()
+            .join("cache")
+            .join("ssh-tmp");
+        let a = temp_file_path("host-a", "/u/x.jsonl", "uid");
+        let b = temp_file_path("host-b", "/u/x.jsonl", "uid");
+        // 根目录固定在配置目录 cache/ssh-tmp，host_id 作子目录跨主机隔离
+        assert!(a.starts_with(&root));
+        assert!(b.starts_with(&root));
+        assert!(a.parent().unwrap().ends_with("host-a"));
+        assert!(b.parent().unwrap().ends_with("host-b"));
+    }
+
+    #[test]
+    fn fetch_limit_boundary_and_message_match_local() {
+        const MAX: u64 = 32 * 1024 * 1024;
+        // 恰好等于上限：放行（与本地 read_limited 的 `>` 判定同口径）
+        assert!(enforce_fetch_limit(MAX, MAX).is_ok());
+        // 超一字节：拒绝，文案与本地 32MB 防护逐字一致（同一常量）
+        let err = enforce_fetch_limit(MAX + 1, MAX).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::session_manager::content::TOO_LARGE_TEXT
         );
     }
 

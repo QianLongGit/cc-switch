@@ -33,7 +33,8 @@ pub const MAX_PAGE_CHARS: u32 = 512 * 1024;
 const STALE: &str = "会话已更新，请重新读取";
 const NOT_TEXT: &str = "引用的内容不是文本";
 const OUTSIDE: &str = "引用的路径不在会话目录内";
-const TOO_LARGE_TEXT: &str = "内容超过 32MB，请直接打开源文件查看";
+/// 全文超过 32MB 的统一提示（本地读取与 SSH 远程拉取共用，文案不得分叉）
+pub(crate) const TOO_LARGE_TEXT: &str = "内容超过 32MB，请直接打开源文件查看";
 const TOO_LARGE_IMAGE: &str = "图片超过 20MB，无法预览";
 
 /// 本地图片允许的扩展名（SVG 单独拒绝：可能含脚本，前端只显示路径）

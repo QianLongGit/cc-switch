@@ -118,8 +118,6 @@ impl FileParseCache {
     /// 远端清单扫描：`(路径, mtime, len)` 由扫描清单供给而非本地文件系统，
     /// 缓存命中判定与本地 [`Self::scan_with_status`] 完全一致；解析失败的文件
     /// 同样不缓存、下一轮重试（远端任务的扫描状态由调用方聚合，这里只记日志）。
-    // Task 7 接线远端扫描任务后移除（当前仅测试调用）
-    #[allow(dead_code)]
     pub(crate) fn scan_remote<F>(
         &self,
         files: Vec<(PathBuf, Option<SystemTime>, u64)>,
