@@ -55,13 +55,19 @@ const REMOTE_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// `REMOTE_LIST_TIMEOUT` 同口径
 const REMOTE_USAGE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_USAGE_LIST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 轻同步单轮自动纳入的无游标新文件数上限：防异常大目录把每次自动刷新
+/// 变成全量首扫；超限文件保持 pending（peek 可见），后续轮次继续消化
+const REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT: usize = 20;
+/// 轻同步单轮自动纳入的新文件累计字节上限（语义同上，字节维度）
+const REMOTE_LIGHT_SYNC_NEW_BYTES_LIMIT: u64 = 50 * 1024 * 1024;
 
 /* ===== 进度载荷 ===== */
 
 /// 远程用量同步进度（事件 `remote-usage-sync-status` 的载荷，serde camelCase）。
 ///
 /// `totalFiles` 是本轮流扫的清单文件总数（含无变化快速跳过的）；
-/// `skipped` 是窗口外 / 超限 / 拉取或解析失败的文件计数；
+/// `skipped` 是窗口外 / 超限 / 轻同步单轮限额外的无游标文件 / 拉取或解析
+/// 失败的文件计数（限额外文件保持 pending，peek 可见、后续轮次消化）；
 /// `doneBytes` 是本轮实际拉回的字节数。peek 复用同一结构表达「待同步
 /// 文件数 / 待拉总字节」（`totalFiles` / `doneBytes`），不拉取不写库。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -312,6 +318,10 @@ pub(crate) fn sync_host_usage_with_io(
         .chain(files.codex.iter().map(|entry| ("codex", entry)))
         .collect();
 
+    // 轻同步自动首扫的限额账本（force 首扫不设限，拉全部窗口内文件）
+    let mut auto_new_files = 0usize;
+    let mut auto_new_bytes = 0u64;
+
     for (provider, entry) in all_files {
         if cancelled(cancel) {
             log::info!(
@@ -343,11 +353,21 @@ pub(crate) fn sync_host_usage_with_io(
 
         let key = remote_cursor_key(host_id, &entry.path);
         let cursor = cursors.get(&key);
-        // 首扫候选：无游标文件只在 force（手动首扫）时拉取，轻同步留给 peek 预告
+        // 轻同步的自动首扫门（spec §4.4 数据流第 1 条：新文件 → 自动对变化
+        // 文件执行增量拉取）：无游标且窗口内、≤32MB 的新文件直接纳入本轮；
+        // 单轮限额（≤20 个 / 累计 ≤50MB）防大目录把自动刷新变成全量首扫，
+        // 超限的保持 pending（计入 skipped，peek 可见），手动 force 兜底
         if cursor.is_none() && !force {
-            status.done_files += 1;
-            progress(&status);
-            continue;
+            if auto_new_files >= REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT
+                || auto_new_bytes.saturating_add(entry.size) > REMOTE_LIGHT_SYNC_NEW_BYTES_LIMIT
+            {
+                status.skipped += 1;
+                status.done_files += 1;
+                progress(&status);
+                continue;
+            }
+            auto_new_files += 1;
+            auto_new_bytes += entry.size;
         }
 
         let outcome = match provider {
@@ -1078,27 +1098,118 @@ mod tests {
         assert_eq!(rows_with_source(&db, "ssh:h1").len(), 2, "增量行应入库");
     }
 
-    // 新文件：轻同步不拉（首扫候选留给 peek 预告 + 手动 force）
+    // 新文件（spec §4.4 数据流第 1 条）：已同步主机的清单中出现新增文件时，
+    // 轻同步（force=false）自动拉取入库并建游标——统计不再静默停留
     #[test]
     #[serial]
-    fn new_file_waits_for_force_scan() {
+    fn new_file_is_auto_ingested_in_light_sync() {
         let db = Database::memory().unwrap();
-        let path = claude_path("c");
+        let path_a = claude_path("c-a");
+        let path_b = claude_path("c-b");
         let mut io = FakeRemote::new();
-        io.upsert(&path, claude_line("msg_c1", 5).as_bytes(), fresh_mtime());
+        io.upsert(&path_a, claude_line("msg_c1", 5).as_bytes(), fresh_mtime());
+        sync(&db, &mut io, true);
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
 
+        // 已同步主机清单中出现新增文件：自动刷新 / 手动增量（均轻同步）覆盖
+        io.upsert(
+            &path_b,
+            claude_line("msg_c2", 6).as_bytes(),
+            fresh_mtime() + 1_000,
+        );
         let light = sync(&db, &mut io, false);
-        assert_eq!(light.done_bytes, 0, "轻同步不拉无游标文件");
-        assert!(io.range_calls.is_empty(), "轻同步零拉取");
-        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 0);
+        assert!(light.done_bytes > 0, "轻同步应拉取新增文件");
+        assert_eq!(light.skipped, 0);
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 2, "新增文件应入库");
         assert!(
-            cursor_of(&db, &remote_cursor_key(HOST_ID, &path)).is_none(),
-            "轻同步不为无游标文件建游标"
+            cursor_of(&db, &remote_cursor_key(HOST_ID, &path_b)).is_some(),
+            "轻同步为新文件建游标"
+        );
+    }
+
+    // 单轮自动拉取上限：21 个无游标文件轻同步只拉 20 个，超限的保持
+    // pending（skipped 计数 + 无游标），后续轮次限额释放后继续消化
+    #[test]
+    #[serial]
+    fn light_sync_caps_new_files_per_round() {
+        let db = Database::memory().unwrap();
+        let mut io = FakeRemote::new();
+        let mut paths = Vec::new();
+        for i in 0..=REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT {
+            let path = claude_path(&format!("cap-{i:02}"));
+            io.upsert(
+                &path,
+                claude_line(&format!("msg_cap_{i}"), 5).as_bytes(),
+                fresh_mtime(),
+            );
+            paths.push(path);
+        }
+
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.skipped, 1, "超出单轮上限的新文件计入 skipped");
+        assert_eq!(
+            rows_with_source(&db, "ssh:h1").len(),
+            REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT,
+            "本轮只拉取上限个数的新文件"
+        );
+        let pending = &paths[REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT];
+        assert!(
+            cursor_of(&db, &remote_cursor_key(HOST_ID, pending)).is_none(),
+            "超限文件保持无游标（pending），等待后续轮次"
         );
 
-        let forced = sync(&db, &mut io, true);
-        assert!(forced.done_bytes > 0, "force 首扫应拉取");
-        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
+        // 下一轮轻同步：已建游标的走 unchanged，剩余 pending 在限额内消化
+        let next = sync(&db, &mut io, false);
+        assert_eq!(next.skipped, 0);
+        assert_eq!(
+            rows_with_source(&db, "ssh:h1").len(),
+            REMOTE_LIGHT_SYNC_NEW_FILE_LIMIT + 1
+        );
+    }
+
+    // 单轮字节上限：待纳入新文件的累计字节超过 50MB 后，后续新文件本轮
+    // 不拉（防异常大目录把每次自动刷新变成全量首扫）
+    #[test]
+    #[serial]
+    fn light_sync_caps_new_file_bytes_per_round() {
+        let db = Database::memory().unwrap();
+        let mut io = FakeRemote::new();
+        // 两个 (LIMIT/2 + 1)B 文件：第一个纳入后，第二个累计超 50MB 被挡
+        let half = (REMOTE_LIGHT_SYNC_NEW_BYTES_LIMIT / 2 + 1) as usize;
+        io.upsert(&claude_path("big-1"), &vec![0u8; half], fresh_mtime());
+        io.upsert(&claude_path("big-2"), &vec![0u8; half], fresh_mtime());
+
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.skipped, 1, "累计字节超限的新文件计入 skipped");
+        assert_eq!(status.done_bytes, half as u64, "只拉了第一个大文件");
+        assert!(
+            cursor_of(&db, &remote_cursor_key(HOST_ID, &claude_path("big-2"))).is_none(),
+            "字节超限文件保持 pending"
+        );
+    }
+
+    // 32MB 上限对轻同步同样生效：超限新文件零拉取、不建游标（与 force
+    // 首扫同门，防单轮自动刷新被异常大文件拖垮）
+    #[test]
+    #[serial]
+    fn light_sync_skips_oversize_new_file() {
+        let db = Database::memory().unwrap();
+        let path = claude_path("light-big");
+        let mut io = FakeRemote::new();
+        io.upsert(
+            &path,
+            &vec![0u8; (REMOTE_USAGE_MAX_FILE_BYTES + 1) as usize],
+            fresh_mtime(),
+        );
+
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.skipped, 1);
+        assert_eq!(status.done_bytes, 0);
+        assert!(io.range_calls.is_empty(), "超限文件不应发起拉取");
+        assert!(
+            cursor_of(&db, &remote_cursor_key(HOST_ID, &path)).is_none(),
+            "超限文件不建游标"
+        );
     }
 
     /* ===== 消失态 ===== */
