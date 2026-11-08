@@ -1865,6 +1865,8 @@ pub fn run() {
             commands::sync_remote_usage,
             commands::cancel_remote_usage_sync,
             commands::peek_remote_usage,
+            commands::reset_remote_usage,
+            commands::purge_remote_host_data,
             // Session usage sync
             commands::sync_session_usage,
             commands::rebuild_codex_usage,

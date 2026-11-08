@@ -1148,7 +1148,7 @@
     },
     "sshHosts": {
       "blockTitle": "SSH Remote Hosts",
-      "help": "Manage the remote machines offered by the session page host switcher. Import from ~/.ssh/config or add manually; deleting a host keeps its cached remote sessions, which become viewable again once you re-add it.",
+      "help": "Manage the remote machines offered by the session page host switcher. Import from ~/.ssh/config or add manually; deleting a host also clears its local usage data and session caches.",
       "add": "Add Host",
       "addTitle": "Add SSH Host",
       "addDescription": "Import existing hosts from ~/.ssh/config, or fill in a new host manually.",
@@ -1181,7 +1181,9 @@
       "editDescription": "Change this host's name, address, and connection settings.",
       "delete": "Delete",
       "deleteTitle": "Delete host \"{{label}}\"?",
-      "deleteLead": "Removes the host from this list only; its cached remote sessions are kept and viewable again once you re-add the same host.",
+      "deleteLead": "The host will be removed from this list along with its connection settings.",
+      "deletePurgeNote": "Its local usage data and session caches will also be cleared; files on the remote machine are unaffected and can be re-synced after re-adding.",
+      "purgeFailed": "Data cleanup did not fully succeed: {{error}}",
       "deleteConfirm": "Delete Host",
       "badId": "Host ID contains the illegal character \"/\"; save cancelled",
       "addedToast": "Added {{count}} host(s)",
@@ -2545,7 +2547,15 @@
       "tipOff": "Auto scan is off. Click to sync now"
     },
     "hostSelector": {
-      "hint": "Switch stats host: remote usage is synced over SSH for local aggregation"
+      "hint": "Switch stats host: remote usage is synced over SSH for local aggregation",
+      "resetEntry": {
+        "entry": "Reset host data…",
+        "confirmTitle": "Reset usage data for \"{{label}}\"?",
+        "confirmBody": "This deletes all usage data and sync progress stored on this computer for the host. Files on the remote machine are unaffected; you can re-sync to rebuild them.",
+        "confirmAction": "Reset data",
+        "successToast": "Cleared {{details}} detail rows / {{rollups}} daily rollups; usage data reset",
+        "failed": "Failed to reset usage data: {{error}}"
+      }
     },
     "remoteSync": {
       "firstSyncPreview": "First sync will fetch {{files}} files / about {{size}}",

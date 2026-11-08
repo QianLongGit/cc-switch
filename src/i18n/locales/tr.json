@@ -1130,7 +1130,7 @@
     },
     "sshHosts": {
       "blockTitle": "SSH Uzak Sunucuları",
-      "help": "Oturum sayfasındaki sunucu değiştiricide kullanılacak uzak makineleri yönetin. ~/.ssh/config dosyasından içe aktarabilir veya elle ekleyebilirsiniz. Bir sunucuyu silmek önbelleğe alınmış uzak oturumlarını silmez; yeniden eklediğinizde geri görünür.",
+      "help": "Oturum sayfasındaki sunucu değiştiricide kullanılacak uzak makineleri yönetin. ~/.ssh/config dosyasından içe aktarabilir veya elle ekleyebilirsiniz. Bir sunucuyu silmek, yerel kullanım verilerini ve oturum önbelleklerini de temizler.",
       "add": "Sunucu Ekle",
       "addTitle": "SSH Sunucusu Ekle",
       "addDescription": "Mevcut sunucuları ~/.ssh/config'ten içe aktarın veya yeni bir sunucuyu elle girin.",
@@ -1163,7 +1163,9 @@
       "editDescription": "Bu sunucunun adını, adresini ve bağlantı ayarlarını değiştirin.",
       "delete": "Sil",
       "deleteTitle": "\"{{label}}\" sunucusu silinsin mi?",
-      "deleteLead": "Yalnızca listeden kaldırılır; bu sunucunun uzak oturum önbelleği korunur ve aynı sunucu yeniden eklendiğinde tekrar görüntülenebilir.",
+      "deleteLead": "Bu sunucu, bağlantı ayarlarıyla birlikte listeden kaldırılır.",
+      "deletePurgeNote": "Yerel kullanım verileri ve oturum önbellekleri de temizlenir; uzak makinedeki dosyalar etkilenmez, yeniden ekledikten sonra yeniden eşitleyebilirsiniz.",
+      "purgeFailed": "Veri temizliği tam olarak başarılı olmadı: {{error}}",
       "deleteConfirm": "Sunucuyu Sil",
       "badId": "Sunucu kimliğinde geçersiz \"/\" karakteri var, kaydetme iptal edildi",
       "addedToast": "{{count}} sunucu eklendi",
@@ -2498,7 +2500,15 @@
       "tip": "Şimdi eşitlemek için tıklayın"
     },
     "hostSelector": {
-      "hint": "İstatistik sunucusunu değiştir: uzak kullanım SSH ile yerelde toplanmak üzere eşitlenir"
+      "hint": "İstatistik sunucusunu değiştir: uzak kullanım SSH ile yerelde toplanmak üzere eşitlenir",
+      "resetEntry": {
+        "entry": "Bu sunucunun verilerini sıfırla…",
+        "confirmTitle": "\"{{label}}\" kullanım verileri sıfırlansın mı?",
+        "confirmBody": "Bu sunucu için yerelde eşitlenen tüm kullanım verileri ve eşitleme ilerlemesi silinir. Uzak makinedeki dosyalar etkilenmez; daha sonra yeniden eşitleyerek yeniden oluşturabilirsiniz.",
+        "confirmAction": "Verileri sıfırla",
+        "successToast": "{{details}} ayrıntı / {{rollups}} günlük özet satırı silindi; kullanım verileri sıfırlandı",
+        "failed": "Kullanım verileri sıfırlanamadı: {{error}}"
+      }
     },
     "remoteSync": {
       "firstSyncPreview": "İlk eşitleme {{files}} dosya / yaklaşık {{size}} çekecek",

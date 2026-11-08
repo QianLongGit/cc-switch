@@ -10,14 +10,28 @@ import {
   sshHostFormSchema,
 } from "./SshHostsSection";
 
+// purge 走 usageApi（Task B 删除主机连带清理）；toast mock 供警告断言
+const toastWarning = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/toast", () => ({
+  toast: { warning: toastWarning, success: vi.fn(), error: vi.fn() },
+}));
+
 vi.mock("@/lib/api", () => ({
   sessionsApi: {
     listSshConfigHosts: vi.fn(async () => [] as SshConfigHost[]),
     testSshHost: vi.fn(async () => true),
   },
+  usageApi: {
+    purgeRemoteHostData: vi.fn(async () => ({
+      deletedDetails: 0,
+      deletedRollups: 0,
+      deletedCursors: 0,
+      deletedDedup: 0,
+    })),
+  },
 }));
 
-import { sessionsApi } from "@/lib/api";
+import { sessionsApi, usageApi } from "@/lib/api";
 
 // ============================================================================
 // SSH 主机管理分区：zod schema / 导入匹配归一 / 组件渲染三层。
@@ -238,9 +252,10 @@ describe("SshHostsSection", () => {
     const { onAutoSave } = renderSection(HOSTS);
     await user.click(screen.getAllByRole("button", { name: /^删除$/ })[0]);
 
-    // 确认框先出现（含缓存保留提示），未确认前不提交
+    // 确认框先出现（含连带清理提示），未确认前不 purge 不提交
     const dialog = screen.getByRole("alertdialog");
-    expect(within(dialog).getByText(/远程会话缓存/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/会话缓存/)).toBeInTheDocument();
+    expect(usageApi.purgeRemoteHostData).not.toHaveBeenCalled();
     expect(onAutoSave).not.toHaveBeenCalled();
 
     await user.click(within(dialog).getByRole("button", { name: /删除主机/ }));
@@ -248,6 +263,88 @@ describe("SshHostsSection", () => {
       expect(onAutoSave).toHaveBeenCalledWith({
         sshHosts: [{ id: "h2", label: "NAS", host: "nas.local" }],
       }),
+    );
+  });
+});
+
+// ─── 删除主机连带清理（Task B：purge → save_settings 顺序锁定） ─────────────
+
+describe("SshHostsSection 删除主机连带清理", () => {
+  beforeEach(() => {
+    vi.mocked(usageApi.purgeRemoteHostData).mockResolvedValue({
+      deletedDetails: 7,
+      deletedRollups: 4,
+      deletedCursors: 3,
+      deletedDedup: 2,
+    });
+    toastWarning.mockClear();
+  });
+
+  /** 走完删除确认流程，返回按发生顺序记录的调用日志（purge / save 各记一笔） */
+  const deleteFirstHost = async () => {
+    const calls: string[] = [];
+    // 包装而非覆盖用例先设好的实现（resolve / reject 都照跑），只加调用记录
+    const purge = vi.mocked(usageApi.purgeRemoteHostData);
+    const impl =
+      purge.getMockImplementation() ??
+      (async () => ({
+        deletedDetails: 0,
+        deletedRollups: 0,
+        deletedCursors: 0,
+        deletedDedup: 0,
+      }));
+    purge.mockImplementation(async (id: string) => {
+      calls.push(`purge:${id}`);
+      return impl(id);
+    });
+    const onAutoSave = vi.fn(async (updates: Partial<SettingsFormState>) => {
+      calls.push(
+        `save:${
+          (updates as { sshHosts?: SshHostConfig[] }).sshHosts
+            ?.map((h) => h.id)
+            .join(",") ?? ""
+        }`,
+      );
+      return true;
+    });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SshHostsSection
+          settings={baseSettings(HOSTS)}
+          onAutoSave={onAutoSave}
+        />
+      </QueryClientProvider>,
+    );
+
+    const user = userEvent.setup();
+    await user.click(screen.getAllByRole("button", { name: /^删除$/ })[0]);
+    const dialog = screen.getByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: /删除主机/ }));
+    await waitFor(() => expect(onAutoSave).toHaveBeenCalled());
+    return calls;
+  };
+
+  it("确认删除：先 purge_remote_host_data(hostId) 再 save_settings（顺序锁定）", async () => {
+    const calls = await deleteFirstHost();
+    // purge 必须先行：后端按 settings 校验主机存在，save 先行会让 purge 拒绝执行
+    expect(calls).toEqual(["purge:h1", "save:h2"]);
+  });
+
+  it("purge 失败也继续删除主机：save_settings 照常提交，仅 toast 警告", async () => {
+    vi.mocked(usageApi.purgeRemoteHostData).mockRejectedValue(
+      new Error("数据库被占用"),
+    );
+    const calls = await deleteFirstHost();
+
+    // purge 仍先于 save 发生（失败被吞），删除主机的意图不被清理失败阻断
+    expect(calls).toEqual(["purge:h1", "save:h2"]);
+    await waitFor(() =>
+      expect(toastWarning).toHaveBeenCalledWith(
+        expect.stringContaining("数据清理未完全成功"),
+      ),
     );
   });
 });

@@ -317,6 +317,12 @@ impl TranscriptCache {
             .retain(|entry| !(entry.key.0 == provider_id && entry.key.1 == source_path));
     }
 
+    /// 按源路径前缀批量清除（purge SSH 主机数据时清 `ssh:<hostId>/` 前缀的
+    /// 远程会话条目）；本机与其余主机的条目路径不带此前缀，原样保留。
+    pub fn remove_source_prefix(&self, prefix: &str) {
+        self.lock().retain(|entry| !entry.key.1.starts_with(prefix));
+    }
+
     /// Release retained bodies in lightweight mode. Check the flag under the
     /// same lock in insert so an already-running parser cannot refill the cache.
     /// Existing readers keep their Arc until their current operation finishes.

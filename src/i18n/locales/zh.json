@@ -1148,7 +1148,7 @@
     },
     "sshHosts": {
       "blockTitle": "SSH 远程主机",
-      "help": "配置会话页主机切换可用的远程机器。可从 ~/.ssh/config 导入或手动添加；删除主机不会清除它的远程会话缓存，重新添加后仍可查看。",
+      "help": "配置会话页主机切换可用的远程机器。可从 ~/.ssh/config 导入或手动添加；删除主机会一并清理它的本地用量数据与会话缓存。",
       "add": "添加主机",
       "addTitle": "添加 SSH 主机",
       "addDescription": "从 ~/.ssh/config 导入已有主机，或手动填写一台新主机。",
@@ -1181,7 +1181,9 @@
       "editDescription": "修改该主机的名称、地址与连接参数。",
       "delete": "删除",
       "deleteTitle": "删除主机「{{label}}」？",
-      "deleteLead": "仅从列表移除该主机；它的远程会话缓存会保留，重新添加同一主机后可再次查看。",
+      "deleteLead": "该主机将从列表移除，连接配置一并清除。",
+      "deletePurgeNote": "将同时清理该主机的本地用量数据与会话缓存；远端文件不受影响，重新添加后可重新同步。",
+      "purgeFailed": "数据清理未完全成功：{{error}}",
       "deleteConfirm": "删除主机",
       "badId": "主机 ID 含非法字符 “/”，已取消保存",
       "addedToast": "已添加 {{count}} 台主机",
@@ -2545,7 +2547,15 @@
       "tipOff": "自动扫描已关闭，点击立即同步"
     },
     "hostSelector": {
-      "hint": "切换统计主机：远程主机的用量经 SSH 增量同步到本地统计"
+      "hint": "切换统计主机：远程主机的用量经 SSH 增量同步到本地统计",
+      "resetEntry": {
+        "entry": "重置该主机数据…",
+        "confirmTitle": "重置「{{label}}」的用量数据？",
+        "confirmBody": "将删除该主机已同步到本地的全部用量数据与同步进度，远端文件不受影响。之后可重新同步重建。",
+        "confirmAction": "重置数据",
+        "successToast": "已清理 {{details}} 条明细 / {{rollups}} 条汇总，用量数据已重置",
+        "failed": "重置用量数据失败：{{error}}"
+      }
     },
     "remoteSync": {
       "firstSyncPreview": "首次同步需拉取 {{files}} 个文件 / 约 {{size}}",

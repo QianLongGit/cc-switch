@@ -5,7 +5,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { Check, Loader2, Pencil, PlugZap, Plus, Trash2, X } from "lucide-react";
-import { sessionsApi } from "@/lib/api";
+import { sessionsApi, usageApi } from "@/lib/api";
 import { toast } from "@/lib/toast";
 import { generateUUID } from "@/utils/uuid";
 import type { SettingsFormState } from "@/hooks/useSettings";
@@ -642,6 +642,19 @@ export function SshHostsSection({
     if (!deletingHost) return;
     const removed = deletingHost;
     setDeletingHost(null);
+    // 顺序锁定：先 purge 再 save_settings——两命令都按 settings 校验主机
+    // 存在，save 先行会让 purge 拒绝执行（主机已不在清单），本地数据残留
+    try {
+      await usageApi.purgeRemoteHostData(removed.id);
+    } catch (error) {
+      // purge 是尽力清理：用户已确认删除意图，失败仅警告、不阻断删除主机
+      toast.warning(
+        t("settings.sshHosts.purgeFailed", {
+          defaultValue: "数据清理未完全成功：{{error}}",
+          error: String(error),
+        }),
+      );
+    }
     const saved = await commitHosts(
       hosts.filter((host) => host.id !== removed.id),
     );
@@ -666,7 +679,7 @@ export function SshHostsSection({
         }),
         body: t("settings.sshHosts.help", {
           defaultValue:
-            "配置会话页主机切换可用的远程机器。可从 ~/.ssh/config 导入或手动添加；删除主机不会清除它的远程会话缓存，重新添加后仍可查看。",
+            "配置会话页主机切换可用的远程机器。可从 ~/.ssh/config 导入或手动添加；删除主机会一并清理它的本地用量数据与会话缓存。",
         }),
       }}
       actions={
@@ -763,7 +776,8 @@ export function SshHostsSection({
         onEdit={handleEdit}
       />
 
-      {/* 删除确认：会话缓存保留是承诺过的行为，说清楚再动手 */}
+      {/* 删除确认：连带清理是破坏性副作用（本地用量数据 + 会话缓存），
+          说明清楚再动手；确认后走 purge → save_settings（见 confirmDelete） */}
       <Dialog
         open={!!deletingHost}
         onOpenChange={(next) => !next && setDeletingHost(null)}
@@ -778,8 +792,12 @@ export function SshHostsSection({
             </DialogTitle>
             <DialogDescription>
               {t("settings.sshHosts.deleteLead", {
+                defaultValue: "该主机将从列表移除，连接配置一并清除。",
+              })}
+              <br />
+              {t("settings.sshHosts.deletePurgeNote", {
                 defaultValue:
-                  "仅从列表移除该主机；它的远程会话缓存会保留，重新添加同一主机后可再次查看。",
+                  "将同时清理该主机的本地用量数据与会话缓存；远端文件不受影响，重新添加后可重新同步。",
               })}
             </DialogDescription>
           </DialogHeader>
