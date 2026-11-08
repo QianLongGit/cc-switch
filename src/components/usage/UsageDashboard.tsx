@@ -330,6 +330,9 @@ export function UsageDashboard({
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false);
   const [rebuildingCodex, setRebuildingCodex] = useState(false);
   const [syncingSession, setSyncingSession] = useState(false);
+  // 重置该主机用量数据（危险操作）：入口在主机菜单底部，确认后才执行
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [lastManualSyncAt, setLastManualSyncAt] = useState(
     lastManualSessionSyncAt,
   );
@@ -530,6 +533,35 @@ export function UsageDashboard({
       setRemoteSyncing(false);
       setRemoteProgress(null);
       await queryClient.invalidateQueries({ queryKey: usageKeys.all });
+    }
+  };
+
+  // ── 重置该主机用量数据（设计 §4.4）─────────────────────────────────────
+  // 清空该主机本地镜像四表（明细 / 汇总 / 游标 / 去重），远端文件不受影响；
+  // 成功后失效 usage 全系查询，页面自然回到首扫预告态（peek 重新统计）
+  const resetTargetLabel =
+    settings?.sshHosts?.find((host) => host.id === remoteHostId)?.label ??
+    remoteHostId ??
+    "";
+  const resetRemoteData = async () => {
+    if (!remoteHostId || resetting) return;
+    setResetting(true);
+    try {
+      const summary = await usageApi.resetRemoteUsage(remoteHostId);
+      await queryClient.invalidateQueries({ queryKey: usageKeys.all });
+      toast.success(
+        t("usage.hostSelector.resetEntry.successToast", {
+          details: summary.deletedDetails,
+          rollups: summary.deletedRollups,
+        }),
+      );
+    } catch (error) {
+      toast.error(
+        t("usage.hostSelector.resetEntry.failed", { error: String(error) }),
+      );
+    } finally {
+      setResetting(false);
+      setShowResetConfirm(false);
     }
   };
 
@@ -804,13 +836,21 @@ export function UsageDashboard({
       />
       <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
       {/* 主机切换：本机 / 远程 SSH 主机；没配主机时整块不渲染。
-          悬停说明走 triggerHint 由组件自己挂：菜单展开期间自动收起，不遮挡列表 */}
+          悬停说明走 triggerHint 由组件自己挂：菜单展开期间自动收起，不遮挡列表；
+          重置入口随菜单走（本机态组件内部不渲染），不占常驻空间 */}
       {(settings?.sshHosts?.length ?? 0) > 0 && (
         <SessionHostMenu
           hostId={hostId}
           sshHosts={settings?.sshHosts}
           onSelect={setHostId}
           triggerHint={t("usage.hostSelector.hint")}
+          dangerEntry={{
+            label: t("usage.hostSelector.resetEntry.entry"),
+            onTrigger: () => setShowResetConfirm(true),
+            // 同步进行中禁用：重置清表与 sync 的增量写入并发会互相打架，
+            // 等 sync 收尾（进度条消失）再重置才能干净回到首扫预告态
+            disabled: remoteSyncing,
+          }}
         />
       )}
       {remoteSyncBar}
@@ -1247,6 +1287,18 @@ export function UsageDashboard({
           zIndex="top"
           onConfirm={() => void rebuildCodexUsage()}
           onCancel={() => setShowRebuildConfirm(false)}
+        />
+        {/* 重置该主机用量数据：本地镜像清空不可撤销，走红色危险确认 */}
+        <ConfirmDialog
+          isOpen={showResetConfirm}
+          title={t("usage.hostSelector.resetEntry.confirmTitle", {
+            label: resetTargetLabel,
+          })}
+          message={t("usage.hostSelector.resetEntry.confirmBody")}
+          confirmText={t("usage.hostSelector.resetEntry.confirmAction")}
+          pending={resetting}
+          onConfirm={() => void resetRemoteData()}
+          onCancel={() => setShowResetConfirm(false)}
         />
       </div>
     </UsageHostProvider>

@@ -167,3 +167,74 @@ describe("SessionHostMenu", () => {
     );
   });
 });
+
+// ─── dangerEntry（用量页「重置该主机数据」入口） ────────────────────────────
+
+describe("SessionHostMenu dangerEntry", () => {
+  it("选中远程主机时菜单底部出现危险项；点击回调收到当前主机 id", async () => {
+    vi.mocked(sessionsApi.checkSshAvailability).mockResolvedValue(true);
+    const user = userEvent.setup();
+    const onTrigger = vi.fn();
+    renderMenu({
+      hostId: "h1",
+      dangerEntry: { label: "重置该主机数据…", onTrigger },
+    });
+
+    await user.click(screen.getByRole("button", { name: /build-box/ }));
+    await user.click(screen.getByRole("menuitem", { name: /重置该主机数据/ }));
+
+    expect(onTrigger).toHaveBeenCalledWith("h1");
+  });
+
+  it("本机态（hostId=null）不渲染危险项", async () => {
+    vi.mocked(sessionsApi.checkSshAvailability).mockResolvedValue(true);
+    const user = userEvent.setup();
+    renderMenu({
+      dangerEntry: { label: "重置该主机数据…", onTrigger: vi.fn() },
+    });
+
+    await user.click(screen.getByRole("button", { name: /本机/ }));
+    expect(screen.queryByRole("menuitem", { name: /重置/ })).toBeNull();
+  });
+
+  it("选中主机已被删除（不在清单）时同样不渲染危险项", async () => {
+    vi.mocked(sessionsApi.checkSshAvailability).mockResolvedValue(true);
+    const user = userEvent.setup();
+    renderMenu({
+      hostId: "gone",
+      dangerEntry: { label: "重置该主机数据…", onTrigger: vi.fn() },
+    });
+
+    await user.click(screen.getByRole("button", { name: /本机/ }));
+    expect(screen.queryByRole("menuitem", { name: /重置/ })).toBeNull();
+  });
+
+  it("未传 dangerEntry 时菜单保持原状（不渲染分隔线与条目）", async () => {
+    vi.mocked(sessionsApi.checkSshAvailability).mockResolvedValue(true);
+    const user = userEvent.setup();
+    renderMenu({ hostId: "h1" });
+
+    await user.click(screen.getByRole("button", { name: /build-box/ }));
+    expect(screen.queryByRole("menuitem", { name: /重置/ })).toBeNull();
+  });
+
+  it("dangerEntry.disabled 时菜单项禁用，点击不触发回调", async () => {
+    vi.mocked(sessionsApi.checkSshAvailability).mockResolvedValue(true);
+    const user = userEvent.setup();
+    const onTrigger = vi.fn();
+    renderMenu({
+      hostId: "h1",
+      dangerEntry: {
+        label: "重置该主机数据…",
+        onTrigger,
+        disabled: true,
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: /build-box/ }));
+    const item = screen.getByRole("menuitem", { name: /重置该主机数据/ });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    await user.click(item);
+    expect(onTrigger).not.toHaveBeenCalled();
+  });
+});

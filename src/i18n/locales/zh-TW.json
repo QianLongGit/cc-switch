@@ -1149,7 +1149,7 @@
     },
     "sshHosts": {
       "blockTitle": "SSH 遠端主機",
-      "help": "設定工作階段頁主機切換可用的遠端機器。可從 ~/.ssh/config 匯入或手動新增；刪除主機不會清除它的遠端工作階段快取，重新新增後仍可檢視。",
+      "help": "設定工作階段頁主機切換可用的遠端機器。可從 ~/.ssh/config 匯入或手動新增；刪除主機會一併清理它的本機用量資料與工作階段快取。",
       "add": "新增主機",
       "addTitle": "新增 SSH 主機",
       "addDescription": "從 ~/.ssh/config 匯入已有主機，或手動填寫一台新主機。",
@@ -1182,7 +1182,9 @@
       "editDescription": "修改該主機的名稱、位址與連線參數。",
       "delete": "刪除",
       "deleteTitle": "刪除主機「{{label}}」？",
-      "deleteLead": "僅從列表移除該主機；它的遠端工作階段快取會保留，重新新增同一主機後可再次檢視。",
+      "deleteLead": "該主機將從列表移除，連線設定一併清除。",
+      "deletePurgeNote": "將同時清理該主機的本機用量資料與工作階段快取；遠端檔案不受影響，重新新增後可重新同步。",
+      "purgeFailed": "資料清理未完全成功：{{error}}",
       "deleteConfirm": "刪除主機",
       "badId": "主機 ID 含非法字元「/」，已取消儲存",
       "addedToast": "已新增 {{count}} 台主機",
@@ -2546,7 +2548,15 @@
       "tipOff": "自動掃描已關閉，點擊立即同步"
     },
     "hostSelector": {
-      "hint": "切換統計主機：遠端主機的用量經 SSH 增量同步到本機統計"
+      "hint": "切換統計主機：遠端主機的用量經 SSH 增量同步到本機統計",
+      "resetEntry": {
+        "entry": "重設該主機資料…",
+        "confirmTitle": "重設「{{label}}」的用量資料？",
+        "confirmBody": "將刪除該主機已同步到本機的全部用量資料與同步進度，遠端檔案不受影響。之後可重新同步重建。",
+        "confirmAction": "重設資料",
+        "successToast": "已清理 {{details}} 條明細 / {{rollups}} 條彙總，用量資料已重設",
+        "failed": "重設用量資料失敗：{{error}}"
+      }
     },
     "remoteSync": {
       "firstSyncPreview": "首次同步需拉取 {{files}} 個檔案 / 約 {{size}}",

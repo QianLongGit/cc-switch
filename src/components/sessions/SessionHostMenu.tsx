@@ -19,6 +19,18 @@ import { sessionMenuItemClass } from "./SessionItem";
 /** 本机 ssh 二进制装没装在一次运行里不会变，查一次就够 */
 const SSH_AVAILABILITY_KEY = ["sshAvailability"] as const;
 
+/**
+ * 菜单底部的危险操作入口（如用量页的「重置该主机数据…」）。
+ * 仅选中有效远程主机时渲染；label 由调用方传入（i18n 归调用方命名空间）。
+ */
+export interface SessionHostMenuDangerEntry {
+  label: React.ReactNode;
+  /** 点击后回传当前选中的主机 id */
+  onTrigger: (hostId: string) => void;
+  /** 禁用态（如用量页同步进行中：重置与 sync 增量写入并发会互相打架） */
+  disabled?: boolean;
+}
+
 export interface SessionHostMenuProps {
   /** 当前选中的主机 id；null = 本机 */
   hostId: string | null;
@@ -28,6 +40,8 @@ export interface SessionHostMenuProps {
   onSelect: (hostId: string | null) => void;
   /** 触发器关闭态的悬停说明（如用量页的「切换统计主机」）；ssh 不可用的禁用说明优先于它 */
   triggerHint?: React.ReactNode;
+  /** 危险操作入口（本机态不渲染）；不传时菜单与原先完全一致 */
+  dangerEntry?: SessionHostMenuDangerEntry;
 }
 
 /** 主机切换下拉：结构与样式跟随会话列表的应用筛选下拉。 */
@@ -36,6 +50,7 @@ export function SessionHostMenu({
   sshHosts,
   onSelect,
   triggerHint,
+  dangerEntry,
 }: SessionHostMenuProps) {
   const { t } = useTranslation();
   // 菜单展开期间不显示悬停提示：提示胶囊（z-130）与下拉列表（z-100）都在触发器
@@ -135,6 +150,24 @@ export function SessionHostMenu({
             onSelect={() => onSelect(host.id)}
           />
         ))}
+        {/* 危险操作入口：只对有效选中的远程主机渲染（本机 / 已删主机不给），
+            分隔线 + danger 文字色与 SessionItem 的删除项同构 */}
+        {dangerEntry && currentHost && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={() => dangerEntry.onTrigger(currentHost.id)}
+              disabled={dangerEntry.disabled}
+              className={cn(
+                sessionMenuItemClass,
+                "text-danger-text",
+                dangerEntry.disabled && "opacity-50",
+              )}
+            >
+              {dangerEntry.label}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

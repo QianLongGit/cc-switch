@@ -196,6 +196,21 @@ export interface RemoteUsageSyncStatus {
   skipped: number;
 }
 
+/**
+ * 主机用量镜像重置的删除计数（后端 `ResetUsageSummary`，serde camelCase）。
+ * reset / purge 两命令共用；四表同事务原子删除，部分失败整体回滚。
+ */
+export interface ResetUsageSummary {
+  /** 明细行数（proxy_request_logs 的 data_source = "ssh:<hostId>"） */
+  deletedDetails: number;
+  /** 日聚合行数（usage_daily_rollups 按 host_id） */
+  deletedRollups: number;
+  /** 同步游标行数（session_log_sync 按 ssh: 前缀文件路径） */
+  deletedCursors: number;
+  /** 去重台账行数（session_usage_dedup 按 data_source） */
+  deletedDedup: number;
+}
+
 export interface ProviderLimitStatus {
   providerId: string;
   dailyUsage: string;

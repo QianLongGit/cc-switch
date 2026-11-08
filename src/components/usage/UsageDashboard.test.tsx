@@ -4,18 +4,23 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18n from "i18next";
 import { http, HttpResponse } from "msw";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import zh from "@/i18n/locales/zh.json";
 import { server } from "../../../tests/msw/server";
 import { setSettings } from "../../../tests/msw/state";
 import { emitTauriEvent } from "../../../tests/msw/tauriMocks";
 import type { SshHostConfig } from "@/types";
-import type { RemoteUsageSyncStatus, UsageSummary } from "@/types/usage";
+import type {
+  RemoteUsageSyncStatus,
+  ResetUsageSummary,
+  UsageSummary,
+} from "@/types/usage";
 import { usageKeys } from "@/lib/query/usage";
 import { UsageDashboard } from "./UsageDashboard";
 
@@ -26,7 +31,17 @@ import { UsageDashboard } from "./UsageDashboard";
 // → peek 首扫预告 → sync(force=true) 确认 → remote-usage-sync-status 进度
 // 渲染 → 取消 → 远程错误态 + 重试。命令经全局 tauriMocks 走 msw，
 // 断言全部落在捕获的请求体与渲染文本上。
+//
+// Task B：主机菜单追加「重置该主机数据…」→ 危险确认 → reset_remote_usage
+// → invalidate 后回首扫预告态（toast 统计）；失败 toast 报错、数据不动。
 // ============================================================================
+
+// toast 走 sonner（无 Toaster 挂载也不渲染）：mock 掉后可直接断言文案参数
+const toastSuccess = vi.hoisted(() => vi.fn());
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/toast", () => ({
+  toast: { success: toastSuccess, error: toastError },
+}));
 
 const TAURI = "http://tauri.local";
 
@@ -55,15 +70,25 @@ const PEEK_FIRST_SYNC: RemoteUsageSyncStatus = {
   skipped: 0,
 };
 
+/** reset_remote_usage 成功返回的删除统计（明细 / 汇总进 toast 文案断言） */
+const RESET_SUMMARY: ResetUsageSummary = {
+  deletedDetails: 3,
+  deletedRollups: 2,
+  deletedCursors: 1,
+  deletedDedup: 1,
+};
+
 /** 每个用例独立的命令捕获与可变状态（msw resetHandlers 在 afterEach 还原覆写） */
 const usageCommands = () => {
   const state = {
     remoteSummary: EMPTY_SUMMARY,
     failRemote: false,
+    failReset: false,
     summaryBodies: [] as Record<string, unknown>[],
     peekBodies: [] as Record<string, unknown>[],
     syncBodies: [] as Record<string, unknown>[],
     cancelBodies: [] as Record<string, unknown>[],
+    resetBodies: [] as Record<string, unknown>[],
     resolveSync: undefined as
       | ((status: RemoteUsageSyncStatus) => void)
       | undefined,
@@ -111,6 +136,15 @@ const usageCommands = () => {
         (await request.json()) as Record<string, unknown>,
       );
       return HttpResponse.json(null);
+    }),
+    http.post(`${TAURI}/reset_remote_usage`, async ({ request }) => {
+      state.resetBodies.push((await request.json()) as Record<string, unknown>);
+      if (state.failReset) {
+        return new HttpResponse("数据库被占用", { status: 500 });
+      }
+      // 镜像已清空：后续 summary 查询回到零数据（模拟后端真实语义）
+      state.remoteSummary = EMPTY_SUMMARY;
+      return HttpResponse.json(RESET_SUMMARY);
     }),
   );
 
@@ -383,5 +417,105 @@ describe("UsageDashboard 主机切换与远程同步", () => {
     await waitFor(() =>
       expect(state.syncBodies).toEqual([{ hostId: "h1", force: false }]),
     );
+  });
+});
+
+// ============================================================================
+// Task B：主机菜单「重置该主机数据…」入口
+//
+// 本机态不渲染入口；远程态确认后 reset_remote_usage 只带 hostId；
+// 成功 → toast 删除统计 + invalidate 全系查询 → 回首扫预告态；
+// 失败 → toast 报错，已入库数据不动（不回预告）。
+// ============================================================================
+
+describe("UsageDashboard 重置该主机用量数据", () => {
+  beforeEach(() => {
+    toastSuccess.mockClear();
+    toastError.mockClear();
+  });
+
+  it("本机态主机菜单没有重置入口", async () => {
+    usageCommands();
+    const user = userEvent.setup();
+    renderDashboard();
+
+    const trigger = await screen.findByRole("button", { name: /本机/ });
+    await user.click(trigger);
+    expect(screen.getAllByRole("menuitemradio")).toHaveLength(2);
+    expect(screen.queryByRole("menuitem", { name: /重置/ })).toBeNull();
+  });
+
+  it("确认后调用 reset_remote_usage(hostId)，成功 toast 带统计并回首扫预告", async () => {
+    const state = usageCommands();
+    // 远程已有数据：重置前没有首扫预告，重置后应重新出现
+    state.remoteSummary = LOCAL_SUMMARY;
+    const user = userEvent.setup();
+    renderDashboard();
+    await selectHost(user);
+
+    await waitFor(() =>
+      expect(state.summaryBodies.some((body) => body.hostId === "h1")).toBe(
+        true,
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/首次同步需拉取/)).toBeNull(),
+    );
+
+    // 菜单内重置入口 → 危险确认弹窗（明示只清本地、远端不受影响）
+    await user.click(screen.getByRole("button", { name: /build-box/ }));
+    await user.click(screen.getByRole("menuitem", { name: /重置该主机数据/ }));
+    const dialog = screen.getByRole("dialog", { name: /重置「build-box」/ });
+    expect(within(dialog).getByText(/远端文件不受影响/)).toBeInTheDocument();
+    expect(state.resetBodies).toEqual([]);
+
+    await user.click(within(dialog).getByRole("button", { name: /重置数据/ }));
+    await waitFor(() => expect(state.resetBodies).toEqual([{ hostId: "h1" }]));
+
+    // toast 显示删除统计（N 条明细 / M 条汇总）
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith(
+        expect.stringContaining("3 条明细"),
+      ),
+    );
+    expect(toastSuccess).toHaveBeenCalledWith(
+      expect.stringContaining("2 条汇总"),
+    );
+    expect(toastError).not.toHaveBeenCalled();
+
+    // invalidate 后回到首扫预告态
+    expect(await screen.findByText(/首次同步需拉取/)).toBeInTheDocument();
+  });
+
+  it("reset 失败：toast 报错，已入库数据保持（不回预告态）", async () => {
+    const state = usageCommands();
+    state.remoteSummary = LOCAL_SUMMARY;
+    state.failReset = true;
+    const user = userEvent.setup();
+    renderDashboard();
+    await selectHost(user);
+
+    await waitFor(() =>
+      expect(state.summaryBodies.some((body) => body.hostId === "h1")).toBe(
+        true,
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/首次同步需拉取/)).toBeNull(),
+    );
+
+    await user.click(screen.getByRole("button", { name: /build-box/ }));
+    await user.click(screen.getByRole("menuitem", { name: /重置该主机数据/ }));
+    await user.click(screen.getByRole("button", { name: /重置数据/ }));
+
+    await waitFor(() => expect(state.resetBodies).toEqual([{ hostId: "h1" }]));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        expect.stringContaining("重置用量数据失败"),
+      ),
+    );
+    expect(toastSuccess).not.toHaveBeenCalled();
+    // 数据未动：不出现首扫预告
+    expect(screen.queryByText(/首次同步需拉取/)).toBeNull();
   });
 });

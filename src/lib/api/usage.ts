@@ -13,6 +13,7 @@ import type {
   ProviderLimitStatus,
   PaginatedLogs,
   RemoteUsageSyncStatus,
+  ResetUsageSummary,
   SessionSyncResult,
   DataSourceSummary,
 } from "@/types/usage";
@@ -195,6 +196,20 @@ export const usageApi = {
   /** 清单 diff 单往返统计待同步文件数 / 待拉总字节（首扫预告），不拉取不写库 */
   peekRemoteUsage: async (hostId: string): Promise<RemoteUsageSyncStatus> => {
     return invoke("peek_remote_usage", { hostId });
+  },
+
+  // ── 主机数据重置 / 清理（设计 §4.4：先校验 hostId 在 settings 中） ─────
+
+  /** 清空一台远程主机的本地用量镜像（明细 / 汇总 / 游标 / 去重四表原子重置）。
+   *  远端文件不受影响，之后同步走回首扫路径重放全量 */
+  resetRemoteUsage: async (hostId: string): Promise<ResetUsageSummary> => {
+    return invoke("reset_remote_usage", { hostId });
+  },
+
+  /** 彻底清除主机本地数据：resetRemoteUsage 全部内容 + 会话侧内存缓存
+   *  （扫描清单 / 远程解析缓存 / ssh: 前缀正文缓存）。删除 SSH 主机前调用 */
+  purgeRemoteHostData: async (hostId: string): Promise<ResetUsageSummary> => {
+    return invoke("purge_remote_host_data", { hostId });
   },
 
   getRequestDetail: async (requestId: string): Promise<RequestLog | null> => {
