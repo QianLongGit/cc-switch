@@ -65,7 +65,7 @@
 |---|---|
 | **远端 rg/grep（选定）** | 增量、零索引维护、与 ssh 原语链路同构；rg 可用时大幅提速；每次搜索 1-N 次 ssh 往返（ControlMaster 复用下可控） |
 | 全量拉回本地索引 | 首扫 GB 级流量、新鲜度维护复杂（一期已论证否决） |
-| 远端 grep + 本地行号映射精确跳转 | 需复刻 provider 行过滤谓词，脆；降级方案体验损失极小，列二期 |
+| 远端 grep + 本地行号映射精确跳转 | 需复刻 provider 行过滤谓词，脆；降级方案体验损失极小，列后续迭代 |
 
 **命令形态（用户指定双方案：rg 优先，grep 降级）**：
 
@@ -85,7 +85,7 @@
 5. 高亮区间在本地对 snippet 文本做大小写不敏感子串扫描（与本地 search.rs 同口径），避免远端 locale 折叠差异
 6. 返回 `Vec<ContentHit>` 同构结构（`sourcePath` 为 `ssh:` 源路径）——**前端类型零改动**
 
-**跳转降级**：远程 snippet 的 `messageIndex` 用哨兵 `-1`（TS 类型必填不动）；前端两处消费点（`SessionItem` 的 `onOpenAt`、`SessionManagerPage` 的 openReader 调用）加降级分支：`messageIndex >= 0` 精确跳转，否则 `openReader(session)` 无 index + `initialFind={query}` 定位第一个匹配（既有链路支持）。本机行为不变。
+**跳转降级**：远程 snippet 的 `message_index` 统一为 `0`（Rust 侧 `usize` 不可表达 -1 哨兵；前端 `initialFind={query, messageIndex=0}` 本就从消息 0 起查找并滚动定位第一个匹配，行为等价于「无精确锚点 + 从头找」）。零类型改动、零前端降级分支。本机行为不变（仍为精确下标）。
 
 **前端显式改动清单**（修正「零改动」声明——合并逻辑与结果类型零改动，hook 层三处必动）：
 1. `sessionContentKeys.search` 加 hostId 维度（对齐一期 `sessions` key 扩维先例，防切主机串缓存）
