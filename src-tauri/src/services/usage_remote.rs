@@ -576,6 +576,23 @@ fn pin_claude_cursor(
 
 /* ===== codex 分支：parser_state 接力 + 段解析 + 入库 ===== */
 
+/// 截断 / zst 重扫的游标输入：**保留旧 `last_line_offset`，其余全部重置**。
+///
+/// - 保留行号门：重扫段按全文件从头解析，事件行号从 1 起，`≤ 旧门限` 的
+///   即已入库过的历史行——rollup 剪枝后 request_id 去重对已剪行失明，
+///   重放会在下次 rollup 时把 host 统计不可逆翻倍，必须由行号门挡住
+///   （与本机 codex「全文件解析 + 行号门挡入库」、claude 远程 `pin_claude_cursor`
+///   的「丢新不双算」同语义）
+/// - 重置 parser_state 等：重扫是全量段，计量高水位随解析逐行重建，新行
+///   delta 依然正确；若沿用旧状态，事件行号会从旧门限之后平移起步，
+///   行号门随之失效（这正是修复前的双算路径）
+fn rescan_cursor_in(cursor: Option<&SyncCursor>) -> SyncCursor {
+    SyncCursor {
+        last_line_offset: cursor.map(|c| c.last_line_offset).unwrap_or(0),
+        ..SyncCursor::default()
+    }
+}
+
 /// 同步单个远程 codex rollout：
 /// - 未压缩：`read_range(committed, size - committed)` 增量段，跨段状态经
 ///   `parser_state` 序列化接力（`rollout_index` 传 None——构建索引需要全量
@@ -609,6 +626,11 @@ fn sync_codex_remote_file(
             Some(cursor) if !file_needs_fetch(entry, Some(cursor)) => {
                 return Ok(FileSyncOutcome::Unchanged);
             }
+            // 归档不变假设（加固）：zst 是终态归档，压缩 size 相同即视为未
+            // 变化——mtime 单独变化（rsync / scp 触碰）不触发全量重拉
+            Some(cursor) if cursor.last_byte_offset == Some(size as i64) => {
+                return Ok(FileSyncOutcome::Unchanged);
+            }
             _ => {
                 let raw = io.read_full(&entry.path)?;
                 if raw.len() as u64 > REMOTE_USAGE_MAX_FILE_BYTES {
@@ -617,7 +639,7 @@ fn sync_codex_remote_file(
                 }
                 let bytes = zstd::stream::decode_all(raw.as_slice())
                     .map_err(|e| AppError::Config(format!("zstd 解压失败 {}: {e}", entry.path)))?;
-                (bytes, SyncCursor::default(), raw.len() as u64)
+                (bytes, rescan_cursor_in(cursor), raw.len() as u64)
             }
         }
     } else {
@@ -625,9 +647,10 @@ fn sync_codex_remote_file(
             Some(cursor) => {
                 let committed = cursor.last_byte_offset.unwrap_or(0);
                 if committed > size as i64 {
-                    // 截断：游标重置当首扫重解析（request_id 去重兜底，无指纹可校验）
+                    // 截断：全量重扫，行号门沿用旧门限（request_id 去重兜底
+                    // 对已剪明细失明，见 rescan_cursor_in）
                     let bytes = io.read_range(&entry.path, 0, size)?;
-                    (bytes, SyncCursor::default(), size)
+                    (bytes, rescan_cursor_in(Some(cursor)), size)
                 } else if committed == size as i64 && mtime == cursor.last_modified {
                     return Ok(FileSyncOutcome::Unchanged);
                 } else {
@@ -1420,6 +1443,127 @@ mod tests {
             cursor.parser_state.is_some(),
             "codex 跨段状态应随游标持久化"
         );
+    }
+
+    /* ===== 截断 / zst 重扫的行号门（防已剪明细重放） ===== */
+
+    /// 模拟 rollup 剪枝：删掉该数据源的明细行——request_id 去重随剪枝
+    /// 失明，此后任何重放都会在下一次 rollup 时双算进 host 统计
+    fn prune_rows(db: &Database, data_source: &str) {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "DELETE FROM proxy_request_logs WHERE data_source = ?1",
+            [data_source],
+        )
+        .unwrap();
+    }
+
+    // 截断重扫：远端文件被剪枝截短后重扫，已入库（明细已被 rollup 剪掉）
+    // 的旧行不得重放——行号门沿用旧门限，与本机「丢新不双算」同语义
+    #[test]
+    #[serial]
+    fn codex_truncation_rescan_does_not_replay_pruned_rows() {
+        let db = Database::memory().unwrap();
+        let path = codex_path(&format!("rollout-{CODEX_THREAD_ID}"));
+        let part1 = format!(
+            "{}\n{}\n{}\n",
+            codex_meta_line(),
+            codex_token_count_line(100, 40),
+            codex_token_count_line(300, 90)
+        );
+        let mut io = FakeRemote::new();
+        io.upsert(&path, part1.as_bytes(), fresh_mtime());
+        sync(&db, &mut io, true);
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 2);
+
+        // 模拟 30 天剪枝：明细删除后 request_id 去重失明
+        prune_rows(&db, "ssh:h1");
+        // 远端截断变小（只保留 meta + 第一个 token_count）
+        let truncated = format!(
+            "{}\n{}\n",
+            codex_meta_line(),
+            codex_token_count_line(100, 40)
+        );
+        let truncated_len = truncated.len();
+        io.files.get_mut(&path).unwrap().bytes = truncated.into_bytes();
+        io.files.get_mut(&path).unwrap().mtime_ms = fresh_mtime() + 9_000;
+
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.skipped, 0, "截断重扫应成功: {status:?}");
+        assert_eq!(
+            rows_with_source(&db, "ssh:h1").len(),
+            0,
+            "已剪旧行不得重放（重放即下次 rollup 双算）"
+        );
+        // 游标推进到新 EOF：下轮按清单 diff 短路，不再重扫
+        let cursor = cursor_of(&db, &remote_cursor_key(HOST_ID, &path)).unwrap();
+        assert_eq!(cursor.last_byte_offset, Some(truncated_len as i64));
+    }
+
+    // zst 重扫：归档重压缩（size 变化）触发全量重扫时，行号门沿用旧门限
+    // 挡住旧行重放，只放行真正的新行
+    #[test]
+    #[serial]
+    fn zst_rescan_does_not_replay_pruned_rows() {
+        let db = Database::memory().unwrap();
+        let path =
+            format!("/home/u/.codex/sessions/2026/11/08/rollout-{CODEX_THREAD_ID}.jsonl.zst");
+        let plain1 = format!(
+            "{}\n{}\n",
+            codex_meta_line(),
+            codex_token_count_line(100, 40)
+        );
+        let mut io = FakeRemote::new();
+        io.upsert(
+            &path,
+            &zstd::stream::encode_all(plain1.as_bytes(), 3).unwrap(),
+            fresh_mtime(),
+        );
+        sync(&db, &mut io, true);
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
+
+        prune_rows(&db, "ssh:h1");
+        // 归档重写：追加一个 token_count 后重新压缩（size 变化触发重扫）
+        let plain2 = format!("{plain1}{}\n", codex_token_count_line(300, 90));
+        io.upsert(
+            &path,
+            &zstd::stream::encode_all(plain2.as_bytes(), 3).unwrap(),
+            fresh_mtime() + 9_000,
+        );
+
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.skipped, 0, "zst 重扫应成功: {status:?}");
+        let rows = rows_with_source(&db, "ssh:h1");
+        assert_eq!(rows.len(), 1, "旧行不得重放，只有新行入库: {rows:?}");
+    }
+
+    // zst 归档不变假设：mtime 单独变化（rsync/scp 触碰）而压缩 size 不变
+    // 时直接按 unchanged 短路，不触发全量重拉
+    #[test]
+    #[serial]
+    fn zst_mtime_touch_with_same_size_short_circuits() {
+        let db = Database::memory().unwrap();
+        let path =
+            format!("/home/u/.codex/sessions/2026/11/08/rollout-{CODEX_THREAD_ID}.jsonl.zst");
+        let plain = format!(
+            "{}\n{}\n",
+            codex_meta_line(),
+            codex_token_count_line(100, 40)
+        );
+        let compressed = zstd::stream::encode_all(plain.as_bytes(), 3).unwrap();
+        let mut io = FakeRemote::new();
+        io.upsert(&path, &compressed, fresh_mtime());
+        sync(&db, &mut io, true);
+        assert_eq!(io.full_calls.len(), 1);
+
+        // 只触碰 mtime，size 不变
+        io.files.get_mut(&path).unwrap().mtime_ms = fresh_mtime() + 9_000;
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.done_bytes, 0, "归档不变假设：mtime 单独变化零拉取");
+        assert_eq!(io.full_calls.len(), 1, "不应再次 read_full");
     }
 
     /* ===== data_source 写值 ===== */
