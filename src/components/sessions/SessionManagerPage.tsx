@@ -279,6 +279,8 @@ export function SessionManagerPage({
     listIsSuccess: isSuccess,
     listUpdatedAt: dataUpdatedAt,
     providerIds: contentProviderIds,
+    // 远程主机走后端远端 rg/grep 搜索；本机（undefined）走本地 FTS5，索引同步在 hook 内自动跳过远程
+    hostId: effectiveHostId ?? undefined,
   });
   const contentHitOf = useCallback(
     (session: SessionMeta) =>

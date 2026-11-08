@@ -64,12 +64,17 @@ export const sessionsApi = {
     return await invoke("sync_session_index");
   },
 
-  /** 在消息正文里搜索（按会话聚合）；providerIds 为空时不按应用过滤 */
+  /** 在消息正文里搜索（按会话聚合）；providerIds 为空时不按应用过滤；hostId 有值时搜该 SSH 主机（远端 rg/grep 路线） */
   async searchContent(
     query: string,
     providerIds?: string[],
+    hostId?: string,
   ): Promise<SessionContentSearchResult> {
-    return await invoke("search_session_content", { query, providerIds });
+    return await invoke("search_session_content", {
+      query,
+      providerIds,
+      hostId: hostId ?? null,
+    });
   },
 
   /** 删除正文索引文件（关闭「搜索消息正文」时） */
