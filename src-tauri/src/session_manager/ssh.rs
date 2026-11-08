@@ -19,6 +19,8 @@
 //! - [`home_dirs_command`] / [`parse_home_dirs`] / [`classify_remote_provider`] /
 //!   [`prefer_plain_entries`] / [`remote_head_tail_request`] / [`rebind_remote_meta`]：
 //!   远程扫描链路的清单归类与请求组装纯函数（由 `mod.rs::scan_remote_sessions` 编排）
+//! - [`build_remote_resume_command`]：远程会话的可复制恢复命令生成
+//!   （`ssh -t ... 'cd <dir> && <内层>'`，用户手动执行口径，无自动执行参数）
 
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
@@ -898,12 +900,64 @@ pub(crate) fn mtime_to_system_time(ms: i64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
 }
 
+/* ===== 远程恢复命令 ===== */
+
+/// 内层 resume 命令（按 provider 重新生成，不沿用本机 meta 里的旧值——
+/// 那是本机路径语义）：claude `claude --resume <id>`、codex `codex resume <id>`，
+/// 与 claude.rs / codex.rs 本地扫描同式两行；其它 provider 返回 `None`。
+fn inner_resume_command(provider_id: &str, session_id: &str) -> Option<String> {
+    match provider_id {
+        "claude" => Some(format!("claude --resume {session_id}")),
+        "codex" => Some(format!("codex resume {session_id}")),
+        _ => None,
+    }
+}
+
+/// 生成可复制到本机终端执行的远程恢复命令：
+/// `ssh [-p N] [-i key] -t [user@]host 'cd <dir> && <内层>'`。
+///
+/// - 与 [`build_ssh_command`] 口径相反：**不含** BatchMode / ConnectTimeout /
+///   ControlMaster 等自动执行参数——用户手动执行场景，无需免密探测与连接复用
+/// - `project_dir` 存在时拼 `cd` 前缀（远端绝对路径）；缺失时仅内层命令
+/// - 目录与整条远端命令均经 [`escape_remote_path`] 单引号转义
+/// - provider 非 claude / codex 返回 `None`（MVP 范围，无内层命令可拼）
+pub(crate) fn build_remote_resume_command(
+    host: &SshHostConfig,
+    provider_id: &str,
+    session_id: &str,
+    project_dir: Option<&str>,
+) -> Option<String> {
+    let inner = inner_resume_command(provider_id, session_id)?;
+    let remote_cmd = match project_dir {
+        Some(dir) => format!("cd {} && {inner}", escape_remote_path(dir)),
+        None => inner,
+    };
+    let target = host
+        .user
+        .as_deref()
+        .map(|user| format!("{user}@{}", host.host))
+        .unwrap_or_else(|| host.host.clone());
+    let mut prefix = String::from("ssh");
+    if let Some(port) = host.port {
+        prefix.push_str(&format!(" -p {port}"));
+    }
+    if let Some(key) = host.identity_file.as_deref() {
+        prefix.push_str(&format!(" -i {key}"));
+    }
+    Some(format!(
+        "{prefix} -t {target} {}",
+        escape_remote_path(&remote_cmd)
+    ))
+}
+
 /// 远程会话标识覆盖：`session_id` = 文件 stem、`source_path` =
 /// `ssh:<hostId><远端路径>`（与 [`parse_ssh_source`] 的解析形态及 registry
-/// 清单 key 严格一致）、`resume_command` 置空；解析产出的其余字段原样保留。
+/// 清单 key 严格一致）；`resume_command` 按 [`build_remote_resume_command`]
+/// 重新生成为完整可复制 ssh 命令（本机语义的旧值不沿用）；解析产出的
+/// 其余字段原样保留。
 pub(crate) fn rebind_remote_meta(
     mut meta: SessionMeta,
-    host_id: &str,
+    host: &SshHostConfig,
     remote_path: &str,
 ) -> SessionMeta {
     if let Some(stem) = remote_session_stem(remote_path) {
@@ -911,8 +965,14 @@ pub(crate) fn rebind_remote_meta(
     }
     // 远端路径自带前导 `/`，拼接时去重避免 `ssh:h1//root/...` 双斜杠形态
     let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
-    meta.source_path = Some(format!("ssh:{host_id}/{rel}"));
-    meta.resume_command = None;
+    meta.source_path = Some(format!("ssh:{}/{rel}", host.id));
+    // 内层 session_id 用覆盖后的远端 stem；project_dir 是解析保留的远端路径
+    meta.resume_command = build_remote_resume_command(
+        host,
+        &meta.provider_id,
+        &meta.session_id,
+        meta.project_dir.as_deref(),
+    );
     meta
 }
 
@@ -2217,6 +2277,95 @@ mod tests {
         assert_eq!(mtime_to_system_time(-500), None);
     }
 
+    /* ===== 远程恢复命令生成（Task 2）===== */
+
+    /// 全参数主机（user + port + identity），锁定完整形态的期望值
+    fn resume_host() -> SshHostConfig {
+        SshHostConfig {
+            id: "host-1".to_string(),
+            label: "构建机".to_string(),
+            host: "host".to_string(),
+            user: Some("guqiu".to_string()),
+            port: Some(50051),
+            identity_file: Some("/key".to_string()),
+        }
+    }
+
+    #[test]
+    fn build_remote_resume_full_options_shape() {
+        // 全参数 + cd 前缀：逐字符锁定（含两层单引号转义），复制即可粘贴执行
+        let cmd =
+            build_remote_resume_command(&resume_host(), "claude", "sess-9", Some("/data/proj"))
+                .unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i /key -t guqiu@host \
+             'cd '\\''/data/proj'\\'' && claude --resume sess-9'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_without_project_dir_skips_cd_prefix() {
+        // project_dir 缺失：仅内层命令，无 cd 前缀；codex 内层为 `codex resume`
+        let cmd = build_remote_resume_command(&resume_host(), "codex", "roll-1", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i /key -t guqiu@host 'codex resume roll-1'"
+        );
+        assert!(!cmd.contains("cd "), "无目录时不得拼 cd 前缀");
+    }
+
+    #[test]
+    fn build_remote_resume_minimal_host_omits_optional_parts() {
+        // 仅 host（无 user/port/identity）：无 -p / -i / user@ 前缀
+        let cmd = build_remote_resume_command(&host(None, None, None), "claude", "s", Some("/p"))
+            .unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -t example.com 'cd '\\''/p'\\'' && claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_escapes_single_quote_in_dir() {
+        // 目录含单引号 → 目录层 `'\''`；含引号的远端命令整体再包一层单引号
+        // （本机 shell 剥外层 → 远端收到 `cd '/data/it'\''s' && ...` 再剥一层）
+        let cmd =
+            build_remote_resume_command(&resume_host(), "claude", "s", Some("/data/it's")).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i /key -t guqiu@host \
+             'cd '\\''/data/it'\\''\\'\\'''\\''s'\\'' && claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_unsupported_provider_returns_none() {
+        // MVP 范围：仅 claude / codex 有内层命令，其它 provider 无恢复命令
+        assert_eq!(
+            build_remote_resume_command(&resume_host(), "gemini", "g", Some("/p")),
+            None
+        );
+        assert_eq!(
+            build_remote_resume_command(&resume_host(), "opencode", "o", None),
+            None
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_omits_batch_and_control_flags() {
+        // 用户手动执行场景：不带免密探测与连接复用参数（与 build_ssh_command 口径相反）
+        let cmd = build_remote_resume_command(&resume_host(), "claude", "s", Some("/p")).unwrap();
+        for flag in [
+            "BatchMode",
+            "ControlMaster",
+            "ConnectTimeout",
+            "ControlPath",
+        ] {
+            assert!(!cmd.contains(flag), "恢复命令不应包含 {flag}");
+        }
+    }
+
     #[test]
     fn rebind_overrides_identity_fields_keeps_rest() {
         let meta = SessionMeta {
@@ -2230,15 +2379,19 @@ mod tests {
             source_path: Some("/root/x.jsonl".to_string()),
             resume_command: Some("claude --resume x".to_string()),
         };
-        let rebound = rebind_remote_meta(meta, "host-1", "/root/x.jsonl");
+        let rebound = rebind_remote_meta(meta, &host(None, None, None), "/root/x.jsonl");
         // session_id = 文件 stem；source_path = ssh:<hostId><远端路径>（单斜杠，
         // 与 parse_ssh_source 的解析形态、registry 清单 key 严格一致）
         assert_eq!(rebound.session_id, "x");
         assert_eq!(
             rebound.source_path.as_deref(),
-            Some("ssh:host-1/root/x.jsonl")
+            Some("ssh:test-host/root/x.jsonl")
         );
-        assert_eq!(rebound.resume_command, None, "远程会话不支持本地 resume");
+        // resume_command 按 provider 重新生成完整 ssh 命令（本机旧值不沿用）
+        assert_eq!(
+            rebound.resume_command.as_deref(),
+            Some("ssh -t example.com 'cd '\\''/work'\\'' && claude --resume x'")
+        );
         // 解析产出字段原样保留
         assert_eq!(rebound.title.as_deref(), Some("标题"));
         assert_eq!(rebound.project_dir.as_deref(), Some("/work"));
