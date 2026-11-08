@@ -102,7 +102,7 @@ Expected: PASS
 
 - [ ] **Step 5: 前端——阅读器「复制进入目录并恢复」远程隐藏**
 
-`SessionReaderHeader.tsx:192-209` 的 `cd` DropdownMenuItem 加条件：`session.projectDir && command && !isRemoteSession(session.sourcePath)`（`isRemoteSession` 已有，utils.ts:73）。vitest：远程会话（sourcePath `ssh:` 前缀）下该项不渲染、其余恢复方式菜单仍渲染。
+`SessionReaderHeader.tsx:192-209` 的 `cd` DropdownMenuItem 加条件：`session.projectDir && command && !isRemoteSession(session)`（`isRemoteSession` 收 session 对象，utils.ts:73）。vitest：远程会话（sourcePath `ssh:` 前缀）下该项不渲染、其余恢复方式菜单仍渲染。
 
 - [ ] **Step 6: 跑前端测试 + Commit**
 
@@ -136,7 +136,7 @@ git commit -m "feat(sessions): generate copyable ssh resume command for remote s
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p cc-switch --lib ssh::tests::search` 
+Run: `cargo test -p cc-switch --lib ssh::tests::build_search_command ssh::tests::parse_search_output ssh::tests::run_remote_with_codes ssh::tests::detect_remote_rg`（模块路径若与实现有出入，以实现后的实际测试名为准，等价模块级过滤 `ssh::tests` 亦可）
 Expected: FAIL
 
 - [ ] **Step 3: 实现四个函数**
@@ -174,12 +174,12 @@ git commit -m "feat(ssh): add rg/grep search primitives with exit-code semantics
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p cc-switch --lib search::remote` 
+Run: `cargo test -p cc-switch --lib search::tests::remote`（以实现后实际测试名为准）
 Expected: FAIL
 
 - [ ] **Step 3: 实现 search_remote + 命令分流**
 
-数据流按设计 §4.2：registry 清单 → 未压缩 `.jsonl` 过滤（zst 跳过）+ providers 过滤（按远端路径前缀对应 provider 根目录）→ 批 50 `build_search_command` + `run_remote_with_codes(host, cmd, timeout, &[0, 1])` → `parse_search_output` → 命中文件 `fetch_to_temp_file` + `load_messages` → snippet 定位（解析后消息文本上找命中行所属消息；行文本与 grep 行内容对齐——按行首 JSON 摘要或消息内容包含匹配）→ `ContentHit { provider_id, source_path: ssh 源路径, snippets, match_count }`。
+数据流按设计 §4.2：registry 清单 → 未压缩 `.jsonl` 过滤（zst 跳过）+ providers 过滤（按远端路径前缀对应 provider 根目录）→ `let use_rg = detect_remote_rg(host);` → 批 50 `build_search_command(pattern, files, use_rg)` + `run_remote_with_codes(host, cmd, timeout, &[0, 1])` → `parse_search_output` → 命中文件 `fetch_to_temp_file` + `load_messages` → snippet 定位（解析后消息文本上找命中行所属消息；行文本与 grep 行内容对齐——按行首 JSON 摘要或消息内容包含匹配）→ `ContentHit { provider_id, source_path: ssh 源路径, snippets, match_count }`。
 
 - [ ] **Step 4: localhost 集成冒烟扩展（真实 grep/rg 全链路）**
 
@@ -209,7 +209,7 @@ git commit -m "feat(sessions): remote content search via rg/grep with local snip
 - Test: `src/hooks/useSessionContentSearch.test.ts`（或既有测试文件）+ `SessionManagerPage.test.tsx` 回归
 
 **Interfaces:**
-- Consumes: Task 4 命令层 `hostId` 参数；`sessionKeys.list` 扩维先例（sessions.ts:25）
+- Consumes: Task 4 命令层 `hostId` 参数；`sessionKeys.list` 扩维先例（`src/lib/query/sessions.ts:25`）
 - Produces: `searchContent(query: string, providerIds?: string[], hostId?: string)`；`useSessionContentSearch({ query, enabled, listIsSuccess, listUpdatedAt, providerIds, hostId })`
 
 - [ ] **Step 1: 写失败测试**
@@ -244,6 +244,7 @@ git commit -m "feat(sessions): wire remote host dimension into content search ho
 **Files:**
 - Modify: `src-tauri/src/database/mod.rs:58`（SCHEMA_VERSION = 27）
 - Modify: `src-tauri/src/database/schema.rs`（`migrate_v26_to_v27` + 注册 arm；建表语句同步加列）
+- Modify: `src-tauri/src/database/dao/usage_rollup.rs`（rollup 写入 INSERT 与 `rollup_and_prune` 读取列同步加 host_id）
 - Modify: `src-tauri/src/services/session_usage_codex.rs:594-603`（`reset_codex_usage_on_conn` 的 rollup 清理谓词加 `AND host_id = ''`）
 - Test: `schema.rs` 迁移单测
 
@@ -297,7 +298,7 @@ git commit -m "feat(db): add host_id dimension to usage rollups (v26->v27)"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p cc-switch --lib session_usage::segment`
+Run: `cargo test -p cc-switch --lib session_usage::tests::segment`（以实现后实际测试名为准）
 Expected: FAIL
 
 - [ ] **Step 3: 实现提取**
@@ -334,12 +335,12 @@ git commit -m "refactor(usage): extract byte-segment usage parsers for remote re
   - `#[tauri::command] pub async fn sync_remote_usage<R: Runtime>(app: AppHandle<R>, hostId: String, force: bool) -> Result<RemoteUsageSyncStatus, AppError>`
   - `#[tauri::command] pub async fn cancel_remote_usage_sync() -> Result<(), AppError>`
   - `#[tauri::command] pub async fn peek_remote_usage(hostId: String) -> Result<RemoteUsageSyncStatus, AppError>`——清单 diff 单往返统计待同步文件数/总字节，不拉取不写库（首扫预告与「有更新」提示共用）
-  - 五命令加 `hostId: Option<String>`：service 聚合调用前经 `host_data_source_filter(hostId) -> Option<String>`（Some → `LIKE 'ssh:<id>%'`，None → `NOT LIKE 'ssh:%'`）注入 WHERE 子句；`hostId` 指向不存在主机 → Err「SSH 主机不存在或已移除」
-  - 引擎函数 `sync_host_usage(db, host, force, progress, cancel: &AtomicBool) -> Result<RemoteUsageSyncStatus, AppError>`：清单 diff（`list_files` TSV 单往返 vs 上次清单）→ 无变化且非 force 直接返回；变化/无游标文件：mtime ≥ now-90d（mtime < 者跳过不建游标）→ 未压缩 `read_range(offset, size-offset)` 喂 Task 7 纯函数入库（`data_source = ssh:<hostId>`，rollup 写入 host_id=<hostId>）；zst 全量 `read_full`；size > 32MB 或拉取失败 → skipped+1 继续；每文件完成 emit 进度；取消标志置位 → 停止并返回当前进度（游标已推进部分保留）；per-host 串行（模块级 Mutex HashMap<hostId, ()>）
+  - 五命令加 `hostId: Option<String>`：**hostId 有值时先执行轻同步**（调 `sync_host_usage(db, host, force=false, …)`——清单 diff + 增量，无变化零流量）再聚合，随后 service 聚合经 `host_data_source_filter(hostId) -> Option<String>`（Some → `LIKE 'ssh:<id>%'`，None → `NOT LIKE 'ssh:%'`）注入 WHERE 子句；`hostId` 指向不存在主机 → Err「SSH 主机不存在或已移除」（远程自动刷新链路由此内建：前端定时 invalidate → 查询重跑 → 命令层轻同步）
+  - 引擎函数 `sync_host_usage(db, host, force, progress, cancel: &AtomicBool) -> Result<RemoteUsageSyncStatus, AppError>`：清单 diff（`list_files` TSV 单往返 vs 上次清单）→ 无变化且非 force 直接返回；**文件消失（上次清单/游标存在、本次清单不含）→ 删除该文件游标行（已入库数据保留）**；变化/无游标文件：mtime ≥ now-90d（mtime < 者跳过不建游标）→ 未压缩 `read_range(offset, size-offset)` 喂 Task 7 纯函数入库（`data_source = ssh:<hostId>`，rollup 写入 host_id=<hostId>）；zst 全量 `read_full`；size > 32MB 或拉取失败 → skipped+1 继续；每文件完成 emit 进度；取消标志置位 → 停止并返回当前进度（游标已推进部分保留）；per-host 串行（模块级 Mutex HashMap<hostId, ()>）
 
 - [ ] **Step 1: 写失败测试（引擎单测，scan/read 抽象注入）**
 
-清单 diff 三态（无变化零拉取 / size 增长走增量 / 新文件走首扫）；90 天窗口（旧 mtime 文件不拉不建游标）；zst 全量路径；>32MB skipped；取消标志中途置位 → 返回部分进度且游标一致；幂等（同文件同字节二次同步 → INSERT OR IGNORE 不重复计数，覆盖 Review Focus #4）；data_source 与 rollup host_id 写值断言；host 过滤子句 SQL 形态断言（LIKE / NOT LIKE）。
+清单 diff 三态（无变化零拉取 / size 增长走增量 / 新文件走首扫）+ **消失态**（上次清单有、本次无 → 游标删除、入库数据保留）；90 天窗口（旧 mtime 文件不拉不建游标）；zst 全量路径；>32MB skipped；取消标志中途置位 → 返回部分进度且游标一致；幂等（同文件同字节二次同步 → INSERT OR IGNORE 不重复计数，覆盖 Review Focus #4）；data_source 与 rollup host_id 写值断言；host 过滤子句 SQL 形态断言（LIKE / NOT LIKE）；五命令 hostId=Some 触发轻同步（mock 引擎断言调用）。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -377,7 +378,7 @@ git commit -m "feat(usage): remote host usage sync with incremental mirror archi
 - Test: `src/components/usage/UsageDashboard.test.tsx`（或新测试文件）
 
 **Interfaces:**
-- Consumes: Task 8 命令层与 `remote-usage-sync-status` 事件；`SessionHostMenu`（src/components/sessions/SessionHostMenu.tsx:31，props 适配：value/onChange/disabled）；listen 先例（useSessionContentSearch.ts:82-103）
+- Consumes: Task 8 命令层与 `remote-usage-sync-status` 事件；`SessionHostMenu`（src/components/sessions/SessionHostMenu.tsx:31，实际 props：`hostId`/`sshHosts`/`onSelect`——挂载时按需适配 props 或轻封装）；listen 先例（useSessionContentSearch.ts:82-103）
 - Produces: 无（UI 层）
 
 - [ ] **Step 1: 写失败测试**
