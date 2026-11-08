@@ -992,6 +992,8 @@ fn inner_resume_command(provider_id: &str, session_id: &str) -> Option<String> {
 ///   ControlMaster 等自动执行参数——用户手动执行场景，无需免密探测与连接复用
 /// - `project_dir` 存在时拼 `cd` 前缀（远端绝对路径）；缺失时仅内层命令
 /// - 目录与整条远端命令均经 [`escape_remote_path`] 单引号转义
+/// - `identity_file` 非空时拼 `-i '<key>'`（本机 shell 参数层单引号包裹，
+///   空串忽略——与 [`build_ssh_command`] 同惯例）
 /// - provider 非 claude / codex 返回 `None`（MVP 范围，无内层命令可拼）
 pub(crate) fn build_remote_resume_command(
     host: &SshHostConfig,
@@ -1013,8 +1015,11 @@ pub(crate) fn build_remote_resume_command(
     if let Some(port) = host.port {
         prefix.push_str(&format!(" -p {port}"));
     }
-    if let Some(key) = host.identity_file.as_deref() {
-        prefix.push_str(&format!(" -i {key}"));
+    if let Some(key) = host.identity_file.as_deref().filter(|s| !s.is_empty()) {
+        // identity 是本机路径，这串命令由用户复制到本机 shell 执行：单引号
+        // 包裹防空格 / 引号碎参（`'` → `'\''`，与 escape_remote_path 同为
+        // POSIX 单引号算法，但层次不同——那是远端命令内嵌层，勿混语义）
+        prefix.push_str(&format!(" -i {}", escape_remote_path(key)));
     }
     Some(format!(
         "{prefix} -t {target} {}",
@@ -2497,7 +2502,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             cmd,
-            "ssh -p 50051 -i /key -t guqiu@host \
+            "ssh -p 50051 -i '/key' -t guqiu@host \
              'cd '\\''/data/proj'\\'' && claude --resume sess-9'"
         );
     }
@@ -2508,7 +2513,7 @@ mod tests {
         let cmd = build_remote_resume_command(&resume_host(), "codex", "roll-1", None).unwrap();
         assert_eq!(
             cmd,
-            "ssh -p 50051 -i /key -t guqiu@host 'codex resume roll-1'"
+            "ssh -p 50051 -i '/key' -t guqiu@host 'codex resume roll-1'"
         );
         assert!(!cmd.contains("cd "), "无目录时不得拼 cd 前缀");
     }
@@ -2532,9 +2537,44 @@ mod tests {
             build_remote_resume_command(&resume_host(), "claude", "s", Some("/data/it's")).unwrap();
         assert_eq!(
             cmd,
-            "ssh -p 50051 -i /key -t guqiu@host \
+            "ssh -p 50051 -i '/key' -t guqiu@host \
              'cd '\\''/data/it'\\''\\'\\'''\\''s'\\'' && claude --resume s'"
         );
+    }
+
+    #[test]
+    fn build_remote_resume_quotes_identity_with_spaces() {
+        // identity 含空格：本机 shell 参数层单引号包裹，复制粘贴不碎参
+        let mut host = resume_host();
+        host.identity_file = Some("/my keys/id_ed25519".to_string());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/my keys/id_ed25519' -t guqiu@host 'claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_escapes_single_quote_in_identity() {
+        // identity 含单引号：本机 shell 转义 `'` → `'\''`。算法与远端路径
+        // 转义同源（POSIX 单引号），但层次不同——这是用户复制到本机 shell
+        // 执行的参数，不是远端命令内嵌路径
+        let mut host = resume_host();
+        host.identity_file = Some("/it's/id".to_string());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/it'\\''s/id' -t guqiu@host 'claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_ignores_empty_identity() {
+        // 空串 identity（与 build_ssh_command 同惯例）：不拼 -i 参数
+        let mut host = resume_host();
+        host.identity_file = Some(String::new());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert!(!cmd.contains("-i"), "空串 identity 不应产生 -i 参数");
     }
 
     #[test]
