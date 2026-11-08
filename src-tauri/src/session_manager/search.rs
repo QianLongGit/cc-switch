@@ -720,6 +720,46 @@ fn locate_hit_message<'a>(rows: &'a [(usize, String)], line_text: &str) -> Optio
     None
 }
 
+/// 消费侧归一化（Task 3 审阅裁决的确定性修复）：[`ssh::parse_search_output`]
+/// 从右向左锚定行号（计划锁定的解析取舍，不改），正文含 `:<纯数字>:` 形态
+/// （ISO 时间戳 `12:34:56` 等）时行号会错锚、path 截成
+/// `<真路径>:<真行号>:<正文前缀>` 残段——真实 JSONL 会话行几乎必含时间戳。
+/// 按已知文件清单（当批 grep 传入的文件集）在消费侧修复：
+///
+/// 1. path 精确命中已知文件 → 原样通过（未污染的正常行）
+/// 2. 某已知文件是 path 前缀且紧随 `:` → 真路径即该文件；path 残段与原
+///    行号 / 原正文无损拼回原始输出行，从已知文件边界后的
+///    `<真行号>:<完整正文>` 确定性重切（行号是剩余段开头的纯数字段）
+/// 3. 无匹配 → None（丢弃：连接 banner / 野路径防御）
+fn normalize_search_line(
+    line: RemoteSearchLine,
+    known_files: &[String],
+) -> Option<(String, u64, String)> {
+    if known_files.iter().any(|f| f == &line.path) {
+        return Some((line.path, line.line_no, line.text));
+    }
+    // 前缀 + 紧随冒号才能认定污染残段的真路径（目录边界：`/a` 不吃 `/a/b`）
+    let known = known_files.iter().find(|f| {
+        line.path
+            .strip_prefix(f.as_str())
+            .is_some_and(|rest| rest.starts_with(':'))
+    })?;
+    // Task 3 的切分无损：path + ":" + line_no + ":" + text == 原始输出行；
+    // 已知文件边界后的剩余段即 "<真行号>:<完整正文>"
+    let rest = format!(
+        "{}:{}:{}",
+        &line.path[known.len() + 1..],
+        line.line_no,
+        line.text
+    );
+    let (line_no, text) = rest.split_once(':')?;
+    let line_no: u64 = line_no.parse().ok()?;
+    if line_no == 0 {
+        return None; // grep / rg 行号从 1 起，0 = 拼接形态非法
+    }
+    Some((known.clone(), line_no, text.to_string()))
+}
+
 /// 远程命中行聚合为 [`ContentHit`]（spec §4.2 数据流 4-5 步的纯函数核心，
 /// 远端扫描与拉取解析均由注入闭包替换，单测不依赖真 ssh）：
 ///
@@ -885,7 +925,19 @@ pub fn search_remote(
         let cmd = ssh::build_search_command(query, &paths, use_rg);
         match ssh::run_remote_with_codes(host, &cmd, REMOTE_SEARCH_TIMEOUT, REMOTE_SEARCH_ACCEPTED)
         {
-            Ok(out) => lines.extend(ssh::parse_search_output(&out)),
+            Ok(out) => {
+                // 消费侧归一化：修复解析器对含 `:<数字>:` 正文（ISO 时间戳）
+                // 的错锚残段，未知路径行丢弃（banner / 野路径防御）
+                for line in ssh::parse_search_output(&out) {
+                    if let Some((path, line_no, text)) = normalize_search_line(line, &paths) {
+                        lines.push(RemoteSearchLine {
+                            path,
+                            line_no,
+                            text,
+                        });
+                    }
+                }
+            }
             // 批内远端命令失败（权限 / 文件消失）：丢弃该批但不毁整搜
             Err(ssh::SshError::Remote(e)) => {
                 log::warn!("远程搜索批失败（SSH 主机「{}」）: {e}", host.label);
@@ -2195,6 +2247,56 @@ mod tests {
         // 锚点过短（不足最小字符数）不参与匹配，避免短锚误命中
         let short = vec![(0, "ok".to_string())];
         assert_eq!(locate_hit_message(&short, r#"{"content":"ok"}"#), None);
+    }
+
+    #[test]
+    fn remote_normalize_repairs_timestamp_poisoned_line() {
+        let known = vec!["/p/q.jsonl".to_string()];
+        // Task 3 解析器（从右向左锚定）对含 ISO 时间戳正文的实际产物形态：
+        // 行号错锚到 `:34:`，path 截成 `<真路径>:<真行号>:<正文前缀>` 残段
+        let poisoned = RemoteSearchLine {
+            path: "/p/q.jsonl:7:{\"ts\":\"2026-11-08T12".to_string(),
+            line_no: 34,
+            text: "56Z\",\"content\":\"hello world\"}".to_string(),
+        };
+        assert_eq!(
+            normalize_search_line(poisoned, &known),
+            Some((
+                "/p/q.jsonl".to_string(),
+                7,
+                "{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"hello world\"}".to_string(),
+            ))
+        );
+        // 精确命中已知文件：原样通过
+        let exact = remote_line("/p/q.jsonl", 7, "plain text");
+        assert_eq!(
+            normalize_search_line(exact, &known),
+            Some(("/p/q.jsonl".to_string(), 7, "plain text".to_string()))
+        );
+        // 未知路径（banner / 野路径）：丢弃
+        let wild = remote_line("/etc/other.jsonl", 1, "x");
+        assert_eq!(normalize_search_line(wild, &known), None);
+    }
+
+    #[test]
+    fn remote_pipeline_normalizes_parser_output_with_timestamps() {
+        // 端到端衔接：真实 stdout → Task 3 解析（从右向左，产出污染形态）
+        // → 消费侧归一化修复——保证手构造的污染形态与解析器实际产物一致
+        let out =
+            b"/p/q.jsonl:7:{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"zephyr hello world\"}\n";
+        let known = vec!["/p/q.jsonl".to_string()];
+        let normalized: Vec<_> = ssh::parse_search_output(out)
+            .into_iter()
+            .filter_map(|line| normalize_search_line(line, &known))
+            .collect();
+        assert_eq!(
+            normalized,
+            vec![(
+                "/p/q.jsonl".to_string(),
+                7,
+                "{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"zephyr hello world\"}".to_string(),
+            )]
+        );
     }
 
     #[test]

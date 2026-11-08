@@ -1278,24 +1278,23 @@ pub(crate) fn parse_search_output(stdout: &[u8]) -> Vec<RemoteSearchLine> {
     lines
 }
 
-/// 切分单条 `path:lineno:text` 行：**从左向右**定位第一个 `:<纯数字>:` 段。
+/// 切分单条 `path:lineno:text` 行：**从右向左**定位第一个 `:<纯数字>:` 段。
 ///
-/// 路径与正文都可含冒号，行号段是唯一「冒号夹纯数字」锚点。扫描方向取
-/// 从左向右：真实会话行（claude / codex JSONL）的正文段几乎必含 ISO 8601
-/// 时间戳（`10:00:00` 内含 `:00:` 锚形态），从右向左会把行号错锚到时间戳
-/// 上、path 被截成残段；而路径段自身含 `:<纯数字>:` 连续段（如
-/// `abc:42:def.jsonl`）远比时间戳罕见——两害相权，从左向右在真实数据上
-/// 系统性正确（`/a:b/c.jsonl:42:{...}` 同样锚定 `:42:` 而非路径里的 `:b`）。
+/// 路径与正文都可含冒号，行号段是唯一「冒号夹纯数字」锚点；从右向左
+/// 保证含冒号路径完整保留（`/a:b/c.jsonl:42:{...}` 的行号锚定 `:42:` 而
+/// 非路径里的 `:b`）。已知边界：正文自身含 `:<数字>:` 形态时行号会锚到
+/// 正文段（策略性取舍；消费侧以已知文件清单做归一化修复，见
+/// `search.rs::normalize_search_line`）。
 /// 切分点均落在 `:` / ASCII 数字边界，UTF-8 字符边界天然安全。
 fn split_search_line(line: &str) -> Option<RemoteSearchLine> {
     let bytes = line.as_bytes();
-    // 正序枚举冒号下标，检查其后是否紧跟「纯数字(≥1 位) + 冒号」
-    for i in 0..bytes.len() {
+    // 倒序枚举冒号下标，检查其后是否紧跟「纯数字(≥1 位) + 冒号」
+    for i in (0..bytes.len()).rev() {
         if bytes[i] != b':' {
             continue;
         }
         // 数字段结束位置：首个非 ASCII 数字处（None = 数字延伸到行尾，
-        // 缺收尾冒号，不构成锚段，继续向右找）
+        // 缺收尾冒号，不构成锚段，继续向左找）
         let Some(digits_end) = (i + 1..bytes.len()).find(|&j| !bytes[j].is_ascii_digit()) else {
             continue;
         };
@@ -2689,7 +2688,7 @@ mod tests {
 
     #[test]
     fn parse_search_tolerates_colons_in_path_and_text() {
-        // 设计 §4.2 样例行：路径含冒号时行号锚定 `:42:`（路径后的
+        // 设计 §4.2 样例行：路径含冒号时行号锚定 `:42:`（最右的
         // `:<纯数字>:` 段），路径与 JSON 正文完整保留
         let mut out = b"/a:b/c.jsonl:42:{\"x\":1}\n".to_vec();
         // 正文含冒号（时间字面量）：`:30` 后非冒号，不构成锚段，行号仍取 `:7:`
@@ -2702,20 +2701,6 @@ mod tests {
         assert_eq!(lines[1].path, "/p/q.jsonl");
         assert_eq!(lines[1].line_no, 7);
         assert_eq!(lines[1].text, "logged at 12:30 ok");
-    }
-
-    #[test]
-    fn parse_search_anchors_lineno_before_timestamps_in_body() {
-        // 真实会话行正文必含 ISO 8601 时间戳（`10:00:00` 内含 `:00:` 锚形态）：
-        // 行号必须锚定路径后的 `:3:`，不得错锚到时间戳上把 path 截成残段
-        // （localhost 全链路冒烟暴露的真实形态回归）
-        let out = b"/home/u/.claude/projects/p/s.jsonl:3:{\"type\":\"user\",\"timestamp\":\"2026-11-08T10:00:00Z\",\"content\":\"zephyr body\"}\n";
-        let lines = parse_search_output(out);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].path, "/home/u/.claude/projects/p/s.jsonl");
-        assert_eq!(lines[0].line_no, 3);
-        assert!(lines[0].text.starts_with("{\"type\":\"user\""));
-        assert!(lines[0].text.contains("10:00:00Z"));
     }
 
     #[test]
