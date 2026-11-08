@@ -2544,6 +2544,21 @@
       "tip": "クリックして今すぐ同期",
       "tipOff": "自動スキャンはオフです。クリックして今すぐ同期"
     },
+    "hostSelector": {
+      "hint": "統計ホストを切替：リモートの使用量は SSH 経由でローカルに同期して集計"
+    },
+    "remoteSync": {
+      "firstSyncPreview": "初回同期は {{files}} ファイル / 約 {{size}} を取得します",
+      "start": "同期を開始",
+      "cancel": "同期をキャンセル",
+      "progress": "同期中 {{done}}/{{total}} · {{bytes}}",
+      "completed": "リモート使用量の同期が完了：{{files}} ファイル",
+      "completedSkipped": "リモート使用量の同期が完了：{{files}} ファイル、{{skipped}} 件スキップ",
+      "cancelled": "リモート使用量の同期をキャンセルしました（部分進捗は保持）",
+      "failed": "リモート使用量の同期に失敗しました：{{error}}",
+      "loadFailed": "リモート使用量の読み込みに失敗しました：{{error}}",
+      "retry": "再試行"
+    },
     "refreshMenu": {
       "label": "{{seconds}} 秒ごとにスキャン"
     },

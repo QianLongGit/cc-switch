@@ -185,6 +185,17 @@ export interface UsageScopeFilters {
   model?: string;
 }
 
+/**
+ * 远程用量同步进度（事件 `remote-usage-sync-status` 载荷，也用于 peek 预告）。
+ * peek 形态：totalFiles = 待同步文件数、doneBytes = 待拉总字节，其余为 0。
+ */
+export interface RemoteUsageSyncStatus {
+  doneFiles: number;
+  totalFiles: number;
+  doneBytes: number;
+  skipped: number;
+}
+
 export interface ProviderLimitStatus {
   providerId: string;
   dailyUsage: string;

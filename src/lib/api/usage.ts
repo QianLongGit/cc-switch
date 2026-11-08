@@ -12,6 +12,7 @@ import type {
   ModelsDevSyncState,
   ProviderLimitStatus,
   PaginatedLogs,
+  RemoteUsageSyncStatus,
   SessionSyncResult,
   DataSourceSummary,
 } from "@/types/usage";
@@ -50,12 +51,15 @@ export const usageApi = {
   },
 
   // Proxy usage statistics methods
+  // hostId 尾参：远程 SSH 主机 id；undefined 时字段不进 invoke 参数（本机零回归）。
+  // 有值时后端先做清单 diff 轻同步，再按 host 维度聚合。
   getUsageSummary: async (
     startDate?: number,
     endDate?: number,
     appType?: string,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<UsageSummary> => {
     return invoke("get_usage_summary", {
       startDate,
@@ -63,6 +67,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -78,12 +83,14 @@ export const usageApi = {
     endDate?: number,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<UsageSummaryByApp[]> => {
     return invoke("get_usage_summary_by_app", {
       startDate,
       endDate,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -93,6 +100,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<DailyStats[]> => {
     return invoke("get_usage_trends", {
       startDate,
@@ -100,6 +108,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -108,11 +117,13 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<string | null> => {
     return invoke("get_usage_first_date", {
       appType,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -122,6 +133,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<ProviderStats[]> => {
     return invoke("get_provider_stats", {
       startDate,
@@ -129,6 +141,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -138,6 +151,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    hostId?: string,
   ): Promise<ModelStats[]> => {
     return invoke("get_model_stats", {
       startDate,
@@ -145,6 +159,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      hostId,
     });
   },
 
@@ -152,12 +167,34 @@ export const usageApi = {
     filters: LogFilters,
     page: number = 0,
     pageSize: number = 20,
+    hostId?: string,
   ): Promise<PaginatedLogs> => {
     return invoke("get_request_logs", {
       filters,
       page,
       pageSize,
+      hostId,
     });
+  },
+
+  // ── 远程用量同步（首扫 / 增量 / 取消 / 预告） ─────────────────────────
+
+  /** 同步远程主机用量：force=true 首扫（90 天窗口全量），false 增量轻同步 */
+  syncRemoteUsage: async (
+    hostId: string,
+    force: boolean,
+  ): Promise<RemoteUsageSyncStatus> => {
+    return invoke("sync_remote_usage", { hostId, force });
+  },
+
+  /** 取消进行中的远程用量同步：引擎在下一个文件边界停止并返回部分进度 */
+  cancelRemoteUsageSync: async (): Promise<void> => {
+    return invoke("cancel_remote_usage_sync");
+  },
+
+  /** 清单 diff 单往返统计待同步文件数 / 待拉总字节（首扫预告），不拉取不写库 */
+  peekRemoteUsage: async (hostId: string): Promise<RemoteUsageSyncStatus> => {
+    return invoke("peek_remote_usage", { hostId });
   },
 
   getRequestDetail: async (requestId: string): Promise<RequestLog | null> => {

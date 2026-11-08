@@ -2544,6 +2544,21 @@
       "tip": "点击立即同步",
       "tipOff": "自动扫描已关闭，点击立即同步"
     },
+    "hostSelector": {
+      "hint": "切换统计主机：远程主机的用量经 SSH 增量同步到本地统计"
+    },
+    "remoteSync": {
+      "firstSyncPreview": "首次同步需拉取 {{files}} 个文件 / 约 {{size}}",
+      "start": "开始同步",
+      "cancel": "取消同步",
+      "progress": "同步中 {{done}}/{{total}} · {{bytes}}",
+      "completed": "远程用量同步完成：{{files}} 个文件",
+      "completedSkipped": "远程用量同步完成：{{files}} 个文件，{{skipped}} 个跳过",
+      "cancelled": "已取消远程用量同步，部分进度已保留",
+      "failed": "远程用量同步失败：{{error}}",
+      "loadFailed": "远程用量加载失败：{{error}}",
+      "retry": "重试"
+    },
     "refreshMenu": {
       "label": "每 {{seconds}} 秒扫描"
     },
