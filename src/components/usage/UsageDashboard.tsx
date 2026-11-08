@@ -804,17 +804,14 @@ export function UsageDashboard({
       />
       <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
       {/* 主机切换：本机 / 远程 SSH 主机；没配主机时整块不渲染。
-          span 包一层：HostMenu 本身不接 ref，HoverTip 的 asChild 挂到 span 上 */}
+          悬停说明走 triggerHint 由组件自己挂：菜单展开期间自动收起，不遮挡列表 */}
       {(settings?.sshHosts?.length ?? 0) > 0 && (
-        <HoverTip content={t("usage.hostSelector.hint")}>
-          <span className="inline-flex shrink-0">
-            <SessionHostMenu
-              hostId={hostId}
-              sshHosts={settings?.sshHosts}
-              onSelect={setHostId}
-            />
-          </span>
-        </HoverTip>
+        <SessionHostMenu
+          hostId={hostId}
+          sshHosts={settings?.sshHosts}
+          onSelect={setHostId}
+          triggerHint={t("usage.hostSelector.hint")}
+        />
       )}
       {remoteSyncBar}
       <div

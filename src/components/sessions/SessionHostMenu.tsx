@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronDown, Monitor, Server } from "lucide-react";
@@ -25,6 +26,8 @@ export interface SessionHostMenuProps {
   sshHosts: SshHostConfig[] | undefined;
   /** 选择主机；null = 切回本机 */
   onSelect: (hostId: string | null) => void;
+  /** 触发器关闭态的悬停说明（如用量页的「切换统计主机」）；ssh 不可用的禁用说明优先于它 */
+  triggerHint?: React.ReactNode;
 }
 
 /** 主机切换下拉：结构与样式跟随会话列表的应用筛选下拉。 */
@@ -32,8 +35,13 @@ export function SessionHostMenu({
   hostId,
   sshHosts,
   onSelect,
+  triggerHint,
 }: SessionHostMenuProps) {
   const { t } = useTranslation();
+  // 菜单展开期间不显示悬停提示：提示胶囊（z-130）与下拉列表（z-100）都在触发器
+  // 正下方，展开时一次指针微动就会让提示重新弹出盖住列表条目，且胶囊可 hover、
+  // 会拦截点击（用户实测反馈）。只观察开合，开关仍交给 Radix 内部管理
+  const [menuOpen, setMenuOpen] = useState(false);
   const hosts = sshHosts ?? [];
   const availability = useQuery({
     queryKey: SSH_AVAILABILITY_KEY,
@@ -59,9 +67,13 @@ export function SessionHostMenu({
     ? (hosts.find((host) => host.id === hostId) ?? null)
     : null;
 
+  // 提示内容：ssh 缺失的禁用说明优先；菜单展开期间整体不渲染（见 menuOpen 注释）。
+  // content 为空时 HoverTip 原样渲染子元素，Tooltip 树随之卸载，展开期间无法重弹
+  const tipContent = menuOpen ? undefined : (unavailableTip ?? triggerHint);
+
   return (
-    <DropdownMenu>
-      <HoverTip content={unavailableTip}>
+    <DropdownMenu onOpenChange={setMenuOpen}>
+      <HoverTip content={tipContent}>
         {/* span 包一层：disabled 按钮收不到鼠标事件，tooltip 挂在 span 上照样能弹 */}
         <span className="inline-flex shrink-0">
           <DropdownMenuTrigger asChild>
@@ -108,9 +120,7 @@ export function SessionHostMenu({
       >
         <HostMenuItem
           pressed={!hostId}
-          icon={
-            <Monitor className="h-4 w-4 text-fg-2" strokeWidth={1.5} />
-          }
+          icon={<Monitor className="h-4 w-4 text-fg-2" strokeWidth={1.5} />}
           label={localLabel}
           onSelect={() => onSelect(null)}
         />
@@ -119,9 +129,7 @@ export function SessionHostMenu({
           <HostMenuItem
             key={host.id}
             pressed={hostId === host.id}
-            icon={
-              <Server className="h-4 w-4 text-fg-2" strokeWidth={1.5} />
-            }
+            icon={<Server className="h-4 w-4 text-fg-2" strokeWidth={1.5} />}
             label={host.label}
             sub={host.user ? `${host.user}@${host.host}` : host.host}
             onSelect={() => onSelect(host.id)}

@@ -1,4 +1,10 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18n from "i18next";
@@ -171,7 +177,14 @@ describe("usageKeys host 维度", () => {
           false,
         ),
       (hostId: string | null) =>
-        usageKeys.trends(hostId, "today", undefined, undefined, undefined, false),
+        usageKeys.trends(
+          hostId,
+          "today",
+          undefined,
+          undefined,
+          undefined,
+          false,
+        ),
       (hostId: string | null) => usageKeys.firstDate(hostId, undefined),
       (hostId: string | null) =>
         usageKeys.providerStats(
@@ -287,6 +300,41 @@ describe("UsageDashboard 主机切换与远程同步", () => {
 
     await user.click(screen.getByRole("button", { name: "取消同步" }));
     await waitFor(() => expect(state.cancelBodies).toHaveLength(1));
+  });
+
+  it("主机切换按钮悬停显示说明提示，展开菜单时提示浮层消失", async () => {
+    usageCommands();
+    const user = userEvent.setup();
+    renderDashboard();
+
+    const trigger = await screen.findByRole("button", { name: /本机/ });
+
+    // 关闭态：hint 提示照常显示（i18n 文案不变）
+    await user.hover(trigger);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /切换统计主机/,
+    );
+
+    // 展开菜单：点击会关掉当前提示，但真机上指针停在触发器上，一次微动就让
+    // 提示经 0ms 延迟重新弹出、盖住主机列表（用户实测的遮挡）。展开期间
+    // 提示浮层必须不存在。（模态菜单会把 body 置 pointer-events:none，
+    // userEvent 发不进去，用 fireEvent 派发等价的指针微动；Radix HideOthers
+    // 会把触发器与 tooltip portal 都 aria-hidden，重查与断言都要 hidden:true；
+    // 修复后 span 树随展开重建，必须用重查的节点发事件才有效）
+    await user.click(trigger);
+    expect(screen.getAllByRole("menuitemradio")).toHaveLength(2);
+    const liveTrigger = screen.getByRole("button", {
+      name: /本机/,
+      hidden: true,
+    });
+    fireEvent.pointerLeave(liveTrigger);
+    fireEvent.pointerMove(liveTrigger);
+    // 0ms 打开计时器走宏任务：等一拍再断言，避免误判「尚未弹出」
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(screen.queryByRole("tooltip", { hidden: true })).toBeNull();
+    await user.keyboard("{Escape}");
   });
 
   it("远程加载失败显示分类错误与重试；重试重新发起请求", async () => {
