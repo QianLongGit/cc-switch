@@ -120,16 +120,18 @@ impl Database {
         let fresh_old_input = fresh_input_sql("old");
         // request_model 维度保留路由接管的「客户端别名 → 真实模型」映射，
         // pricing_model 维度保留写入时的计价基准（request 计价模式下与 model 分叉）；
-        // 明细行的这两列可能为 NULL（历史/手工数据），归一为 ''。
+        // host_id 维度区分本机（''）与 SSH 远程宿主（v27 起入主键）：本机明细
+        // 聚合恒并到 host_id='' 行，同键远程行永不触碰——否则剪枝把远程数字
+        // 不可逆并入本机账本。明细行的前两列可能为 NULL（历史/手工数据），归一为 ''。
         let aggregation_sql = format!(
             "INSERT OR REPLACE INTO usage_daily_rollups
-                (date, app_type, provider_id, model, request_model, pricing_model,
+                (date, app_type, provider_id, model, request_model, pricing_model, host_id,
                  request_count, success_count,
                  input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
                  input_token_semantics, total_cost_usd, avg_latency_ms)
             SELECT
-                d, a, p, m, rm, pm,
+                d, a, p, m, rm, pm, h,
                 COALESCE(old.request_count, 0) + new_req,
                 COALESCE(old.success_count, 0) + new_succ,
                 COALESCE({fresh_old_input}, 0) + new_in,
@@ -149,6 +151,7 @@ impl Database {
                     l.app_type as a, l.provider_id as p, l.model as m,
                     COALESCE(l.request_model, '') as rm,
                     COALESCE(l.pricing_model, '') as pm,
+                    '' as h,
                     COUNT(*) as new_req,
                     SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END) as new_succ,
                     COALESCE(SUM({fresh_detail_input}), 0) as new_in,
@@ -164,7 +167,8 @@ impl Database {
             LEFT JOIN usage_daily_rollups old
                 ON old.date = agg.d AND old.app_type = agg.a
                 AND old.provider_id = agg.p AND old.model = agg.m
-                AND old.request_model = agg.rm AND old.pricing_model = agg.pm"
+                AND old.request_model = agg.rm AND old.pricing_model = agg.pm
+                AND old.host_id = agg.h"
         );
 
         conn.execute(&aggregation_sql, [cutoff])
@@ -568,6 +572,77 @@ mod tests {
         )?;
         assert_eq!(count, 13, "10 existing + 3 new");
         assert_eq!(input, 1300, "1000 existing + 300 new");
+        Ok(())
+    }
+
+    // v27 host 维度：本机明细聚合只准落进 host_id='' 行；同键并存的远程行
+    // 必须原样保留。若 JOIN 不带 host_id 条件，agg 会同时命中本机与远程两行
+    // old，REPLACE 后写入错乱计数——本测试锁定按宿主分账的合并语义。
+    #[test]
+    fn test_rollup_buckets_local_rows_and_leaves_remote_rollups_alone() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let now = chrono::Utc::now().timestamp();
+        let old_ts = now - 40 * 86400;
+
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            let date_str = Local
+                .timestamp_opt(old_ts, 0)
+                .single()
+                .expect("old timestamp should be a valid local datetime")
+                .format("%Y-%m-%d")
+                .to_string();
+            for (host_id, count) in [("", 10i64), ("ssh:h1", 5)] {
+                conn.execute(
+                    "INSERT INTO usage_daily_rollups
+                        (date, app_type, provider_id, model, host_id,
+                         request_count, success_count, input_tokens, output_tokens,
+                         total_cost_usd, avg_latency_ms)
+                     VALUES (?1, 'claude', 'p1', 'claude-3', ?2, ?3, ?3, ?3 * 100, ?3 * 50,
+                             '0.01', 100)",
+                    rusqlite::params![date_str, host_id, count],
+                )?;
+            }
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model,
+                        input_tokens, output_tokens, total_cost_usd,
+                        latency_ms, status_code, created_at
+                    ) VALUES (?1, 'p1', 'claude', 'claude-3', 100, 50, '0.01', 200, 200, ?2)",
+                    rusqlite::params![format!("host-merge-{i}"), old_ts + i as i64],
+                )?;
+            }
+        }
+
+        let deleted = db.rollup_and_prune(30)?;
+        assert_eq!(deleted, 3);
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let mut stmt = conn.prepare(
+            "SELECT host_id, request_count, input_tokens FROM usage_daily_rollups
+             WHERE app_type = 'claude' AND provider_id = 'p1' ORDER BY host_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2, "本机行与远程行必须各自成行");
+        assert_eq!(
+            rows[0],
+            (String::new(), 13, 1300),
+            "本机行 = 10 存量 + 3 新明细，host_id=''"
+        );
+        assert_eq!(
+            rows[1],
+            ("ssh:h1".to_string(), 5, 500),
+            "远程行原样保留，不被本机聚合触碰"
+        );
         Ok(())
     }
 }

@@ -599,8 +599,18 @@ pub(crate) fn reset_codex_usage_on_conn(
     if sqlite_table_exists(conn, "usage_daily_rollups")?
         && sqlite_column_exists(conn, "usage_daily_rollups", "provider_id")?
     {
+        // v27 起 rollup 按 host 分账：本机重置只清本机行（host_id = ''），
+        // 远程宿主的 Codex rollup 行必须存活。迁移链 v15→v16 路过这里时
+        // 表还没有 host_id 列（彼时也不存在远程行），退回无维度谓词。
+        let host_scope = if sqlite_column_exists(conn, "usage_daily_rollups", "host_id")? {
+            " AND host_id = ''"
+        } else {
+            ""
+        };
         conn.execute(
-            "DELETE FROM usage_daily_rollups WHERE provider_id = '_codex_session'",
+            &format!(
+                "DELETE FROM usage_daily_rollups WHERE provider_id = '_codex_session'{host_scope}"
+            ),
             [],
         )
         .map_err(|error| AppError::Database(format!("清理 Codex 用量汇总失败: {error}")))?;
@@ -6168,6 +6178,48 @@ mod tests {
                 })?;
             assert_eq!((codex_rows, gemini_rows, codex_rollups), (0, 1, 0));
             assert_eq!(remaining_cursors, 2);
+        }
+        Ok(())
+    }
+
+    // v27 host 维度：本机重置只清 host_id='' 的 Codex rollup 行，
+    // 远程宿主（如 'ssh:h1'）的 Codex rollup 行必须存活——它们属于
+    // 其他宿主的账本，本机重建不得越权清空。
+    #[test]
+    fn reset_codex_usage_keeps_remote_host_rollups() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(
+                "INSERT INTO usage_daily_rollups (date, app_type, provider_id, model, host_id)
+                 VALUES
+                    ('2026-07-10', 'codex', '_codex_session', 'gpt', ''),
+                    ('2026-07-10', 'codex', '_codex_session', 'gpt', 'ssh:h1');",
+            )?;
+        }
+
+        {
+            let conn = lock_conn!(db.conn);
+            reset_codex_usage_on_conn(&conn, temp.path())?;
+        }
+
+        {
+            let conn = lock_conn!(db.conn);
+            let (local_rows, remote_rows): (i64, i64) = conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM usage_daily_rollups
+                     WHERE provider_id = '_codex_session' AND host_id = ''),
+                    (SELECT COUNT(*) FROM usage_daily_rollups
+                     WHERE provider_id = '_codex_session' AND host_id = 'ssh:h1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(
+                (local_rows, remote_rows),
+                (0, 1),
+                "只清本机行，远程宿主行存活"
+            );
         }
         Ok(())
     }
