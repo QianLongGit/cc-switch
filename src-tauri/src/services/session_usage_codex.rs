@@ -23,7 +23,7 @@ use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     estimated_first_token_ms, estimated_latency_ms, metadata_modified_nanos,
     parse_timestamp_millis, update_sync_state, update_sync_state_on_conn, EstimatedTiming,
-    SessionSyncResult,
+    SessionSyncResult, SyncCursor,
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
@@ -31,6 +31,7 @@ use crate::services::usage_stats::{
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufRead;
@@ -51,7 +52,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
@@ -60,7 +61,7 @@ struct CumulativeTokens {
 }
 
 /// 单次 API 调用的 token 增量
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeltaTokens {
     input: u32,
     cached_input: u32,
@@ -74,7 +75,7 @@ impl DeltaTokens {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TokenCountersSignature {
     input: Option<u64>,
     cached_input: Option<u64>,
@@ -83,7 +84,7 @@ struct TokenCountersSignature {
     total: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TokenUsageSignature {
     total: Option<TokenCountersSignature>,
     last: Option<TokenCountersSignature>,
@@ -209,8 +210,8 @@ struct CachedReplayPrefix {
     prefix: usize,
 }
 
-#[derive(Debug)]
-struct ParsedTokenEvent {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedTokenEvent {
     line_offset: i64,
     signature: TokenUsageSignature,
     delta: DeltaTokens,
@@ -328,7 +329,7 @@ fn output_item_started_ms(line: &str, payload_head: &[u8]) -> Option<TimingLine>
 /// 请求被中断或出错时等不到 `token_count`，它留下的起点要在下一轮开始时清掉，
 /// 否则会被下一次请求沿用。只在 `task_started` / `turn_aborted` 上清，不在用户
 /// 消息上清：Codex 会在响应中途插入 developer 消息，在那里清会把起点挪晚。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct RequestTimer {
     last_boundary_ms: Option<i64>,
     last_token_count_ms: Option<i64>,
@@ -453,7 +454,7 @@ impl RequestTimer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ParentResolution {
     None,
     Parent(String),
@@ -966,6 +967,7 @@ fn signature_for_last_usage(usage: &CumulativeTokens) -> TokenUsageSignature {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingUsageRecord {
     key: String,
     usage: CumulativeTokens,
@@ -1238,6 +1240,537 @@ fn resolve_continuation_baseline(
     Ok(None)
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * 字节段续读纯函数（本机 parse_codex_file_with_index 与远程增量拉取共用的解析内核）
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * 边界契约（Task 8 远程增量拉取按此复用）：
+ *
+ *   输入  bytes   从游标边界起的增量字节段（本机全文件一次喂 / 远程按段喂）
+ *         cursor  旧游标（last_byte_offset 即段起点；parser_state 携带段间状态）
+ *         ctx     文件身份 + 续写页基线查找（唯一跨文件 IO 点）
+ *   输出  token / usage_record 事件（delta 已按高水位算好）+ 段末状态 + 新游标
+ *
+ * 计量与计时状态（高水位、签名去重、pending 配对、当前模型、请求计时器）全部
+ * 经 CodexSegmentState 序列化进 cursor.parser_state 跨段接力：同一字节流一次性
+ * 喂与按段接力喂产出完全一致的事件集合与游标。
+ */
+
+/// Codex 段解析的上下文：文件身份与跨文件查找，段间恒定。
+pub(crate) struct CodexSegmentContext<'a> {
+    pub(crate) file_path: &'a Path,
+    /// 文件名尾部的 rollout UUID（线程身份）
+    pub(crate) root_thread_id: Option<&'a str>,
+    /// 续写页前序分段索引（[`resolve_continuation_baseline`] 用）。远程段 /
+    /// 无索引场景传 None：遇到需要基线的续写页按既有的缺失语义转 Deferred
+    pub(crate) rollout_index: Option<&'a RolloutIndex>,
+}
+
+/// Codex 段间解析状态：serde 序列化进 [`SyncCursor::parser_state`] 往返。
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CodexSegmentState {
+    // ── 会话身份（首段的 session_meta 确定后冻结）──
+    root_meta_seen: bool,
+    meta_thread_id: Option<String>,
+    is_continuation: bool,
+    history_base_thread_id: Option<String>,
+    /// 解析出的父关系；None = 尚未见过 session_meta（初始），组装
+    /// ParsedCodexFile 时映射为 ParentResolution::None
+    parent: Option<ParentResolution>,
+    bounded_history: Option<serde_json::Value>,
+    root_timestamp: Option<DateTime<Utc>>,
+    // ── 计量与计时（跨段必须接力，丢了会重复计费或漏计）──
+    /// 空串等价初始值 "unknown"（恢复时归一）
+    current_model: String,
+    total_high_water: Option<CumulativeTokens>,
+    /// 各快照源的最新全量签名。用 Vec 承载：键是 `Option<String>`（无
+    /// limit_id 的快照源），None 无法序列化为 JSON 对象键，HashMap 存不进
+    /// parser_state；源数量个位数，线性查找无碍
+    last_signature_by_source: Vec<(Option<String>, TokenUsageSignature)>,
+    previous_token_signature: Option<TokenUsageSignature>,
+    pending_usage: Option<PendingUsageRecord>,
+    event_index: u32,
+    timer: RequestTimer,
+    // ── 游标 ──
+    line_offset: i64,
+    /// 已读字节累计（含未消费的半行后缀）。只用来与下轮的文件大小比对，
+    /// 从不作为 seek 位置；远程续读从 committed 边界重读半行时会把重读的
+    /// 字节也计入，仅作变化门参考
+    observed_bytes: i64,
+    /// 段末消费边界（最后一条完整记录之后）：远程增量拉取的续读起点。
+    /// 每段以游标列（权威）重置后推进，不信任序列化值
+    committed_bytes: i64,
+    has_billable_tokens: bool,
+}
+
+/// 字节段解析结果
+pub(crate) struct CodexSegmentOutcome {
+    /// `token_count` 产出的计量事件（delta 已算好，event_index 跨段连续）
+    pub(crate) token_events: Vec<ParsedTokenEvent>,
+    /// `token_usage_record` 后面紧跟全 0 last 的 `token_count` 时补记的用量
+    pub(crate) usage_record_events: Vec<ParsedTokenEvent>,
+    /// 段末状态（行号 / 已读字节 / 计量状态全在内），供外层组装或继续接力
+    pub(crate) state: CodexSegmentState,
+    // cursor 字段由远程增量拉取（Task 8）按段接力消费；本机全文件形态在
+    // parse_codex_file_with_index 里忽略（游标另经 ParsedCodexFile 组装）
+    /// 推进后的游标：last_line_offset = 已消费行号，last_byte_offset =
+    /// 续读起点（最后完整记录后）；last_modified / last_synced_at 原样带回
+    #[allow(dead_code)]
+    pub(crate) cursor: SyncCursor,
+}
+
+impl CodexSegmentState {
+    /// 状态机推进：吃一段字节，产出事件。逐行循环源自原
+    /// `parse_codex_file_with_index` 的解析主体（行为逐字等价），文件读取
+    /// 与跨文件查找之外的全部状态都在 self 上接力。
+    fn advance(
+        &mut self,
+        bytes: &[u8],
+        ctx: &CodexSegmentContext<'_>,
+    ) -> (Vec<ParsedTokenEvent>, Vec<ParsedTokenEvent>) {
+        let mut token_events = Vec::new();
+        let mut usage_record_events = Vec::new();
+        let file_path = ctx.file_path;
+        let root_thread_id = ctx.root_thread_id;
+        let rollout_index = ctx.rollout_index;
+
+        for record in bytes.split_inclusive(|b| *b == b'\n') {
+            // Count the incomplete suffix too, so an unchanged crashed/closed
+            // rollout is skipped rather than fully reparsed on every sync pass.
+            self.observed_bytes += record.len() as i64;
+            // A live writer may have only written part of the final JSON record.
+            // Leave its line cursor unconsumed for the next file change, but retain
+            // support for a complete final JSON record without a newline.
+            if !record.ends_with(b"\n")
+                && serde_json::from_slice::<serde_json::Value>(record).is_err()
+            {
+                break;
+            }
+            self.line_offset += 1;
+            self.committed_bytes += record.len() as i64;
+            let line = match std::str::from_utf8(record) {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            self.timer.observe_line(line);
+
+            let is_event_msg = line.contains("\"event_msg\"");
+            let is_turn_context = line.contains("\"turn_context\"");
+            let is_session_meta = line.contains("\"session_meta\"");
+            let is_usage_record = line.contains("\"token_usage_record\"");
+            if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
+                continue;
+            }
+            if is_event_msg
+                && !line.contains("\"token_count\"")
+                && !line.contains("\"thread_settings_applied\"")
+            {
+                continue;
+            }
+
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+
+            match event_type {
+                "session_meta" if !self.root_meta_seen => {
+                    self.root_meta_seen = true;
+                    self.root_timestamp = parse_timestamp(value.get("timestamp"));
+                    let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+                    let mut parent = explicit_parent_from_meta(payload);
+                    self.bounded_history = payload.get("history_base").cloned();
+
+                    self.meta_thread_id = non_empty_string(
+                        payload
+                            .get("id")
+                            .or_else(|| payload.get("thread_id"))
+                            .or_else(|| payload.get("threadId")),
+                    )
+                    .map(|id| {
+                        uuid::Uuid::parse_str(&id)
+                            .map(|value| value.hyphenated().to_string())
+                            .unwrap_or(id)
+                    });
+                    let leading_id = leading_thread_id_from_filename(file_path);
+                    if let (Some(filename_id), Some(meta_id)) =
+                        (root_thread_id, self.meta_thread_id.as_ref())
+                    {
+                        let matches = filename_id == meta_id
+                            || leading_id.as_deref() == Some(meta_id.as_str());
+                        if !matches {
+                            parent = ParentResolution::Deferred(format!(
+                                "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
+                            ));
+                        }
+                    }
+
+                    // 分支线程翻页产生的续写页（`<branchId>_<pageId>`）以及带有指向本线程
+                    // history_base 的延续分段，其 session_meta 仍保留所属分支会话的
+                    // forked_from_id / parent_thread_id；但续写页是在本线程之后实时追加的，
+                    // 记录的是翻页后的新事件，新格式续写页不复制父会话用量。如果将其作为
+                    // 新 fork 处理，其 session_meta 时间戳是翻页时刻（晚于原始父线程末尾），
+                    // 会因父线程无法达到 child cutoff 而被永久 deferred。
+                    // 识别为本线程延续后，将其标为 Continuation，不剔除父重放（无需对齐父时间线）。
+                    self.history_base_thread_id = non_empty_string(
+                        payload
+                            .get("history_base")
+                            .and_then(|hb| hb.get("thread_id")),
+                    )
+                    .map(|id| {
+                        uuid::Uuid::parse_str(&id)
+                            .map(|value| value.hyphenated().to_string())
+                            .unwrap_or(id)
+                    });
+                    let is_paginated = payload
+                        .get("history_mode")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("paginated");
+                    let has_history_base = self.history_base_thread_id.is_some();
+                    let has_parent = matches!(parent, ParentResolution::Parent(_));
+                    self.is_continuation =
+                        match (leading_id.as_deref(), self.meta_thread_id.as_deref()) {
+                            (Some(leading), Some(meta)) if leading == meta => {
+                                is_paginated || has_history_base || has_parent
+                            }
+                            _ => {
+                                has_history_base
+                                    && self.history_base_thread_id.as_deref()
+                                        == self.meta_thread_id.as_deref()
+                            }
+                        };
+
+                    if self.is_continuation {
+                        let ancestor_parent_id = match &parent {
+                            ParentResolution::Parent(p) => Some(p.clone()),
+                            _ => None,
+                        };
+                        parent = ParentResolution::Continuation {
+                            ancestor_parent_id,
+                            history_base_id: self.history_base_thread_id.clone(),
+                        };
+                    }
+
+                    if let ParentResolution::Parent(parent_id) = &mut parent {
+                        match uuid::Uuid::parse_str(parent_id) {
+                            Ok(value) => *parent_id = value.hyphenated().to_string(),
+                            Err(_) => {
+                                parent = ParentResolution::Deferred(format!(
+                                    "显式 parent_thread_id 不是有效 UUID: {parent_id}"
+                                ));
+                            }
+                        }
+                    }
+                    if matches!(
+                        (root_thread_id, &parent),
+                        (Some(root), ParentResolution::Parent(parent_id)) if root == parent_id.as_str()
+                    ) {
+                        parent = ParentResolution::Deferred(
+                            "parent_thread_id 与 root_thread_id 相同".to_string(),
+                        );
+                    }
+                    self.parent = Some(parent);
+                }
+                "turn_context" => {
+                    if let Some(payload) = value.get("payload") {
+                        if let Some(model) = payload
+                            .get("model")
+                            .or_else(|| payload.get("info").and_then(|info| info.get("model")))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            self.current_model = normalize_codex_model(model);
+                        }
+                    }
+                }
+                "event_msg" => {
+                    let Some(payload) = value.get("payload") else {
+                        continue;
+                    };
+                    if payload.get("type").and_then(serde_json::Value::as_str)
+                        == Some("thread_settings_applied")
+                    {
+                        // Resumed/Desktop threads may change models without another
+                        // turn_context. Only update attribution: the cumulative token
+                        // baseline and duplicate snapshots still belong to the session.
+                        if let Some(model) = payload
+                            .get("thread_settings")
+                            .and_then(|settings| settings.get("model"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|model| !model.is_empty())
+                        {
+                            self.current_model = normalize_codex_model(model);
+                        }
+                        continue;
+                    }
+                    if payload.get("type").and_then(serde_json::Value::as_str)
+                        != Some("token_count")
+                    {
+                        continue;
+                    }
+                    let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
+                        continue;
+                    };
+                    let Some(signature) = parse_token_signature(info) else {
+                        continue;
+                    };
+
+                    if let Some(model) = info
+                        .get("model")
+                        .or_else(|| info.get("model_name"))
+                        .or_else(|| payload.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        self.current_model = normalize_codex_model(model);
+                    }
+
+                    let snapshot_source = token_snapshot_source(payload);
+                    let total = info
+                        .get("total_token_usage")
+                        .and_then(parse_cumulative_tokens);
+                    let last = info
+                        .get("last_token_usage")
+                        .and_then(parse_cumulative_tokens);
+                    if let Some(pending) = self.pending_usage.take() {
+                        // 对得上的 last 已经由这条 token_count 入账。last 为 0 是远程压缩
+                        // 把本次用量只写在 token_usage_record 里之后的空快照。其它对不上的
+                        // 记录只用于耗时，不能再记一行。
+                        let covered = last
+                            .as_ref()
+                            .is_some_and(|last| usage_matches(last, &pending.usage));
+                        if !covered && last.as_ref().is_some_and(usage_is_zero) {
+                            push_unmatched_usage(
+                                &mut usage_record_events,
+                                pending,
+                                self.line_offset,
+                                &mut self.has_billable_tokens,
+                            );
+                        }
+                    }
+                    if total.is_none() && last.is_none() {
+                        continue;
+                    }
+                    let has_total_snapshot = total.is_some();
+                    let duplicate_snapshot = has_total_snapshot
+                        && (self.last_signature_by_source.iter().any(|(source, known)| {
+                            *source == snapshot_source && *known == signature
+                        }) || self.previous_token_signature.as_ref() == Some(&signature));
+                    if has_total_snapshot {
+                        match self
+                            .last_signature_by_source
+                            .iter_mut()
+                            .find(|(source, _)| *source == snapshot_source)
+                        {
+                            Some(entry) => entry.1 = signature.clone(),
+                            None => {
+                                self.last_signature_by_source
+                                    .push((snapshot_source, signature.clone()));
+                            }
+                        }
+                    }
+                    self.previous_token_signature = Some(signature.clone());
+
+                    let request_usage = last.clone();
+                    let delta = if duplicate_snapshot {
+                        DeltaTokens {
+                            input: 0,
+                            cached_input: 0,
+                            cache_write_input: 0,
+                            output: 0,
+                        }
+                    } else if let Some(last) = last {
+                        // Codex provides the exact per-request usage. Prefer it to
+                        // subtracting cumulative snapshots, which may come from
+                        // multiple independently advancing rate-limit lanes.
+                        DeltaTokens {
+                            input: last.input as u32,
+                            cached_input: last.cached_input as u32,
+                            cache_write_input: last.cache_write_input as u32,
+                            output: last.output as u32,
+                        }
+                    } else if let Some(total) = total.as_ref() {
+                        if self.is_continuation && self.total_high_water.is_none() {
+                            let meta_id = self.meta_thread_id.as_deref().unwrap_or_default();
+                            match resolve_continuation_baseline(
+                                file_path,
+                                meta_id,
+                                self.history_base_thread_id.as_deref(),
+                                rollout_index,
+                            ) {
+                                Ok(Some(baseline)) => {
+                                    if total.input < baseline.input {
+                                        // 续写页计数器重置（从 0 或较小值起算），以当前快照为首轮基线
+                                        self.total_high_water = None;
+                                    } else {
+                                        // 继承上一分段截止高水位基线
+                                        self.total_high_water = Some(baseline);
+                                    }
+                                }
+                                Ok(None) => {
+                                    self.total_high_water = None;
+                                }
+                                Err(err) => {
+                                    // 防御机制：前序分段无法读取或基线无法可靠恢复，必须暂缓导入
+                                    self.parent = Some(ParentResolution::Deferred(format!(
+                                        "续写页缺少有效的前序累计用量基线: {err}"
+                                    )));
+                                    self.has_billable_tokens = true;
+                                    break;
+                                }
+                            }
+                        }
+                        compute_delta(&self.total_high_water, total)
+                    } else {
+                        continue;
+                    };
+                    if let Some(total) = total {
+                        if let Some(high_water) = self.total_high_water.as_mut() {
+                            update_high_water(high_water, &total);
+                        } else {
+                            self.total_high_water = Some(total);
+                        }
+                    }
+                    // Cache reads and writes are disjoint parts of input_tokens.
+                    let cached_input = delta.cached_input.min(delta.input);
+                    let delta = DeltaTokens {
+                        cached_input,
+                        cache_write_input: delta.cache_write_input.min(delta.input - cached_input),
+                        ..delta
+                    };
+                    let nonzero_index = if delta.is_zero() {
+                        None
+                    } else {
+                        self.has_billable_tokens = true;
+                        self.event_index = self.event_index.saturating_add(1);
+                        Some(self.event_index)
+                    };
+
+                    let timestamp = value
+                        .get("timestamp")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    // 重复快照（限额刷新时重发的）不是一次请求，不参与计时
+                    let timing = nonzero_index.and_then(|_| {
+                        self.timer.finish_request(
+                            timestamp.as_deref().and_then(parse_timestamp_millis),
+                            request_usage.as_ref(),
+                        )
+                    });
+
+                    token_events.push(ParsedTokenEvent {
+                        line_offset: self.line_offset,
+                        signature,
+                        delta,
+                        event_index: nonzero_index,
+                        request_suffix: None,
+                        model: self.current_model.clone(),
+                        timestamp,
+                        timing,
+                    });
+                }
+                "token_usage_record" => {
+                    self.pending_usage = None;
+                    let Some(payload) = value.get("payload") else {
+                        continue;
+                    };
+                    let Some(usage) = payload.get("usage").and_then(parse_cumulative_tokens) else {
+                        continue;
+                    };
+                    if usage_is_zero(&usage) {
+                        continue;
+                    }
+                    let response_id = payload
+                        .get("response_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let key = if response_id.is_empty() {
+                        format!("line{}", self.line_offset)
+                    } else {
+                        response_id.to_string()
+                    };
+                    self.pending_usage = Some(PendingUsageRecord {
+                        key,
+                        usage,
+                        timestamp: value
+                            .get("timestamp")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        model: self.current_model.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        (token_events, usage_record_events)
+    }
+}
+
+/// 解析一段从 `cursor.last_byte_offset` 起的字节增量。
+///
+/// 段按 `\n` 切记录：完整记录（或无换行但 JSON 完整的末记录）推进行号与
+/// 续读起点，段尾半行不消费、由下一段重读补全。空段直接原样返回游标与
+/// 状态——远程清单 diff 无新增字节时无产出、无推进。
+pub(crate) fn parse_codex_usage_segment(
+    bytes: &[u8],
+    cursor: &SyncCursor,
+    ctx: &CodexSegmentContext<'_>,
+) -> CodexSegmentOutcome {
+    // 段状态恢复：parser_state 序列化往返。本机全文件形态（无 parser_state）
+    // 或状态损坏时从头起步——重放由 request_id 主键去重兜底，不会双算
+    let mut state: CodexSegmentState = cursor
+        .parser_state
+        .as_deref()
+        .and_then(|serialized| serde_json::from_str(serialized).ok())
+        .unwrap_or_default();
+    if state.current_model.is_empty() {
+        state.current_model = "unknown".to_string();
+    }
+    // 续读起点以游标列为权威（防序列化值与游标漂移）
+    state.committed_bytes = cursor.last_byte_offset.unwrap_or(0);
+
+    if bytes.is_empty() {
+        return CodexSegmentOutcome {
+            token_events: Vec::new(),
+            usage_record_events: Vec::new(),
+            state,
+            cursor: cursor.clone(),
+        };
+    }
+
+    let (token_events, usage_record_events) = state.advance(bytes, ctx);
+    let line_offset = state.line_offset;
+    let committed_bytes = state.committed_bytes;
+    CodexSegmentOutcome {
+        token_events,
+        usage_record_events,
+        cursor: SyncCursor {
+            last_modified: cursor.last_modified,
+            last_line_offset: line_offset,
+            last_byte_offset: Some(committed_bytes),
+            // Codex 路径不使用尾部指纹
+            last_tail_fingerprint: None,
+            // 序列化失败兜底旧值：宁可下段回到旧状态重放（request_id 去重）
+            // 也不能丢掉可续读的游标
+            parser_state: serde_json::to_string(&state).ok().or_else(|| {
+                cursor
+                    .parser_state
+                    .clone()
+                    .or_else(|| serde_json::to_string(&CodexSegmentState::default()).ok())
+            }),
+            last_synced_at: cursor.last_synced_at,
+        },
+        state,
+    }
+}
+
 #[cfg(test)]
 fn parse_codex_file(
     file_path: &Path,
@@ -1268,409 +1801,41 @@ fn parse_codex_file_with_index(
     };
     let mut reader = codex_rollout_file::reader_from_file(file_path, file)
         .map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
-    let mut root_meta_seen = false;
-    let mut bounded_history = None;
-    let mut root_timestamp = None;
-    let mut meta_thread_id = None;
-    let mut parent = ParentResolution::None;
-    let mut current_model = "unknown".to_string();
-    // `total_token_usage` is session-cumulative, including across model and
-    // rate-limit bucket changes. Divergent snapshots are handled by preferring
-    // exact `last_token_usage`, not by splitting the cumulative baseline.
-    let mut total_high_water = None;
-    // Rate-limit refreshes can re-emit unchanged token info under another
-    // `limit_id`. Same-source repeats are identified by that source's latest
-    // full snapshot; cross-source repeats must match the immediately preceding
-    // token event. Do not compare against other sources' older snapshots:
-    // those stale signatures can legitimately recur after a counter reset.
-    let mut last_signature_by_source: HashMap<Option<String>, TokenUsageSignature> = HashMap::new();
-    let mut previous_token_signature = None;
-    let mut is_continuation = false;
-    let mut history_base_thread_id = None;
-    let mut event_index = 0u32;
-    let mut token_events = Vec::new();
-    let mut usage_record_events = Vec::new();
-    let mut pending_usage: Option<PendingUsageRecord> = None;
-    let mut line_offset = 0i64;
-    let mut observed_bytes = 0i64;
-    let mut has_billable_tokens = false;
-    let mut timer = RequestTimer::default();
-
-    loop {
-        let mut bytes = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut bytes)
-            .map_err(|e| AppError::Config(format!("无法读取 Codex 日志: {e}")))?;
-        // Count the incomplete suffix too, so an unchanged crashed/closed
-        // rollout is skipped rather than fully reparsed on every sync pass.
-        observed_bytes += read as i64;
-        // A live writer may have only written part of the final JSON record.
-        // Leave its line cursor unconsumed for the next file change, but retain
-        // support for a complete final JSON record without a newline.
-        if read == 0
-            || (bytes.last() != Some(&b'\n')
-                && serde_json::from_slice::<serde_json::Value>(&bytes).is_err())
-        {
-            break;
-        }
-        line_offset += 1;
-        let line = match String::from_utf8(bytes) {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        timer.observe_line(&line);
-
-        let is_event_msg = line.contains("\"event_msg\"");
-        let is_turn_context = line.contains("\"turn_context\"");
-        let is_session_meta = line.contains("\"session_meta\"");
-        let is_usage_record = line.contains("\"token_usage_record\"");
-        if !is_event_msg && !is_turn_context && !is_session_meta && !is_usage_record {
-            continue;
-        }
-        if is_event_msg
-            && !line.contains("\"token_count\"")
-            && !line.contains("\"thread_settings_applied\"")
-        {
-            continue;
-        }
-
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-
-        match event_type {
-            "session_meta" if !root_meta_seen => {
-                root_meta_seen = true;
-                root_timestamp = parse_timestamp(value.get("timestamp"));
-                let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
-                parent = explicit_parent_from_meta(payload);
-                bounded_history = payload.get("history_base").cloned();
-
-                meta_thread_id = non_empty_string(
-                    payload
-                        .get("id")
-                        .or_else(|| payload.get("thread_id"))
-                        .or_else(|| payload.get("threadId")),
-                )
-                .map(|id| {
-                    uuid::Uuid::parse_str(&id)
-                        .map(|value| value.hyphenated().to_string())
-                        .unwrap_or(id)
-                });
-                let leading_id = leading_thread_id_from_filename(file_path);
-                if let (Some(filename_id), Some(meta_id)) =
-                    (&root_thread_id, meta_thread_id.as_ref())
-                {
-                    let matches =
-                        filename_id == meta_id || leading_id.as_deref() == Some(meta_id.as_str());
-                    if !matches {
-                        parent = ParentResolution::Deferred(format!(
-                            "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
-                        ));
-                    }
-                }
-
-                // 分支线程翻页产生的续写页（`<branchId>_<pageId>`）以及带有指向本线程
-                // history_base 的延续分段，其 session_meta 仍保留所属分支会话的
-                // forked_from_id / parent_thread_id；但续写页是在本线程之后实时追加的，
-                // 记录的是翻页后的新事件，新格式续写页不复制父会话用量。如果将其作为
-                // 新 fork 处理，其 session_meta 时间戳是翻页时刻（晚于原始父线程末尾），
-                // 会因父线程无法达到 child cutoff 而被永久 deferred。
-                // 识别为本线程延续后，将其标为 Continuation，不剔除父重放（无需对齐父时间线）。
-                history_base_thread_id = non_empty_string(
-                    payload
-                        .get("history_base")
-                        .and_then(|hb| hb.get("thread_id")),
-                )
-                .map(|id| {
-                    uuid::Uuid::parse_str(&id)
-                        .map(|value| value.hyphenated().to_string())
-                        .unwrap_or(id)
-                });
-                let is_paginated = payload
-                    .get("history_mode")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("paginated");
-                let has_history_base = history_base_thread_id.is_some();
-                let has_parent = matches!(parent, ParentResolution::Parent(_));
-                is_continuation = match (leading_id.as_deref(), meta_thread_id.as_deref()) {
-                    (Some(leading), Some(meta)) if leading == meta => {
-                        is_paginated || has_history_base || has_parent
-                    }
-                    _ => {
-                        has_history_base
-                            && history_base_thread_id.as_deref() == meta_thread_id.as_deref()
-                    }
-                };
-
-                if is_continuation {
-                    let ancestor_parent_id = match &parent {
-                        ParentResolution::Parent(p) => Some(p.clone()),
-                        _ => None,
-                    };
-                    parent = ParentResolution::Continuation {
-                        ancestor_parent_id,
-                        history_base_id: history_base_thread_id.clone(),
-                    };
-                }
-
-                if let ParentResolution::Parent(parent_id) = &mut parent {
-                    match uuid::Uuid::parse_str(parent_id) {
-                        Ok(value) => *parent_id = value.hyphenated().to_string(),
-                        Err(_) => {
-                            parent = ParentResolution::Deferred(format!(
-                                "显式 parent_thread_id 不是有效 UUID: {parent_id}"
-                            ));
-                        }
-                    }
-                }
-                if matches!((&root_thread_id, &parent), (Some(root), ParentResolution::Parent(parent_id)) if root == parent_id)
-                {
-                    parent = ParentResolution::Deferred(
-                        "parent_thread_id 与 root_thread_id 相同".to_string(),
-                    );
-                }
-            }
-            "turn_context" => {
-                if let Some(payload) = value.get("payload") {
-                    if let Some(model) = payload
-                        .get("model")
-                        .or_else(|| payload.get("info").and_then(|info| info.get("model")))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        current_model = normalize_codex_model(model);
-                    }
-                }
-            }
-            "event_msg" => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(serde_json::Value::as_str)
-                    == Some("thread_settings_applied")
-                {
-                    // Resumed/Desktop threads may change models without another
-                    // turn_context. Only update attribution: the cumulative token
-                    // baseline and duplicate snapshots still belong to the session.
-                    if let Some(model) = payload
-                        .get("thread_settings")
-                        .and_then(|settings| settings.get("model"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|model| !model.is_empty())
-                    {
-                        current_model = normalize_codex_model(model);
-                    }
-                    continue;
-                }
-                if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
-                    continue;
-                }
-                let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
-                    continue;
-                };
-                let Some(signature) = parse_token_signature(info) else {
-                    continue;
-                };
-
-                if let Some(model) = info
-                    .get("model")
-                    .or_else(|| info.get("model_name"))
-                    .or_else(|| payload.get("model"))
-                    .and_then(serde_json::Value::as_str)
-                {
-                    current_model = normalize_codex_model(model);
-                }
-
-                let snapshot_source = token_snapshot_source(payload);
-                let total = info
-                    .get("total_token_usage")
-                    .and_then(parse_cumulative_tokens);
-                let last = info
-                    .get("last_token_usage")
-                    .and_then(parse_cumulative_tokens);
-                if let Some(pending) = pending_usage.take() {
-                    // 对得上的 last 已经由这条 token_count 入账。last 为 0 是远程压缩
-                    // 把本次用量只写在 token_usage_record 里之后的空快照。其它对不上的
-                    // 记录只用于耗时，不能再记一行。
-                    let covered = last
-                        .as_ref()
-                        .is_some_and(|last| usage_matches(last, &pending.usage));
-                    if !covered && last.as_ref().is_some_and(usage_is_zero) {
-                        push_unmatched_usage(
-                            &mut usage_record_events,
-                            pending,
-                            line_offset,
-                            &mut has_billable_tokens,
-                        );
-                    }
-                }
-                if total.is_none() && last.is_none() {
-                    continue;
-                }
-                let has_total_snapshot = total.is_some();
-                let duplicate_snapshot = has_total_snapshot
-                    && (last_signature_by_source.get(&snapshot_source) == Some(&signature)
-                        || previous_token_signature.as_ref() == Some(&signature));
-                if has_total_snapshot {
-                    last_signature_by_source.insert(snapshot_source, signature.clone());
-                }
-                previous_token_signature = Some(signature.clone());
-
-                let request_usage = last.clone();
-                let delta = if duplicate_snapshot {
-                    DeltaTokens {
-                        input: 0,
-                        cached_input: 0,
-                        cache_write_input: 0,
-                        output: 0,
-                    }
-                } else if let Some(last) = last {
-                    // Codex provides the exact per-request usage. Prefer it to
-                    // subtracting cumulative snapshots, which may come from
-                    // multiple independently advancing rate-limit lanes.
-                    DeltaTokens {
-                        input: last.input as u32,
-                        cached_input: last.cached_input as u32,
-                        cache_write_input: last.cache_write_input as u32,
-                        output: last.output as u32,
-                    }
-                } else if let Some(total) = total.as_ref() {
-                    if is_continuation && total_high_water.is_none() {
-                        let meta_id = meta_thread_id.as_deref().unwrap_or_default();
-                        match resolve_continuation_baseline(
-                            file_path,
-                            meta_id,
-                            history_base_thread_id.as_deref(),
-                            rollout_index,
-                        ) {
-                            Ok(Some(baseline)) => {
-                                if total.input < baseline.input {
-                                    // 续写页计数器重置（从 0 或较小值起算），以当前快照为首轮基线
-                                    total_high_water = None;
-                                } else {
-                                    // 继承上一分段截止高水位基线
-                                    total_high_water = Some(baseline);
-                                }
-                            }
-                            Ok(None) => {
-                                total_high_water = None;
-                            }
-                            Err(err) => {
-                                // 防御机制：前序分段无法读取或基线无法可靠恢复，必须暂缓导入
-                                parent = ParentResolution::Deferred(format!(
-                                    "续写页缺少有效的前序累计用量基线: {err}"
-                                ));
-                                has_billable_tokens = true;
-                                break;
-                            }
-                        }
-                    }
-                    compute_delta(&total_high_water, total)
-                } else {
-                    continue;
-                };
-                if let Some(total) = total {
-                    if let Some(high_water) = total_high_water.as_mut() {
-                        update_high_water(high_water, &total);
-                    } else {
-                        total_high_water = Some(total);
-                    }
-                }
-                // Cache reads and writes are disjoint parts of input_tokens.
-                let cached_input = delta.cached_input.min(delta.input);
-                let delta = DeltaTokens {
-                    cached_input,
-                    cache_write_input: delta.cache_write_input.min(delta.input - cached_input),
-                    ..delta
-                };
-                let nonzero_index = if delta.is_zero() {
-                    None
-                } else {
-                    has_billable_tokens = true;
-                    event_index = event_index.saturating_add(1);
-                    Some(event_index)
-                };
-
-                let timestamp = value
-                    .get("timestamp")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                // 重复快照（限额刷新时重发的）不是一次请求，不参与计时
-                let timing = nonzero_index.and_then(|_| {
-                    timer.finish_request(
-                        timestamp.as_deref().and_then(parse_timestamp_millis),
-                        request_usage.as_ref(),
-                    )
-                });
-
-                token_events.push(ParsedTokenEvent {
-                    line_offset,
-                    signature,
-                    delta,
-                    event_index: nonzero_index,
-                    request_suffix: None,
-                    model: current_model.clone(),
-                    timestamp,
-                    timing,
-                });
-            }
-            "token_usage_record" => {
-                pending_usage = None;
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                let Some(usage) = payload.get("usage").and_then(parse_cumulative_tokens) else {
-                    continue;
-                };
-                if usage_is_zero(&usage) {
-                    continue;
-                }
-                let response_id = payload
-                    .get("response_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let key = if response_id.is_empty() {
-                    format!("line{line_offset}")
-                } else {
-                    response_id.to_string()
-                };
-                pending_usage = Some(PendingUsageRecord {
-                    key,
-                    usage,
-                    timestamp: value
-                        .get("timestamp")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    model: current_model.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
+    // 本机同步是全文件形态：从 0 起一次性把整个文件喂给字节段解析内核
+    // （逐行解析行为与旧的流式 read_until 循环等价；已解析行号的入库过滤
+    // 由 sync_single_codex_file 的 last_offset 门承担）。解压 / 读取错误照旧
+    // 整文件失败
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| AppError::Config(format!("无法读取 Codex 日志: {e}")))?;
+    let ctx = CodexSegmentContext {
+        file_path,
+        root_thread_id: root_thread_id.as_deref(),
+        rollout_index,
+    };
+    let outcome = parse_codex_usage_segment(&bytes, &SyncCursor::default(), &ctx);
+    let CodexSegmentOutcome {
+        token_events,
+        usage_record_events,
+        state,
+        ..
+    } = outcome;
 
     Ok(ParsedCodexFile {
         root_thread_id,
-        meta_thread_id,
-        root_meta_seen,
-        bounded_history,
-        root_timestamp,
-        parent,
+        meta_thread_id: state.meta_thread_id,
+        root_meta_seen: state.root_meta_seen,
+        bounded_history: state.bounded_history,
+        root_timestamp: state.root_timestamp,
+        parent: state.parent.unwrap_or(ParentResolution::None),
         token_events,
         usage_record_events,
-        line_offset,
+        line_offset: state.line_offset,
         observed_bytes: compressed_size
             .and_then(|size| i64::try_from(size).ok())
-            .unwrap_or(observed_bytes),
-        has_billable_tokens,
+            .unwrap_or(state.observed_bytes),
+        has_billable_tokens: state.has_billable_tokens,
     })
 }
 
@@ -6720,5 +6885,223 @@ mod tests {
         ];
 
         assert_eq!(parsed_latencies(&lines), vec![Some(30_090), Some(10_100)]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 字节段续读纯函数（parse_codex_usage_segment）等价性
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 覆盖跨段协作形态的样本 rollout：累计 total 快照递增（高水位推进）、
+    /// 精确 last 用量、远程压缩式 token_usage_record（由其后全 0 last 的
+    /// token_count 补记——record 与配对 count 分居两段时靠段状态接力）
+    fn codex_segment_sample_bytes() -> Vec<u8> {
+        let lines = [
+            session_meta_at(PARENT_ID, None, None, "2026-07-10T03:00:00Z"),
+            turn_context_at("2026-07-10T03:00:01Z"),
+            token_count_at(1_000, 900, 100, "2026-07-10T03:00:06Z"),
+            token_count_at(1_300, 1_050, 150, "2026-07-10T03:00:07Z"),
+            token_usage_record_at("resp_1", 60, 0, 40, "2026-07-10T03:00:08Z"),
+            token_count_with_last_at(
+                1_360,
+                1_050,
+                190,
+                0,
+                0,
+                0,
+                "default",
+                "2026-07-10T03:00:08Z",
+            ),
+            token_count_with_last_at(
+                1_500,
+                1_100,
+                260,
+                140,
+                100,
+                60,
+                "default",
+                "2026-07-10T03:00:20Z",
+            ),
+        ];
+        ((lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n")
+            .into_bytes())
+    }
+
+    /// 段上下文：样本文件名与 PARENT_ID 一致（不触发 meta/文件名不一致的
+    /// Deferred），无 rollout 索引（基线解析不触发——样本非续写页）
+    fn codex_segment_context() -> CodexSegmentContext<'static> {
+        CodexSegmentContext {
+            file_path: Path::new(
+                "rollout-2026-07-10T03-00-00-00000000-0000-4000-8000-000000000001.jsonl",
+            ),
+            root_thread_id: Some(PARENT_ID),
+            rollout_index: None,
+        }
+    }
+
+    /// 首扫形态：无 parser_state，一次性喂入完整文件
+    fn parse_codex_whole_segment(bytes: &[u8]) -> CodexSegmentOutcome {
+        let ctx = codex_segment_context();
+        parse_codex_usage_segment(bytes, &SyncCursor::default(), &ctx)
+    }
+
+    /// 按切点接力喂入；每段从上一段游标边界（最后完整记录后）起，
+    /// 跨段状态经 cursor.parser_state 序列化往返
+    fn parse_codex_split_segments(
+        bytes: &[u8],
+        cuts: &[usize],
+    ) -> (Vec<ParsedTokenEvent>, Vec<ParsedTokenEvent>, SyncCursor) {
+        let mut cursor = SyncCursor::default();
+        let ctx = codex_segment_context();
+        let mut token_events = Vec::new();
+        let mut usage_record_events = Vec::new();
+        for cut in cuts.iter().copied().chain(std::iter::once(bytes.len())) {
+            let start = cursor.last_byte_offset.unwrap_or(0) as usize;
+            assert!(start <= cut, "切点必须不早于游标边界");
+            let outcome = parse_codex_usage_segment(&bytes[start..cut], &cursor, &ctx);
+            token_events.extend(outcome.token_events);
+            usage_record_events.extend(outcome.usage_record_events);
+            cursor = outcome.cursor;
+        }
+        (token_events, usage_record_events, cursor)
+    }
+
+    fn assert_codex_events_match(
+        whole_tokens: &[ParsedTokenEvent],
+        whole_records: &[ParsedTokenEvent],
+        split_tokens: &[ParsedTokenEvent],
+        split_records: &[ParsedTokenEvent],
+    ) {
+        assert_eq!(
+            whole_tokens.len(),
+            split_tokens.len(),
+            "token 事件数须一致：\nwhole={whole_tokens:#?}\nsplit={split_tokens:#?}"
+        );
+        for (expected, actual) in whole_tokens.iter().zip(split_tokens) {
+            assert_eq!(expected.line_offset, actual.line_offset);
+            assert_eq!(expected.delta.input, actual.delta.input);
+            assert_eq!(expected.delta.cached_input, actual.delta.cached_input);
+            assert_eq!(expected.delta.output, actual.delta.output);
+            assert_eq!(expected.event_index, actual.event_index);
+            assert_eq!(expected.request_suffix, actual.request_suffix);
+            assert_eq!(expected.model, actual.model);
+            assert_eq!(expected.timestamp, actual.timestamp);
+            assert_eq!(expected.timing, actual.timing, "计时估算须一致");
+        }
+        assert_eq!(whole_records.len(), split_records.len());
+        for (expected, actual) in whole_records.iter().zip(split_records) {
+            assert_eq!(expected.line_offset, actual.line_offset);
+            assert_eq!(expected.request_suffix, actual.request_suffix);
+            assert_eq!(expected.delta.input, actual.delta.input);
+            assert_eq!(expected.delta.output, actual.delta.output);
+        }
+    }
+
+    /// 前 `lines` 行（含行尾 `\n`）的累计字节长度
+    fn codex_segment_line_cut(bytes: &[u8], lines: usize) -> usize {
+        bytes
+            .split(|b| *b == b'\n')
+            .take(lines)
+            .map(|line| line.len() + 1)
+            .sum()
+    }
+
+    #[test]
+    fn codex_segment_feed_two_way_split_matches_whole_file() {
+        let bytes = codex_segment_sample_bytes();
+        let whole = parse_codex_whole_segment(&bytes);
+
+        // 一次性喂入的产出基线：四次 token 快照事件（其中全 0 last 的一次
+        // delta 为零、event_index 为 None，入库时被过滤）+ 一次 usage_record 补记
+        assert_eq!(whole.token_events.len(), 4);
+        assert_eq!(whole.usage_record_events.len(), 1);
+        assert!(whole.state.has_billable_tokens);
+
+        // 在 token_usage_record 与其配对 token_count 之间切一刀：
+        // pending 记录经段状态接力后照常补记
+        let cut = codex_segment_line_cut(&bytes, 5);
+        assert!(cut > 0);
+        let (split_tokens, split_records, split_cursor) =
+            parse_codex_split_segments(&bytes, &[cut]);
+
+        assert_codex_events_match(
+            &whole.token_events,
+            &whole.usage_record_events,
+            &split_tokens,
+            &split_records,
+        );
+        assert_eq!(split_cursor.last_line_offset, whole.cursor.last_line_offset);
+        assert_eq!(
+            split_cursor.last_byte_offset, whole.cursor.last_byte_offset,
+            "分段接力的续读起点须与一次性喂入一致"
+        );
+    }
+
+    #[test]
+    fn codex_segment_feed_three_way_split_with_mid_line_cut_matches_whole_file() {
+        let bytes = codex_segment_sample_bytes();
+        let whole = parse_codex_whole_segment(&bytes);
+
+        // 切点 1：session_meta 之后行边界；切点 2：第 3 行（首个 token_count）行内。
+        // 半行记录不消费、游标停在它之前，下一段重读补全；session_meta、turn_context
+        // 与首个 token 快照分居三段，模型与高水位全部经段状态接力
+        let first_cut = codex_segment_line_cut(&bytes, 2);
+        let mid_line_cut = first_cut + 20;
+        let (split_tokens, split_records, split_cursor) =
+            parse_codex_split_segments(&bytes, &[first_cut, mid_line_cut]);
+
+        assert_codex_events_match(
+            &whole.token_events,
+            &whole.usage_record_events,
+            &split_tokens,
+            &split_records,
+        );
+        assert_eq!(split_cursor.last_line_offset, whole.cursor.last_line_offset);
+        assert_eq!(split_cursor.last_byte_offset, whole.cursor.last_byte_offset);
+    }
+
+    #[test]
+    fn codex_segment_empty_input_keeps_cursor_and_state() {
+        let bytes = codex_segment_sample_bytes();
+        let cut = codex_segment_line_cut(&bytes, 3);
+        let (_, _, cursor) = parse_codex_split_segments(&bytes, &[cut]);
+
+        // 空拉取：无事件、游标逐字段原样、段状态序列化往返稳定
+        let ctx = codex_segment_context();
+        let outcome = parse_codex_usage_segment(&[], &cursor, &ctx);
+        assert!(outcome.token_events.is_empty());
+        assert!(outcome.usage_record_events.is_empty());
+        assert_eq!(outcome.cursor, cursor);
+
+        let before: CodexSegmentState =
+            serde_json::from_str(cursor.parser_state.as_deref().unwrap_or("null")).unwrap();
+        let after: CodexSegmentState =
+            serde_json::from_str(outcome.cursor.parser_state.as_deref().unwrap_or("null")).unwrap();
+        assert_eq!(before, after, "空段不得改动段状态");
+    }
+
+    #[test]
+    fn codex_segment_tail_without_newline_is_consumed_when_json_completes() {
+        let mut bytes = codex_segment_sample_bytes();
+        // 去掉末行换行：末行是完整 JSON 记录——照常消费（行号推进），
+        // 续读起点推过它（下一段从文件末尾起）
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        let whole = parse_codex_whole_segment(&bytes);
+        assert_eq!(whole.token_events.len(), 4);
+        assert_eq!(whole.cursor.last_byte_offset, Some(bytes.len() as i64));
+        assert_eq!(
+            whole.cursor.last_line_offset, 7,
+            "无换行的完整末记录也计入行号"
+        );
+
+        // 末行是半行（JSON 不完整）时不消费：行号停在 6，续读起点回到行首
+        let mut truncated = bytes.clone();
+        truncated.truncate(bytes.len() - 20);
+        let partial = parse_codex_whole_segment(&truncated);
+        assert_eq!(partial.cursor.last_line_offset, 6);
     }
 }
