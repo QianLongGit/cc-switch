@@ -154,8 +154,9 @@ pub(crate) fn scan_sessions_with_status() -> SessionScan {
 
 /* ===== SSH 远程扫描链路（spec §5.4）===== */
 
-/// 远端目录解析命令超时（连接建立 + printf，亚秒级完成）
-const REMOTE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
+/// 远端目录解析命令超时（连接建立 + printf，亚秒级完成）；搜索链路的
+/// home_dirs 往返同口径复用
+pub(crate) const REMOTE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
 /// 远端清单命令超时（大目录 `find` 遍历较慢，放宽）
 const REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(120);
 /// 单批头尾拉取超时

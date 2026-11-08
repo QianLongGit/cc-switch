@@ -37,8 +37,8 @@ use serial_test::serial;
 use crate::settings::SshHostConfig;
 
 use super::ssh::{
-    control_socket_dir_path, escape_remote_path, read_block, run_remote, SshScanRegistry,
-    DISABLE_CONTROL_MASTER_FOR_TEST,
+    control_socket_dir_path, escape_remote_path, read_block, run_remote, RemoteFileMeta,
+    SshScanRegistry, DISABLE_CONTROL_MASTER_FOR_TEST,
 };
 
 /* ===== 远端命令超时（与 mod.rs 链路口径对齐）===== */
@@ -67,6 +67,14 @@ const CODEX_BODY: &str = concat!(
     "\"payload\":{\"id\":\"rollout-localtest\",\"cwd\":\"/tmp/localtest-project\"}}\n",
     "{\"timestamp\":\"2026-11-07T21:50:13Z\",\"type\":\"response_item\",",
     "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello codex localtest\"}}\n",
+);
+
+/// 远程搜索冒烟的 claude 夹具正文：关键词用大小写混合形态——远端
+/// rg / grep 的 `-i` 命中与本地高亮保留原文大小写形态两侧都验证到
+const SEARCH_CLAUDE_BODY: &str = concat!(
+    "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Zephyr unique search body\"},",
+    "\"sessionId\":\"sess-search\",\"cwd\":\"/tmp/localtest-project\",",
+    "\"timestamp\":\"2026-11-08T10:00:00Z\"}\n",
 );
 
 /* ===== 环境探测 ===== */
@@ -393,4 +401,138 @@ fn localhost_ssh_full_chain_smoke() {
     // guard Drop：清理剩余夹具目录 + 恢复 settings 与环境变量
     let _ = std::io::stdout().flush();
     eprintln!("localtest: 全链路冒烟通过");
+}
+
+/// localhost 远程搜索冒烟（迭代 2 Task 4，spec §4.2）：远端 rg / grep 真跑
+/// → 命中文件拉回解析 → 本地 snippet 高亮。覆盖真实进程路径的退出码语义
+/// （无命中 exit 1 = 空结果非错误）；清单走 registry 注入（免全 HOME find）。
+#[test]
+#[serial]
+fn localhost_ssh_remote_search_smoke() {
+    if !localhost_ssh_available() {
+        return;
+    }
+    eprintln!("localtest: ssh localhost 可用，执行远程搜索冒烟");
+
+    // ── 全局态准备（与全链路冒烟同模式：短 tempdir + settings 注入 + 禁 CM）──
+    let local_temp = tempfile::Builder::new()
+        .prefix("ccsw-lt-")
+        .tempdir_in("/tmp")
+        .expect("创建 /tmp 短前缀 tempdir")
+        .keep();
+    let original_env = std::env::var_os("CC_SWITCH_TEST_HOME");
+    std::env::set_var("CC_SWITCH_TEST_HOME", &local_temp);
+
+    let host = SshHostConfig {
+        id: "localtest".to_string(),
+        label: "localtest".to_string(),
+        host: "localhost".to_string(),
+        user: None,
+        port: None,
+        identity_file: None,
+    };
+    let original_settings = crate::settings::get_settings();
+    let mut with_host = original_settings.clone();
+    with_host.ssh_hosts = Some(vec![host.clone()]);
+    crate::settings::update_settings(with_host).expect("注入 localtest 主机到 settings");
+
+    let mut guard = FixtureGuard {
+        host: host.clone(),
+        remote_dirs: Vec::new(),
+        original_settings,
+        original_env,
+        local_temp,
+    };
+    DISABLE_CONTROL_MASTER_FOR_TEST.store(true, Ordering::Relaxed);
+
+    // ── 远端夹具：一个含关键词的 claude jsonl + 一个不含的 codex jsonl ──
+    let home_raw =
+        run_remote(&host, "printf '%s' \"$HOME\"", QUICK_CMD_TIMEOUT).expect("解析远端 HOME");
+    let home = String::from_utf8_lossy(&home_raw).trim().to_string();
+    assert!(home.starts_with('/'), "远端 HOME 应为绝对路径: {home}");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let claude_dir = format!("{home}/.claude/projects/cc-switch-search-{tag}");
+    let codex_dir = format!("{home}/.codex/sessions/cc-switch-search-{tag}");
+    let claude_file = format!("{claude_dir}/sess-search.jsonl");
+    let codex_file = format!("{codex_dir}/rollout-search.jsonl");
+    guard.remote_dirs.push(claude_dir.clone());
+    guard.remote_dirs.push(codex_dir.clone());
+
+    let setup = format!(
+        "mkdir -p {} {} && printf '%s' {} > {} && printf '%s' {} > {}",
+        escape_remote_path(&claude_dir),
+        escape_remote_path(&codex_dir),
+        escape_remote_path(SEARCH_CLAUDE_BODY),
+        escape_remote_path(&claude_file),
+        escape_remote_path(CODEX_BODY),
+        escape_remote_path(&codex_file),
+    );
+    run_remote(&host, &setup, SETUP_CMD_TIMEOUT).expect("构造远端搜索夹具");
+
+    // ── 清单注入：search_remote 只按清单圈定 grep 文件集（meta 值仅影响排序）──
+    let entries = [
+        (
+            claude_file.clone(),
+            RemoteFileMeta {
+                len: 1,
+                mtime_ms: 2000,
+            },
+        ),
+        (
+            codex_file.clone(),
+            RemoteFileMeta {
+                len: 1,
+                mtime_ms: 1000,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    SshScanRegistry::global().replace_manifest("localtest", entries);
+
+    // ── 1. 命中：远端 rg / grep 真跑 + 命中拉回解析 + 本地高亮 ──
+    let result = super::search::search_remote("zephyr", &host, None, 200);
+    assert_eq!(
+        result.hits.len(),
+        1,
+        "只应命中 claude 夹具: {:?}",
+        result.hits
+    );
+    let hit = &result.hits[0];
+    assert_eq!(hit.provider_id, "claude");
+    assert_eq!(
+        hit.source_path,
+        format!(
+            "ssh:localtest/{}",
+            claude_file.strip_prefix('/').unwrap_or(&claude_file)
+        )
+    );
+    assert_eq!(hit.match_count, 1);
+    let snippet = &hit.snippets[0];
+    assert_eq!(
+        snippet.message_index, 0,
+        "远程跳转降级：message_index 统一 0"
+    );
+    assert!(
+        snippet.text.contains("Zephyr"),
+        "snippet 应保留原文大小写形态: {}",
+        snippet.text
+    );
+    assert!(!snippet.highlights.is_empty(), "高亮区间非空");
+
+    // ── 2. providers 过滤：codex 圈内不含关键词文件 ──
+    let codex_only =
+        super::search::search_remote("zephyr", &host, Some(vec!["codex".to_string()]), 200);
+    assert!(
+        codex_only.hits.is_empty(),
+        "codex 过滤下不应命中 claude 文件"
+    );
+
+    // ── 3. 无命中：exit 1 = 空结果而非错误（真实进程路径的退出码语义）──
+    let miss = super::search::search_remote("no-such-keyword-xyz", &host, None, 200);
+    assert!(miss.hits.is_empty(), "无命中应为空结果而非错误");
+
+    // guard Drop：清理远端夹具 + 恢复 settings 与环境变量
+    eprintln!("localtest: 远程搜索冒烟通过");
 }

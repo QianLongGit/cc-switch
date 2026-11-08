@@ -45,22 +45,36 @@ pub async fn sync_session_index<R: tauri::Runtime>(
     }))
 }
 
-/// 在消息正文里搜索，按会话聚合；`providerIds` 为空时不按应用过滤
+/// 在消息正文里搜索，按会话聚合；`providerIds` 为空时不按应用过滤。
+/// `hostId` 有值时搜索对应 SSH 远程主机（主机配置缺失 → Err；未扫描过 →
+/// 空结果），缺省走本机索引零变化。
 #[tauri::command]
 pub async fn search_session_content(
     query: String,
     providerIds: Option<Vec<String>>,
     limit: Option<usize>,
+    hostId: Option<String>,
 ) -> Result<session_manager::search::ContentSearchResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        session_manager::search::search(
-            &query,
-            providerIds,
-            limit.unwrap_or(session_manager::search::DEFAULT_LIMIT),
-        )
+        let limit = limit.unwrap_or(session_manager::search::DEFAULT_LIMIT);
+        match hostId {
+            None => Ok(session_manager::search::search(&query, providerIds, limit)),
+            Some(host_id) => {
+                let host = crate::settings::get_settings()
+                    .ssh_hosts
+                    .and_then(|hosts| hosts.into_iter().find(|host| host.id == host_id))
+                    .ok_or_else(|| "SSH 主机不存在或已移除".to_string())?;
+                Ok(session_manager::search::search_remote(
+                    &query,
+                    &host,
+                    providerIds,
+                    limit,
+                ))
+            }
+        }
     })
     .await
-    .map_err(|e| format!("Failed to search session content: {e}"))
+    .map_err(|e| format!("Failed to search session content: {e}"))?
 }
 
 /// 删除会话正文索引文件（关闭「搜索消息正文」时调用）
