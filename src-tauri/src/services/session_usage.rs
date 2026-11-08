@@ -214,16 +214,16 @@ pub struct DataSourceSummary {
 /// 从 JSONL 中解析出的 assistant 消息使用数据
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedAssistantUsage {
-    message_id: String,
-    model: String,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_read_tokens: u32,
-    cache_creation_tokens: u32,
-    cache_creation_1h_tokens: u32,
-    stop_reason: Option<String>,
-    timestamp: Option<String>,
-    session_id: Option<String>,
+    pub(crate) message_id: String,
+    pub(crate) model: String,
+    pub(crate) input_tokens: u32,
+    pub(crate) output_tokens: u32,
+    pub(crate) cache_read_tokens: u32,
+    pub(crate) cache_creation_tokens: u32,
+    pub(crate) cache_creation_1h_tokens: u32,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) timestamp: Option<String>,
+    pub(crate) session_id: Option<String>,
 }
 
 /// 估算出的请求耗时短于这个毫秒数就不要：真实请求不可能这么快，多半是起点取错了。
@@ -287,7 +287,7 @@ fn record_chain_node(chain: &mut ChainNodes, value: &serde_json::Value) {
 /// 起点行（用户消息、工具结果）在游标前面：工具结果先落盘，回复要等整条
 /// 结束才一次写完。起点行比这个窗口还大（比如带图片的工具结果）时，那一条
 /// 请求就不估耗时。
-const CHAIN_SEED_BYTES: i64 = 256 * 1024;
+pub(crate) const CHAIN_SEED_BYTES: i64 = 256 * 1024;
 
 /// 读取游标前一小段字节（对话链回看窗口）。回复的前几块可能已经被上一轮读走，
 /// 这一轮要靠窗口里的行才知道回复从哪一块开始：窗口交给
@@ -567,10 +567,10 @@ struct ClaudeFileSync {
 }
 
 /// 游标边界指纹覆盖的尾部字节数（与 Pi 的 `REVISION_TAIL_BYTES` 同值）。
-const TAIL_FINGERPRINT_BYTES: i64 = 4096;
+pub(crate) const TAIL_FINGERPRINT_BYTES: i64 = 4096;
 
 /// 游标边界前尾部字节的指纹。域标签防止与其他用途的哈希混淆。
-fn claude_tail_fingerprint(tail: &[u8]) -> i64 {
+pub(crate) fn claude_tail_fingerprint(tail: &[u8]) -> i64 {
     let mut hasher = Sha256::new();
     hasher.update(b"claude-session-tail-v1");
     hasher.update(tail);
@@ -1036,6 +1036,7 @@ fn sync_single_file(
             &request_id,
             &msg,
             entry.timing,
+            "session_log",
             &mut pricing_cache,
         ) {
             // 补全已有的行也算进 imported：数据变了，界面要跟着刷新
@@ -1077,8 +1078,9 @@ fn sync_single_file(
 }
 
 /// 写入 Claude 路径的字节游标。`last_line_offset` 固定写 0：字节游标语义
-/// 下行号不再维护，置 0 明确表示"行号游标不可用"。
-fn update_claude_sync_state_on_conn(
+/// 下行号不再维护，置 0 明确表示"行号游标不可用"。远程主机路径（Task 8）
+/// 与本机共用此入口：`file_path` 键以 `ssh:<hostId>/` 前缀天然隔离。
+pub(crate) fn update_claude_sync_state_on_conn(
     conn: &rusqlite::Connection,
     file_path: &str,
     last_modified: i64,
@@ -1206,7 +1208,7 @@ pub(crate) fn update_byte_sync_state(
 
 /// 一条回复写库的结果。
 #[derive(Debug, PartialEq, Eq)]
-enum SessionRowOutcome {
+pub(crate) enum SessionRowOutcome {
     Inserted,
     /// 这条回复早先按中间块入过库，这次补全了用量或耗时；或者补全后发现它和
     /// 路由服务记的是同一次请求，把先前那一行删了。
@@ -1254,7 +1256,7 @@ fn find_stored_session_row(
 
 /// 单个文件导入事务的定价缓存；连接锁释放时一起丢弃，不跨事务缓存旧价或未命中。
 #[derive(Default)]
-struct SessionPricingCache {
+pub(crate) struct SessionPricingCache {
     entries: HashMap<String, Option<ModelPricing>>,
     #[cfg(test)]
     lookup_count: usize,
@@ -1328,7 +1330,10 @@ fn refresh_session_log_entry_on_conn(
     dedup_key: &DedupKey,
     pricing_cache: &mut SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
-    if stored.data_source != "session_log" {
+    // 补全只在同一来源内进行：本机行只被本机段补全，ssh:<hostId> 行只被
+    // 同主机的远程段补全——跨源（尤其与 proxy 行）互相补全会把对方账本
+    // 的字段改写掉。dedup_key.data_source 即本次入库的来源
+    if stored.data_source != dedup_key.data_source {
         return Ok(SessionRowOutcome::Skipped);
     }
     let output_grew = i64::from(msg.output_tokens) > stored.output_tokens;
@@ -1397,11 +1402,18 @@ fn refresh_session_log_entry_on_conn(
 ///
 /// 调用方持有连接锁（通常在事务内）。`timing` 是按日志时间戳估出来的
 /// 请求耗时（含首字等待）和首字时间，估不出来传 None。
-fn upsert_session_log_entry_on_conn(
+/// 单条 assistant 用量入库（INSERT OR IGNORE + 同源补全）。
+///
+/// `data_source` 是归属维度：本机路径传 `"session_log"`，SSH 远程路径传
+/// `"ssh:<hostId>"`（rollup 剪枝按此前缀分账到对应 host 行）。`ssh:` 前缀的
+/// 行不参与「会话行 vs proxy 行」跨源去重——远程流量不经本机代理，不存在
+/// 双记，跨源比对反而可能把远程行误伤成重复（设计 §4.4 裁定）。
+pub(crate) fn upsert_session_log_entry_on_conn(
     conn: &rusqlite::Connection,
     request_id: &str,
     msg: &ParsedAssistantUsage,
     timing: Option<EstimatedTiming>,
+    data_source: &str,
     pricing_cache: &mut SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
     let created_at = msg
@@ -1421,7 +1433,7 @@ fn upsert_session_log_entry_on_conn(
 
     let dedup_key = DedupKey {
         app_type: "claude",
-        data_source: "session_log",
+        data_source,
         model: &msg.model,
         input_tokens: msg.input_tokens,
         output_tokens: msg.output_tokens,
@@ -1440,7 +1452,9 @@ fn upsert_session_log_entry_on_conn(
             pricing_cache,
         );
     }
-    if has_matching_proxy_usage_log(conn, &dedup_key)? {
+    // 跨源去重只对本机会话行有意义（同一次请求可能同时被代理与会话日志
+    // 记下）；ssh: 行不与 proxy 行比对，见函数文档
+    if !data_source.starts_with("ssh:") && has_matching_proxy_usage_log(conn, &dedup_key)? {
         return Ok(SessionRowOutcome::Skipped);
     }
 
@@ -1480,7 +1494,7 @@ fn upsert_session_log_entry_on_conn(
                 1i64,               // is_streaming: Claude Code 通常使用流式
                 "1.0",              // cost_multiplier
                 created_at,
-                "session_log",      // data_source
+                data_source,        // data_source: 本机 session_log / 远程 ssh:<hostId>
             ],
         )
         .map_err(|e| AppError::Database(format!("插入会话日志失败: {e}")))?;
@@ -1612,7 +1626,14 @@ mod tests {
                 }
                 let id = format!("session:pricing-{model_index}-{index}");
                 assert_eq!(
-                    upsert_session_log_entry_on_conn(&tx, &id, &msg, None, &mut cache)?,
+                    upsert_session_log_entry_on_conn(
+                        &tx,
+                        &id,
+                        &msg,
+                        None,
+                        "session_log",
+                        &mut cache
+                    )?,
                     SessionRowOutcome::Inserted
                 );
                 let stored: [String; 5] = tx.query_row(
@@ -1645,6 +1666,7 @@ mod tests {
                 "session:pricing-0-0",
                 &completed,
                 None,
+                "session_log",
                 &mut cache,
             )?,
             SessionRowOutcome::Updated
@@ -1855,6 +1877,7 @@ mod tests {
                 "session:msg_1",
                 &msg,
                 None,
+                "session_log",
                 &mut SessionPricingCache::default(),
             )?
         };

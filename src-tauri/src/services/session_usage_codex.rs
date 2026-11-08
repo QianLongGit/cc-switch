@@ -27,7 +27,8 @@ use crate::services::session_usage::{
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
-    find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+    find_model_pricing, has_matching_proxy_usage_log, has_suspected_codex_session_duplicate,
+    proxy_request_id_exists, DedupKey,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -49,7 +50,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
 };
 
-const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
+pub(crate) const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -62,11 +63,11 @@ struct CumulativeTokens {
 
 /// 单次 API 调用的 token 增量
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DeltaTokens {
-    input: u32,
-    cached_input: u32,
-    cache_write_input: u32,
-    output: u32,
+pub(crate) struct DeltaTokens {
+    pub(crate) input: u32,
+    pub(crate) cached_input: u32,
+    pub(crate) cache_write_input: u32,
+    pub(crate) output: u32,
 }
 
 impl DeltaTokens {
@@ -212,17 +213,17 @@ struct CachedReplayPrefix {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedTokenEvent {
-    line_offset: i64,
+    pub(crate) line_offset: i64,
     signature: TokenUsageSignature,
-    delta: DeltaTokens,
-    event_index: Option<u32>,
+    pub(crate) delta: DeltaTokens,
+    pub(crate) event_index: Option<u32>,
     /// 不占用 `token_count` 序号的用量。远程压缩只写 `token_usage_record` 时用它，
     /// 避免把后面每次请求的 `event_index` 都往后挤。
-    request_suffix: Option<String>,
-    model: String,
-    timestamp: Option<String>,
+    pub(crate) request_suffix: Option<String>,
+    pub(crate) model: String,
+    pub(crate) timestamp: Option<String>,
     /// 按事件时间戳估出来的请求耗时（含首字等待）和首字时间；估不出来为 None。
-    timing: Option<EstimatedTiming>,
+    pub(crate) timing: Option<EstimatedTiming>,
 }
 
 /// 只看每行开头这么多字节来判断行的种类：时间戳、类型、角色都在行头，
@@ -681,7 +682,7 @@ fn non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn thread_id_from_filename(path: &Path) -> Option<String> {
+pub(crate) fn thread_id_from_filename(path: &Path) -> Option<String> {
     let logical = codex_rollout_file::logical_path(path);
     let stem = logical.file_stem()?.to_str()?;
     let candidate = stem.get(stem.len().checked_sub(36)?..)?;
@@ -1320,6 +1321,41 @@ pub(crate) struct CodexSegmentOutcome {
 }
 
 impl CodexSegmentState {
+    /// root meta 是否已见过（身份冻结的前提）。远程增量拉取在段末判定：
+    /// 首段都没读完（无 session_meta）的文件按既有语义整体跳过。
+    pub(crate) fn root_meta_seen(&self) -> bool {
+        self.root_meta_seen
+    }
+
+    /// 本段是否解析出了计费 token。无计费文件也要推游标（本机同语义），
+    /// 远程侧据此区分「推进游标」与「跳过文件」。
+    pub(crate) fn has_billable_tokens(&self) -> bool {
+        self.has_billable_tokens
+    }
+
+    /// root meta 的线程 ID（`session_id` 列的值；未见 meta 时 None）。
+    pub(crate) fn meta_thread_id(&self) -> Option<&str> {
+        self.meta_thread_id.as_deref()
+    }
+
+    /// 远程增量拉取的跳过原因：段末状态仍有未解决的父关系时返回原因文案。
+    ///
+    /// - `Deferred`：文件名/基线校验失败，或续写页缺前序累计基线——远程没有
+    ///   rollout_index（构建需全量拉取），这类文件永远等不到基线，按跳过处理
+    /// - `Parent`：fork 子 rollout 头部会重放父的 token 事件，剔除重放需要
+    ///   读父文件算签名前缀——远程做不了，导入会双算父的请求，同样跳过
+    ///
+    /// `None` / `Continuation` 不需要父侧信息，可安全入库。
+    pub(crate) fn unresolved_parent_reason(&self) -> Option<String> {
+        match self.parent.as_ref()? {
+            ParentResolution::Deferred(reason) => Some(reason.clone()),
+            ParentResolution::Parent(parent_id) => Some(format!(
+                "forked rollout（父 {parent_id} 的重放无法在远程剔除）"
+            )),
+            ParentResolution::None | ParentResolution::Continuation { .. } => None,
+        }
+    }
+
     /// 状态机推进：吃一段字节，产出事件。逐行循环源自原
     /// `parse_codex_file_with_index` 的解析主体（行为逐字等价），文件读取
     /// 与跨文件查找之外的全部状态都在 self 上接力。
@@ -2172,6 +2208,39 @@ fn update_codex_sync_state(
     Ok(())
 }
 
+/// 远程增量拉取的游标写入（Task 8）：`file_path` 键为 `ssh:<hostId>/<远端路径>`
+/// 源路径形态。与 [`update_codex_sync_state_on_conn`] 的区别：游标值直接取自
+/// 段解析产出的 [`SyncCursor`]——`last_line_offset`（行号门）/ `last_byte_offset`
+///（续读起点）/ `parser_state`（跨段状态）三列原子落库。压缩文件的
+/// `last_byte_offset` 由调用方覆写为清单里的压缩 size（diff 基准，见引擎注释）。
+pub(crate) fn update_codex_remote_sync_state_on_conn(
+    conn: &rusqlite::Connection,
+    file_path: &str,
+    cursor: &SyncCursor,
+) -> Result<(), AppError> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO session_log_sync
+         (file_path, last_modified, last_line_offset, last_synced_at, last_byte_offset, parser_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(rusqlite::params![
+            file_path,
+            cursor.last_modified,
+            cursor.last_line_offset,
+            now,
+            cursor.last_byte_offset,
+            cursor.parser_state,
+        ])
+    })
+    .map_err(|e| AppError::Database(format!("更新 Codex 远程游标失败: {e}")))?;
+    Ok(())
+}
+
 // A bounded-reference fork stores only its own requests. Accept this narrow case
 // only with a complete physical prefix and an exact inherited counter baseline.
 // Otherwise retain the existing replay/deferred path. Never rewrite rollout data.
@@ -2538,6 +2607,7 @@ fn sync_single_codex_file(
                 Some(session_thread_id),
                 event.timestamp.as_deref(),
                 event.timing,
+                "codex_session",
                 &mut batch_suspected,
                 &mut pass.pricing,
             ) {
@@ -2589,6 +2659,7 @@ fn insert_codex_session_entry(
         session_id,
         timestamp,
         None,
+        "codex_session",
         suspected_duplicates,
         &mut HashMap::new(),
     )
@@ -2600,8 +2671,12 @@ fn insert_codex_session_entry(
 /// `find_codex_pricing` 是纯函数式查找，同串必同结果），全量重导时把
 /// 每事件一次的定价 SELECT 降为每模型一次。`timing` 是按事件时间戳估出来的
 /// 请求耗时和首字时间（见 [`RequestTimer`]），估不出来传 None。
+///
+/// `data_source` 是归属维度：本机传 `"codex_session"`，SSH 远程传
+/// `"ssh:<hostId>"`（rollup 剪枝按此前缀分账）；`ssh:` 前缀行不参与
+/// 「会话行 vs proxy 行」跨源去重（远程流量不经本机代理，无双记可防）。
 #[allow(clippy::too_many_arguments)]
-fn insert_codex_session_entry_on_conn(
+pub(crate) fn insert_codex_session_entry_on_conn(
     conn: &rusqlite::Connection,
     request_id: &str,
     delta: &DeltaTokens,
@@ -2609,6 +2684,7 @@ fn insert_codex_session_entry_on_conn(
     session_id: Option<&str>,
     timestamp: Option<&str>,
     timing: Option<EstimatedTiming>,
+    data_source: &str,
     suspected_duplicates: &mut u32,
     pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
 ) -> Result<bool, AppError> {
@@ -2627,7 +2703,7 @@ fn insert_codex_session_entry_on_conn(
 
     let dedup_key = DedupKey {
         app_type: "codex",
-        data_source: "codex_session",
+        data_source,
         model,
         input_tokens: delta.input,
         output_tokens: delta.output,
@@ -2635,7 +2711,11 @@ fn insert_codex_session_entry_on_conn(
         cache_creation_tokens: delta.cache_write_input,
         created_at,
     };
-    if should_skip_session_insert(conn, request_id, &dedup_key)? {
+    // request_id 幂等门对所有来源生效（重放/断点续拉的去重底线）；proxy 行
+    // 跨源比对仅本机行参与，见函数文档
+    if proxy_request_id_exists(conn, request_id)?
+        || (!data_source.starts_with("ssh:") && has_matching_proxy_usage_log(conn, &dedup_key)?)
+    {
         return Ok(false);
     }
     if has_suspected_codex_session_duplicate(conn, request_id, &dedup_key)? {
@@ -2719,7 +2799,7 @@ fn insert_codex_session_entry_on_conn(
                 1i64,                // is_streaming
                 "1.0",               // cost_multiplier
                 created_at,
-                "codex_session",     // data_source
+                data_source,         // data_source: 本机 codex_session / 远程 ssh:<hostId>
                 INPUT_TOKEN_SEMANTICS_TOTAL, // input_tokens 含缓存读写
             ]))
         .map_err(|e| AppError::Database(format!("插入 Codex 会话日志失败: {e}")))?;
