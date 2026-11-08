@@ -174,7 +174,10 @@ fn build_list_marks_out_of_sync_and_orphan() {
     let list = build_project_list(&db, fx.home.path(), now).unwrap();
     let a = find(&list, &pp);
     assert_eq!(a.bound_provider_id, None, "clear 后无绑定");
-    assert_eq!(a.sync_status, "orphan_header", "无绑定 + 文件残留目标行 → orphan_header");
+    assert_eq!(
+        a.sync_status, "orphan_header",
+        "无绑定 + 文件残留目标行 → orphan_header"
+    );
 }
 
 #[test]
@@ -194,9 +197,16 @@ fn build_list_invalid_provider_flagged() {
 
     let list = build_project_list(&db, fx.home.path(), now).unwrap();
     let a = find(&list, &pp);
-    assert_eq!(a.bound_provider_id.as_deref(), Some("p1"), "悬空绑定仍透出 id");
+    assert_eq!(
+        a.bound_provider_id.as_deref(),
+        Some("p1"),
+        "悬空绑定仍透出 id"
+    );
     assert_eq!(a.bound_provider_name, None, "供应商已删 → name 缺失");
-    assert!(!a.bound_provider_valid, "悬空绑定 → valid=false（已失效态）");
+    assert!(
+        !a.bound_provider_valid,
+        "悬空绑定 → valid=false（已失效态）"
+    );
 }
 
 // ===================================================================
@@ -224,7 +234,9 @@ fn set_route_double_write_db_then_file() {
     let headers = headers_of(Path::new(&pp));
     assert_eq!(target_line_count(&headers), 1, "应有且仅有一行目标行");
     assert!(
-        headers.lines().any(|l| is_target_line(l) && l.contains(&pp)),
+        headers
+            .lines()
+            .any(|l| is_target_line(l) && l.contains(&pp)),
         "目标行值应为项目路径本身（ASCII 安全路径编码不变）：{headers:?}"
     );
 
@@ -309,9 +321,8 @@ fn clear_route_removes_both() {
     // 文件不存在的项目路径 → Ok
     let ghost = fx.home.path().join("never-exists");
     clear_route(&db, ghost.to_str().unwrap()).expect("文件不存在也应 Ok");
-    assert!(
-        db.find_route(ghost.to_str().unwrap(), "claude")
-            .unwrap()
-            .is_none()
-    );
+    assert!(db
+        .find_route(ghost.to_str().unwrap(), "claude")
+        .unwrap()
+        .is_none());
 }

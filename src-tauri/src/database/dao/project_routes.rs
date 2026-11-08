@@ -168,7 +168,11 @@ mod tests {
         let bound = db
             .find_route("/Users/dev/proj", "claude")
             .expect("find route");
-        assert_eq!(bound.as_deref(), Some("p1"), "插入后应能按 (path, app) 查回 provider_id");
+        assert_eq!(
+            bound.as_deref(),
+            Some("p1"),
+            "插入后应能按 (path, app) 查回 provider_id"
+        );
     }
 
     #[test]
@@ -183,7 +187,11 @@ mod tests {
         let bound = db
             .find_route("/Users/dev/proj", "claude")
             .expect("find route");
-        assert_eq!(bound.as_deref(), Some("p2"), "upsert 后 provider_id 应更新为新值");
+        assert_eq!(
+            bound.as_deref(),
+            Some("p2"),
+            "upsert 后 provider_id 应更新为新值"
+        );
     }
 
     #[test]
@@ -274,13 +282,12 @@ mod tests {
             .find_route("/Users/dev/proj", "claude")
             .expect("find route after cascade");
         assert!(bound.is_none(), "供应商删除后其绑定行应级联消失");
-        let gone = db
-            .get_provider_by_id("p1", "claude")
-            .expect("query p1");
+        let gone = db.get_provider_by_id("p1", "claude").expect("query p1");
         assert!(gone.is_none(), "供应商行本身已删");
 
         // 无路由行的 provider 删除照常成功且不产生副作用
-        db.delete_provider("claude", "p2").expect("delete p2 without routes");
+        db.delete_provider("claude", "p2")
+            .expect("delete p2 without routes");
     }
 
     #[test]
@@ -296,7 +303,8 @@ mod tests {
         db.insert_or_update_route("/Users/dev/projX", "codex", "p1")
             .expect("bind codex route");
 
-        db.delete_provider("claude", "p1").expect("delete claude p1");
+        db.delete_provider("claude", "p1")
+            .expect("delete claude p1");
 
         assert!(
             db.find_route("/Users/dev/projC", "claude")

@@ -1473,10 +1473,8 @@ fn memory_db_has_project_tables_and_columns() {
     let conn = db.conn.lock().expect("lock conn");
 
     assert!(Database::table_exists(&conn, "project_routes").expect("check project_routes"));
-    assert!(
-        Database::table_exists(&conn, "settings_local_backup")
-            .expect("check settings_local_backup")
-    );
+    assert!(Database::table_exists(&conn, "settings_local_backup")
+        .expect("check settings_local_backup"));
 
     let project_dir = get_column_info(&conn, "proxy_request_logs", "project_dir");
     assert_eq!(project_dir.r#type, "TEXT");

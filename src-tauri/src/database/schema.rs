@@ -4656,10 +4656,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(
-            host_col,
-            ("TEXT".to_string(), 1, Some("''".to_string()))
-        );
+        assert_eq!(host_col, ("TEXT".to_string(), 1, Some("''".to_string())));
 
         // host_id 进主键尾列：pk 序号 = 7
         let host_pk: i64 = conn.query_row(

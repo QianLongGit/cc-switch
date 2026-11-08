@@ -14,7 +14,9 @@ use crate::config::get_home_dir;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::services::project_scanner::scan_projects;
-use crate::services::settings_local_writer::{read_sync_status, remove_project_header, set_project_header};
+use crate::services::settings_local_writer::{
+    read_sync_status, remove_project_header, set_project_header,
+};
 use crate::store::AppState;
 use std::collections::HashMap;
 use std::path::Path;
@@ -79,12 +81,10 @@ pub fn build_project_list(
                 None => true,
             };
             // DB 有绑定即传该路径本身，供文件行值对比（bound=None 检孤儿行）
-            let sync_status = read_sync_status(
-                &sp.project_path,
-                bound.map(|_| sp.project_path.as_str()),
-            )
-            .as_str()
-            .to_string();
+            let sync_status =
+                read_sync_status(&sp.project_path, bound.map(|_| sp.project_path.as_str()))
+                    .as_str()
+                    .to_string();
             ProjectRouteInfo {
                 project_path: sp.project_path,
                 basename: sp.basename,
