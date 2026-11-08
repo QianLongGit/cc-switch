@@ -12,6 +12,7 @@
 //!   → load_messages（全文拉取落临时文件 + provider 解析）
 //!   → ssh::read_block（远端字节区间窗口）
 //!   → delete_session（stem 校验 + 清单白名单 + rm + registry 摘除）
+//!   → usage_remote 引擎（清单 diff 首扫 / 增量入库 + host 聚合口径）
 //!   → Drop guard 清理远端夹具
 //! ```
 //!
@@ -535,4 +536,250 @@ fn localhost_ssh_remote_search_smoke() {
 
     // guard Drop：清理远端夹具 + 恢复 settings 与环境变量
     eprintln!("localtest: 远程搜索冒烟通过");
+}
+
+/* ===== 远程用量同步冒烟（迭代 2 Task 8，spec §4.4）===== */
+
+/// 远程 usage 夹具正文（引擎单测同款 assistant usage 行，真实 JSONL 形态）。
+/// 每行一条完整 assistant 消息：首扫入库一行，追加一行验证增量。
+fn remote_usage_line(msg_id: &str, output: u32) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "id": msg_id,
+            "model": "claude-opus-4-8",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": output,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            },
+            "stop_reason": "end_turn"
+        },
+        "timestamp": "2026-11-08T10:00:00Z",
+        "sessionId": "sess-usage"
+    })
+    .to_string()
+}
+
+/// 冒烟专用 IO：目录覆写为夹具目录的 SSH 实现。
+///
+/// 生产引擎经 `home_dirs_command` 解析远端 $HOME 的真实会话根目录；冒烟
+/// 若沿用，force 首扫会把本机真实 `~/.claude/projects` 全量拉一遍（开发
+/// 机实测 90 天窗口内 266 个文件 / 247MB，代价不可控）。覆写目录后传输
+/// 链路（list_files / read_range 真跑 ssh）保持原样，仅扫描范围收敛到夹具。
+struct UsageFixtureIo {
+    host: SshHostConfig,
+    dirs: Vec<String>,
+}
+
+impl crate::services::usage_remote::RemoteUsageIo for UsageFixtureIo {
+    fn home_dirs(&mut self) -> Result<Vec<String>, crate::error::AppError> {
+        Ok(self.dirs.clone())
+    }
+
+    fn list_files(
+        &mut self,
+        dirs: &[String],
+    ) -> Result<Vec<super::ssh::RemoteFileEntry>, crate::error::AppError> {
+        let out = super::ssh::run_remote(
+            &self.host,
+            &super::ssh::list_files_command(dirs),
+            QUICK_CMD_TIMEOUT,
+        )
+        .map_err(|e| {
+            crate::error::AppError::Config(format!("SSH 主机「{}」: {e}", self.host.label))
+        })?;
+        Ok(super::ssh::parse_list_output(&out))
+    }
+
+    fn read_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, crate::error::AppError> {
+        super::ssh::run_remote(
+            &self.host,
+            &super::ssh::read_range_command(path, offset, len),
+            SETUP_CMD_TIMEOUT,
+        )
+        .map_err(|e| {
+            crate::error::AppError::Config(format!("SSH 主机「{}」: {e}", self.host.label))
+        })
+    }
+
+    fn read_full(&mut self, path: &str) -> Result<Vec<u8>, crate::error::AppError> {
+        super::ssh::run_remote(
+            &self.host,
+            &super::ssh::read_full_command(path),
+            SETUP_CMD_TIMEOUT,
+        )
+        .map_err(|e| {
+            crate::error::AppError::Config(format!("SSH 主机「{}」: {e}", self.host.label))
+        })
+    }
+}
+
+/// localhost 远程用量同步冒烟：夹具 claude jsonl → force 首扫入库 + 游标 →
+/// 远端追加字节 → 轻同步增量 → hostId 聚合数字正确且本机视图不含。
+#[test]
+#[serial]
+fn localhost_remote_usage_smoke() {
+    use std::sync::atomic::AtomicBool;
+
+    if !localhost_ssh_available() {
+        return;
+    }
+    eprintln!("localtest: ssh localhost 可用，执行远程用量同步冒烟");
+
+    // ── 全局态准备（与既有冒烟同模式：短 tempdir + settings 注入 + 禁 CM）──
+    let local_temp = tempfile::Builder::new()
+        .prefix("ccsw-lt-")
+        .tempdir_in("/tmp")
+        .expect("创建 /tmp 短前缀 tempdir")
+        .keep();
+    let original_env = std::env::var_os("CC_SWITCH_TEST_HOME");
+    std::env::set_var("CC_SWITCH_TEST_HOME", &local_temp);
+
+    let host = SshHostConfig {
+        id: "localtest".to_string(),
+        label: "localtest".to_string(),
+        host: "localhost".to_string(),
+        user: None,
+        port: None,
+        identity_file: None,
+    };
+    let original_settings = crate::settings::get_settings();
+    let mut with_host = original_settings.clone();
+    with_host.ssh_hosts = Some(vec![host.clone()]);
+    crate::settings::update_settings(with_host).expect("注入 localtest 主机到 settings");
+
+    let mut guard = FixtureGuard {
+        host: host.clone(),
+        remote_dirs: Vec::new(),
+        original_settings,
+        original_env,
+        local_temp,
+    };
+    DISABLE_CONTROL_MASTER_FOR_TEST.store(true, Ordering::Relaxed);
+
+    // ── 远端夹具：claude usage jsonl + 两个 codex 占位目录（目录覆写后
+    //    扫描范围只有这三个目录，真实 HOME 的会话文件不受波及）──
+    let home_raw =
+        run_remote(&host, "printf '%s' \"$HOME\"", QUICK_CMD_TIMEOUT).expect("解析远端 HOME");
+    let home = String::from_utf8_lossy(&home_raw).trim().to_string();
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let claude_dir = format!("{home}/.claude/projects/cc-switch-usage-{tag}");
+    let codex_dir = format!("{home}/.codex/sessions/cc-switch-usage-{tag}");
+    let archived_dir = format!("{home}/.codex/archived_sessions/cc-switch-usage-{tag}");
+    let claude_file = format!("{claude_dir}/sess-usage.jsonl");
+    guard.remote_dirs.push(claude_dir.clone());
+    guard.remote_dirs.push(codex_dir.clone());
+    guard.remote_dirs.push(archived_dir.clone());
+
+    let first_line = format!("{}\n", remote_usage_line("msg-usage-1", 5));
+    let setup = format!(
+        "mkdir -p {} {} {} && printf '%s' {} > {}",
+        escape_remote_path(&claude_dir),
+        escape_remote_path(&codex_dir),
+        escape_remote_path(&archived_dir),
+        escape_remote_path(&first_line),
+        escape_remote_path(&claude_file),
+    );
+    run_remote(&host, &setup, SETUP_CMD_TIMEOUT).expect("构造远端 usage 夹具");
+
+    let mut io = UsageFixtureIo {
+        host: host.clone(),
+        dirs: vec![claude_dir, codex_dir, archived_dir],
+    };
+    let db = crate::database::Database::memory().expect("内存库");
+    let cancel = AtomicBool::new(false);
+    let sync = |io: &mut UsageFixtureIo, force: bool| {
+        crate::services::usage_remote::sync_host_usage_with_io(
+            &db,
+            "localtest",
+            io,
+            force,
+            &mut |_| {},
+            &cancel,
+        )
+        .expect("远程用量同步应成功")
+    };
+
+    // ── 1. force 首扫：夹具行入库（data_source=ssh:localtest）+ 游标落库 ──
+    let first = sync(&mut io, true);
+    assert_eq!(first.total_files, 1, "扫描范围只有夹具文件");
+    assert_eq!(first.skipped, 0);
+    assert!(first.done_bytes > 0, "首扫应拉取夹具字节");
+
+    let fixture_rows = |db: &crate::database::Database| -> i64 {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE data_source = 'ssh:localtest' AND session_id = 'sess-usage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(fixture_rows(&db), 1, "首扫应入库一行夹具用量");
+
+    let cursor_key = format!("ssh:localtest/{}", claude_file.trim_start_matches('/'));
+    let cursor_bytes = |db: &crate::database::Database| -> Option<i64> {
+        crate::services::session_usage::load_sync_cursors(db)
+            .unwrap()
+            .get(&cursor_key)
+            .and_then(|cursor| cursor.last_byte_offset)
+    };
+    let first_offset = cursor_bytes(&db).expect("首扫后应有游标");
+    assert_eq!(first_offset, first_line.len() as i64, "游标应停在首行末");
+
+    // ── 2. 远端追加一行 → 轻同步（force=false）→ 增量入库 + 游标推进 ──
+    let second_line = format!("{}\n", remote_usage_line("msg-usage-2", 7));
+    let append = format!(
+        "printf '%s' {} >> {}",
+        escape_remote_path(&second_line),
+        escape_remote_path(&claude_file),
+    );
+    run_remote(&host, &append, SETUP_CMD_TIMEOUT).expect("追加夹具字节");
+    // 抬高 mtime（printf 追加本身会更新 mtime，显式 touch 保证跨秒可见）
+    run_remote(
+        &host,
+        &format!("touch {}", escape_remote_path(&claude_file)),
+        QUICK_CMD_TIMEOUT,
+    )
+    .expect("刷新夹具 mtime");
+
+    let second = sync(&mut io, false);
+    assert_eq!(second.skipped, 0, "增量同步应成功: {second:?}");
+    assert_eq!(fixture_rows(&db), 2, "增量行应入库");
+    assert_eq!(
+        cursor_bytes(&db),
+        Some((first_line.len() + second_line.len()) as i64),
+        "游标应推进到追加段末"
+    );
+
+    // ── 3. 聚合口径：hostId=Some 只含远程数据，None 不含 ──
+    let remote_summary = db
+        .get_usage_summary(None, None, Some("claude"), None, None, Some("localtest"))
+        .expect("远程聚合");
+    assert_eq!(remote_summary.total_requests, 2);
+    assert_eq!(remote_summary.total_input_tokens, 20, "两行 × input 10");
+    assert_eq!(remote_summary.total_output_tokens, 12, "5 + 7");
+
+    let local_summary = db
+        .get_usage_summary(None, None, Some("claude"), None, None, None)
+        .expect("本机聚合");
+    assert_eq!(
+        local_summary.total_requests, 0,
+        "本机视图不含 ssh:localtest 数据"
+    );
+
+    // guard Drop：清理远端夹具 + 恢复 settings 与环境变量
+    eprintln!("localtest: 远程用量同步冒烟通过");
 }
