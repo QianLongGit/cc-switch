@@ -108,7 +108,10 @@ pub fn read_sync_status(project_path: &str, bound: Option<&str>) -> SyncStatus {
     let (value, _) = load_settings_json(&settings_local_path(project_path));
     let file_encoded = extract_x_cc_project(&headers_of(&value));
     match bound {
-        Some(pp) => match file_encoded.as_deref().and_then(percent_decode_project_path) {
+        Some(pp) => match file_encoded
+            .as_deref()
+            .and_then(percent_decode_project_path)
+        {
             // 目标行值 decode 后与绑定全等才 synced；值不一致 / decode 非法 /
             // 文件缺失 / 无目标行一律 out_of_sync（警示 + 一键修复）
             Some(decoded) if decoded == pp => SyncStatus::Synced,
@@ -126,7 +129,9 @@ pub fn read_sync_status(project_path: &str, bound: Option<&str>) -> SyncStatus {
 
 /// `<project_path>/.claude/settings.local.json` 的完整路径。
 fn settings_local_path(project_path: &str) -> PathBuf {
-    Path::new(project_path).join(".claude").join("settings.local.json")
+    Path::new(project_path)
+        .join(".claude")
+        .join("settings.local.json")
 }
 
 /// 读取并容错解析 settings.local.json，返回（对象, 已存在文件的原文）。
@@ -145,9 +150,8 @@ fn load_settings_json(path: &Path) -> (serde_json::Value, Option<String>) {
     let well_formed = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
         .filter(|v| {
-            v.as_object().is_some_and(|obj| {
-                obj.get("env").map_or(true, |e| e.is_object())
-            })
+            v.as_object()
+                .is_some_and(|obj| obj.get("env").map_or(true, |e| e.is_object()))
         });
     match well_formed {
         Some(v) => (v, Some(raw)),
@@ -183,8 +187,8 @@ fn write_custom_headers(
         value["env"] = serde_json::json!({});
     }
     value["env"]["ANTHROPIC_CUSTOM_HEADERS"] = serde_json::json!(new_headers);
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| AppError::JsonSerialize { source: e })?;
+    let text =
+        serde_json::to_string_pretty(value).map_err(|e| AppError::JsonSerialize { source: e })?;
     atomic_write(path, text.as_bytes())
 }
 
@@ -243,10 +247,7 @@ mod tests {
         if lines.last() == Some(&"") {
             lines.pop();
         }
-        let mut others: Vec<&str> = lines
-            .into_iter()
-            .filter(|l| !is_target_line(l))
-            .collect();
+        let mut others: Vec<&str> = lines.into_iter().filter(|l| !is_target_line(l)).collect();
         while others.last() == Some(&"") {
             others.pop();
         }
@@ -284,8 +285,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::memory().unwrap();
         let pp = dir.path().to_str().unwrap().to_string();
-        let original =
-            r#"{"env":{"ANTHROPIC_CUSTOM_HEADERS":"X-Api-Key: k\n"},"permissions":{"allow":["Bash(ls:*)"]}}"#;
+        let original = r#"{"env":{"ANTHROPIC_CUSTOM_HEADERS":"X-Api-Key: k\n"},"permissions":{"allow":["Bash(ls:*)"]}}"#;
         seed_settings(dir.path(), original);
 
         set_project_header(&pp, &db).unwrap();
@@ -413,7 +413,12 @@ mod tests {
     fn remove_ok_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::memory().unwrap();
-        let pp = dir.path().join("never-exists").to_str().unwrap().to_string();
+        let pp = dir
+            .path()
+            .join("never-exists")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         remove_project_header(&pp, &db).expect("文件不存在应直接 Ok 返回");
     }
@@ -560,8 +565,8 @@ mod tests {
     /// 宽表随机串（可作 JSON 字符串值）：ASCII 字母数字 + `/._~-%:\n\r\t ` + 中文池。
     fn rand_string(rng: &mut Lcg, len: usize) -> String {
         const CHARSET: &[&str] = &[
-            "a", "B", "z", "0", "9", "/", ".", "_", "~", "-", "%", ":", "\n", "\r", "\t", " ",
-            "2", "4", "8", "E", "F", "f", "项目", "开", "发", "文", "件",
+            "a", "B", "z", "0", "9", "/", ".", "_", "~", "-", "%", ":", "\n", "\r", "\t", " ", "2",
+            "4", "8", "E", "F", "f", "项目", "开", "发", "文", "件",
         ];
         (0..len)
             .map(|_| CHARSET[rng.below(CHARSET.len() as u64) as usize].to_string())
@@ -571,8 +576,8 @@ mod tests {
     /// 行内随机值：同宽表但**不含 `\n`**（行级结构可控），可含 `:`、`%`、`\r`、空白、中文。
     fn rand_line_value(rng: &mut Lcg) -> String {
         const LINE_CHARSET: &[&str] = &[
-            "a", "B", "z", "0", "9", "/", ".", "_", "~", "-", ":", "\r", "\t", " ", "%", "2",
-            "F", "x", "X", "k", "项目",
+            "a", "B", "z", "0", "9", "/", ".", "_", "~", "-", ":", "\r", "\t", " ", "%", "2", "F",
+            "x", "X", "k", "项目",
         ];
         (0..rng.below(16) + 1)
             .map(|_| LINE_CHARSET[rng.below(LINE_CHARSET.len() as u64) as usize].to_string())
@@ -681,8 +686,10 @@ mod tests {
             let pp = project.to_str().unwrap().to_string();
 
             let (before, extra_key) = rand_existing_doc(&mut rng);
-            let original_headers =
-                before["env"]["ANTHROPIC_CUSTOM_HEADERS"].as_str().unwrap().to_string();
+            let original_headers = before["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+                .as_str()
+                .unwrap()
+                .to_string();
             seed_settings(&project, &serde_json::to_string(&before).unwrap());
 
             // --- set：只动 X-CC-Project 行 ---

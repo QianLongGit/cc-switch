@@ -1438,11 +1438,11 @@ fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
 //   项目归因两列（spec §4.1/§4.2/§4.3）
 // ============================================================================
 
-// 新库：裸 Connection 走完 create_tables + migrations 后 user_version == 26，
-// 两张新表关键列齐。Database::memory() 只走 create_tables 不走迁移
-// （user_version 恒 0），不能用它断言版本号。
+// 新库：裸 Connection 走完 create_tables + migrations 后 user_version 到当前
+// SCHEMA_VERSION，两张新表关键列齐。Database::memory() 只走 create_tables
+// 不走迁移（user_version 恒 0），不能用它断言版本号。
 #[test]
-fn fresh_db_has_project_routes_table_and_version_26() {
+fn fresh_db_has_project_routes_table_and_current_version() {
     let conn = Connection::open_in_memory().expect("open memory db");
 
     Database::create_tables_on_conn(&conn).expect("create tables");
@@ -1450,7 +1450,7 @@ fn fresh_db_has_project_routes_table_and_version_26() {
 
     assert_eq!(
         Database::get_user_version(&conn).expect("read version after migration"),
-        26
+        SCHEMA_VERSION
     );
 
     let app_type = get_column_info(&conn, "project_routes", "app_type");
@@ -1473,10 +1473,8 @@ fn memory_db_has_project_tables_and_columns() {
     let conn = db.conn.lock().expect("lock conn");
 
     assert!(Database::table_exists(&conn, "project_routes").expect("check project_routes"));
-    assert!(
-        Database::table_exists(&conn, "settings_local_backup")
-            .expect("check settings_local_backup")
-    );
+    assert!(Database::table_exists(&conn, "settings_local_backup")
+        .expect("check settings_local_backup"));
 
     let project_dir = get_column_info(&conn, "proxy_request_logs", "project_dir");
     assert_eq!(project_dir.r#type, "TEXT");
@@ -1609,7 +1607,7 @@ fn v20_db_migrates_to_v21_keeping_rows() {
 
     assert_eq!(
         Database::get_user_version(&conn).expect("version after migration"),
-        26
+        SCHEMA_VERSION
     );
 
     assert!(

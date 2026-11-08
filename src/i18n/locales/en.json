@@ -2544,6 +2544,21 @@
       "tip": "Click to sync now",
       "tipOff": "Auto scan is off. Click to sync now"
     },
+    "hostSelector": {
+      "hint": "Switch stats host: remote usage is synced over SSH for local aggregation"
+    },
+    "remoteSync": {
+      "firstSyncPreview": "First sync will fetch {{files}} files / about {{size}}",
+      "start": "Start sync",
+      "cancel": "Cancel sync",
+      "progress": "Syncing {{done}}/{{total}} · {{bytes}}",
+      "completed": "Remote usage sync finished: {{files}} files",
+      "completedSkipped": "Remote usage sync finished: {{files}} files, {{skipped}} skipped",
+      "cancelled": "Remote usage sync cancelled; partial progress kept",
+      "failed": "Remote usage sync failed: {{error}}",
+      "loadFailed": "Failed to load remote usage: {{error}}",
+      "retry": "Retry"
+    },
     "refreshMenu": {
       "label": "Scan every {{seconds}}s"
     },

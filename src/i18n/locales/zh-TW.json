@@ -2545,6 +2545,21 @@
       "tip": "點擊立即同步",
       "tipOff": "自動掃描已關閉，點擊立即同步"
     },
+    "hostSelector": {
+      "hint": "切換統計主機：遠端主機的用量經 SSH 增量同步到本機統計"
+    },
+    "remoteSync": {
+      "firstSyncPreview": "首次同步需拉取 {{files}} 個檔案 / 約 {{size}}",
+      "start": "開始同步",
+      "cancel": "取消同步",
+      "progress": "同步中 {{done}}/{{total}} · {{bytes}}",
+      "completed": "遠端用量同步完成：{{files}} 個檔案",
+      "completedSkipped": "遠端用量同步完成：{{files}} 個檔案，{{skipped}} 個跳過",
+      "cancelled": "已取消遠端用量同步，部分進度已保留",
+      "failed": "遠端用量同步失敗：{{error}}",
+      "loadFailed": "遠端用量載入失敗：{{error}}",
+      "retry": "重試"
+    },
     "refreshMenu": {
       "label": "每 {{seconds}} 秒掃描"
     },

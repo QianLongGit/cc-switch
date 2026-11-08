@@ -303,12 +303,7 @@ mod tests {
         /// 铺 ~/.claude/projects/<slug>/<id>.jsonl（每行一个 JSON 对象），
         /// 返回 jsonl 路径供 mtime 断言
         fn add_jsonl(&self, slug: &str, id: &str, lines: &[Value]) -> PathBuf {
-            let dir = self
-                .home
-                .path()
-                .join(".claude")
-                .join("projects")
-                .join(slug);
+            let dir = self.home.path().join(".claude").join("projects").join(slug);
             fs::create_dir_all(&dir).unwrap();
             let file = dir.join(format!("{id}.jsonl"));
             let body = lines
@@ -342,14 +337,8 @@ mod tests {
 
         /// 铺 ~/.claude/projects/<slug> 空目录（无任何 jsonl）
         fn add_empty_project_dir(&self, slug: &str) {
-            fs::create_dir_all(
-                self.home
-                    .path()
-                    .join(".claude")
-                    .join("projects")
-                    .join(slug),
-            )
-            .unwrap();
+            fs::create_dir_all(self.home.path().join(".claude").join("projects").join(slug))
+                .unwrap();
         }
     }
 
@@ -390,10 +379,14 @@ mod tests {
             (&proj_c, json!(now - 5 * DAY)),
         ]);
         // 源 2：projA 的 jsonl 含 cwd（首行为无 cwd 的元数据行），mtime ≈ now
-        let jsonl = fx.add_jsonl("proj-a-slug", "s1", &[
-            json!({ "type": "queue-operation", "operation": "enqueue" }),
-            json!({ "cwd": proj_a, "sessionId": "s1" }),
-        ]);
+        let jsonl = fx.add_jsonl(
+            "proj-a-slug",
+            "s1",
+            &[
+                json!({ "type": "queue-operation", "operation": "enqueue" }),
+                json!({ "cwd": proj_a, "sessionId": "s1" }),
+            ],
+        );
         // 源 3：projA active、projB idle、projC busy（真实环境实测值）
         fx.add_session("1001", &proj_a, "active", (now - DAY) * 1000);
         fx.add_session("1002", &proj_b, "idle", (now - DAY) * 1000);

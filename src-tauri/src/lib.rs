@@ -1861,6 +1861,10 @@ pub fn run() {
             commands::record_models_dev_sync_result,
             commands::fetch_models_dev,
             commands::check_provider_limits,
+            // Remote usage sync (SSH hosts)
+            commands::sync_remote_usage,
+            commands::cancel_remote_usage_sync,
+            commands::peek_remote_usage,
             // Session usage sync
             commands::sync_session_usage,
             commands::rebuild_codex_usage,

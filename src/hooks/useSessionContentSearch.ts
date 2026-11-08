@@ -9,8 +9,9 @@ const SEARCH_DEBOUNCE_MS = 250;
 
 export const sessionContentKeys = {
   all: ["sessionContentSearch"] as const,
-  search: (query: string, providerIds: string[]) =>
-    ["sessionContentSearch", query, providerIds] as const,
+  /** 搜索按主机分维，切主机不串缓存；本机用 "local" 占位（对齐 sessionKeys.list 先例） */
+  search: (query: string, providerIds: string[], hostId?: string) =>
+    ["sessionContentSearch", hostId ?? "local", query, providerIds] as const,
 };
 
 /** 命中与会话对应用的键：同一会话文件只有一个命中 */
@@ -34,6 +35,8 @@ interface UseSessionContentSearchOptions {
   listUpdatedAt: number;
   /** 只要这些应用的命中 */
   providerIds: string[];
+  /** 远程 SSH 主机 id；缺省为本机。远程命中由后端远端 rg/grep 现算，不走本机索引 */
+  hostId?: string;
 }
 
 interface UseSessionContentSearchResult {
@@ -54,6 +57,7 @@ export function useSessionContentSearch({
   listIsSuccess,
   listUpdatedAt,
   providerIds,
+  hostId,
 }: UseSessionContentSearchOptions): UseSessionContentSearchResult {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<SessionIndexStatus | null>(null);
@@ -102,10 +106,11 @@ export function useSessionContentSearch({
     };
   }, [enabled, queryClient]);
 
-  // 会话列表每次读取成功后同步索引；后端只处理有变化的会话，已在跑时只排一次重跑
+  // 会话列表每次读取成功后同步索引；后端只处理有变化的会话，已在跑时只排一次重跑。
+  // sync_session_index 只维护本机 FTS5 索引：远程主机没有可同步的本机索引，直接跳过
   useEffect(() => {
     // 空列表也要同步，以清理已被外部删除的会话；首次读取完成前不启动。
-    if (!enabled || !listIsSuccess || listUpdatedAt === 0) return;
+    if (!enabled || hostId || !listIsSuccess || listUpdatedAt === 0) return;
     let cancelled = false;
     sessionsApi
       .syncContentIndex()
@@ -116,13 +121,13 @@ export function useSessionContentSearch({
     return () => {
       cancelled = true;
     };
-  }, [enabled, listIsSuccess, listUpdatedAt]);
+  }, [enabled, hostId, listIsSuccess, listUpdatedAt]);
 
   const providerKey = useMemo(() => [...providerIds].sort(), [providerIds]);
 
   const search = useQuery({
-    queryKey: sessionContentKeys.search(debounced, providerKey),
-    queryFn: () => sessionsApi.searchContent(debounced, providerKey),
+    queryKey: sessionContentKeys.search(debounced, providerKey, hostId),
+    queryFn: () => sessionsApi.searchContent(debounced, providerKey, hostId),
     enabled: enabled && debounced !== "" && providerKey.length > 0,
     staleTime: 0,
   });

@@ -53,9 +53,10 @@ use std::sync::Mutex;
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
 // ============================================================================
 // 撞号调和：上游 v4.0.26 的 v23→v24（enabled_dsh + parser_state）与本 fork
-// v24（enabled_kimi）撞号，已重编号为 v25→v26 追加链尾，故最终版本取 26。
+// v24（enabled_kimi）撞号，已重编号为 v25→v26 追加链尾，故彼时终版取 26。
+// v27：usage_daily_rollups 增加 host_id 维度（SSH 远程会话分账，本机=''）。
 // ============================================================================
-pub(crate) const SCHEMA_VERSION: i32 = 26;
+pub(crate) const SCHEMA_VERSION: i32 = 27;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {

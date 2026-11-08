@@ -2497,6 +2497,21 @@
       "syncing": "Eşitleniyor…",
       "tip": "Şimdi eşitlemek için tıklayın"
     },
+    "hostSelector": {
+      "hint": "İstatistik sunucusunu değiştir: uzak kullanım SSH ile yerelde toplanmak üzere eşitlenir"
+    },
+    "remoteSync": {
+      "firstSyncPreview": "İlk eşitleme {{files}} dosya / yaklaşık {{size}} çekecek",
+      "start": "Eşitlemeyi başlat",
+      "cancel": "Eşitlemeyi iptal et",
+      "progress": "Eşitleniyor {{done}}/{{total}} · {{bytes}}",
+      "completed": "Uzak kullanım eşitlemesi tamamlandı: {{files}} dosya",
+      "completedSkipped": "Uzak kullanım eşitlemesi tamamlandı: {{files}} dosya, {{skipped}} atlandı",
+      "cancelled": "Uzak kullanım eşitlemesi iptal edildi; kısmi ilerleme korundu",
+      "failed": "Uzak kullanım eşitlemesi başarısız: {{error}}",
+      "loadFailed": "Uzak kullanım yüklenemedi: {{error}}",
+      "retry": "Yeniden dene"
+    },
     "refreshMenu": {
       "label": "Her {{seconds}} saniyede tara"
     },

@@ -194,9 +194,8 @@ mod tests {
     // ---- 场景 1：标准段 ----
     #[test]
     fn parses_standard_block() {
-        let hosts = parse_ssh_config_str(
-            "Host web\n  HostName example.com\n  User deploy\n  Port 2222\n",
-        );
+        let hosts =
+            parse_ssh_config_str("Host web\n  HostName example.com\n  User deploy\n  Port 2222\n");
         assert_eq!(hosts.len(), 1);
         let h = find(&hosts, "web");
         assert_eq!(h.host_name.as_deref(), Some("example.com"));
@@ -207,8 +206,7 @@ mod tests {
     // ---- 场景 2：多 Host 一行（Host a b）各自成条目、共享段内属性 ----
     #[test]
     fn expands_multi_alias_line() {
-        let hosts =
-            parse_ssh_config_str("Host a b\n  HostName example.com\n  Port 2200\n");
+        let hosts = parse_ssh_config_str("Host a b\n  HostName example.com\n  Port 2200\n");
         assert_eq!(hosts.len(), 2);
         for alias in ["a", "b"] {
             let h = find(&hosts, alias);
@@ -220,9 +218,8 @@ mod tests {
     // ---- 场景 3：通配条目跳过，其段内属性不归属任何主机 ----
     #[test]
     fn skips_wildcard_entries() {
-        let hosts = parse_ssh_config_str(
-            "Host *\n  User global-user\nHost web\n  HostName example.com\n",
-        );
+        let hosts =
+            parse_ssh_config_str("Host *\n  User global-user\nHost web\n  HostName example.com\n");
         assert_eq!(hosts.len(), 1);
         let h = find(&hosts, "web");
         assert_eq!(h.host_name.as_deref(), Some("example.com"));
@@ -253,8 +250,7 @@ mod tests {
     // ---- 场景 5：Tab 缩进合法 ----
     #[test]
     fn accepts_tab_indentation() {
-        let hosts =
-            parse_ssh_config_str("Host web\n\tHostName example.com\n\tPort 2222\n");
+        let hosts = parse_ssh_config_str("Host web\n\tHostName example.com\n\tPort 2222\n");
         let h = find(&hosts, "web");
         assert_eq!(h.host_name.as_deref(), Some("example.com"));
         assert_eq!(h.port, Some(2222));
@@ -281,7 +277,10 @@ mod tests {
             "Host web\n  Port abc\n  HostName example.com\nHost big\n  Port 99999\n",
         );
         assert_eq!(find(&hosts, "web").port, None);
-        assert_eq!(find(&hosts, "web").host_name.as_deref(), Some("example.com"));
+        assert_eq!(
+            find(&hosts, "web").host_name.as_deref(),
+            Some("example.com")
+        );
         assert_eq!(find(&hosts, "big").port, None, "u16 溢出同样容错");
     }
 
@@ -329,7 +328,10 @@ mod tests {
         let ci = find(&hosts, "ci");
         assert_eq!(ci.host_name.as_deref(), Some("ci.internal"));
         assert_eq!(ci.port, Some(2200));
-        assert_eq!(find(&hosts, "web").host_name.as_deref(), Some("example.com"));
+        assert_eq!(
+            find(&hosts, "web").host_name.as_deref(),
+            Some("example.com")
+        );
     }
 
     #[test]
@@ -354,8 +356,14 @@ mod tests {
 
         let hosts = load_ssh_config_hosts_from(dir.path());
         assert_eq!(hosts.len(), 2);
-        assert_eq!(find(&hosts, "abs-host").host_name.as_deref(), Some("abs.com"));
-        assert_eq!(find(&hosts, "home-host").host_name.as_deref(), Some("home.com"));
+        assert_eq!(
+            find(&hosts, "abs-host").host_name.as_deref(),
+            Some("abs.com")
+        );
+        assert_eq!(
+            find(&hosts, "home-host").host_name.as_deref(),
+            Some("home.com")
+        );
     }
 
     #[test]

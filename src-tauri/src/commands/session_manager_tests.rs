@@ -71,3 +71,51 @@ fn failed_session_stream_still_sends_an_error_packet() {
         [json!({"type":"error", "message":error})]
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn search_session_content_routes_remote_host_id() {
+    let _home = crate::commands::startup_tests::TestHome::new();
+
+    // hostId 缺省：本机路径零变化（TestHome 下无索引 → 空 hits，命令仍 Ok）
+    let local =
+        tauri::async_runtime::block_on(search_session_content("needle".into(), None, None, None))
+            .unwrap();
+    assert!(local.hits.is_empty());
+
+    // hostId 指向不存在的主机：可读错误（与 load_messages 的远程文案一致）
+    let missing = tauri::async_runtime::block_on(search_session_content(
+        "needle".into(),
+        None,
+        None,
+        Some("ghost-host".into()),
+    ))
+    .unwrap_err();
+    assert_eq!(missing, "SSH 主机不存在或已移除");
+
+    // hostId 存在但从未扫描（registry miss）：空结果而非错误
+    let original = crate::settings::get_settings();
+    let mut with_host = original.clone();
+    with_host.ssh_hosts = Some(vec![crate::settings::SshHostConfig {
+        id: "search-miss-host".to_string(),
+        label: "search-miss-host".to_string(),
+        host: "example.invalid".to_string(),
+        user: None,
+        port: None,
+        identity_file: None,
+    }]);
+    crate::settings::update_settings(with_host).expect("注入搜索测试主机");
+    let remote = tauri::async_runtime::block_on(search_session_content(
+        "needle".into(),
+        None,
+        None,
+        Some("search-miss-host".into()),
+    ))
+    .unwrap();
+    assert!(remote.hits.is_empty());
+    assert_eq!(
+        remote.status,
+        session_manager::search::IndexStatus::default()
+    );
+    crate::settings::update_settings(original).expect("恢复 settings");
+}

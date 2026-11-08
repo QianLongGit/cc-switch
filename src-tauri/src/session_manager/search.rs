@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -27,6 +27,8 @@ use serde::Serialize;
 use super::cache::{self, Fingerprint};
 use super::content;
 use super::model::{SessionBlock, SessionMessage};
+use super::ssh::{self, RemoteSearchLine};
+use crate::settings::SshHostConfig;
 
 const INDEX_FILE: &str = "session-index.db";
 /// 索引格式版本；表结构或收录规则变了就加一，旧索引整体重建
@@ -663,6 +665,310 @@ pub fn search(query: &str, providers: Option<Vec<String>>, limit: usize) -> Cont
             log::warn!("会话正文搜索失败: {e}");
             Vec::new()
         });
+    ContentSearchResult { hits, status }
+}
+
+/* ===== 远程正文搜索（spec §4.2，迭代 2）===== */
+
+/// 远程搜索批大小（对齐扫描链路 `REMOTE_HEAD_TAIL_BATCH` 的批口径）
+const REMOTE_SEARCH_BATCH: usize = 50;
+/// 单批搜索命令超时（批内同样是逐文件读内容的远端命令，与扫描链路
+/// `REMOTE_BATCH_TIMEOUT` 同量级）
+const REMOTE_SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// rg / grep 的可接受退出码：0 有命中、1 无命中（空结果语义，spec §4.2
+/// 退出码裁决）；255 连接错误与其余非零仍按错误分类透传
+const REMOTE_SEARCH_ACCEPTED: &[i32] = &[0, 1];
+/// 锚点最长字符数：消息正文前缀足够在原始 JSONL 行内圈定所属消息
+const REMOTE_ANCHOR_MAX_CHARS: usize = 32;
+/// 锚点最短字符数：过短的锚容易误命中行内其他字段（时间戳 / 路径等）
+const REMOTE_ANCHOR_MIN_CHARS: usize = 4;
+
+/// `ssh:<hostId>/<远端路径>` 源路径（与 `rebind_remote_meta` 的形态严格
+/// 一致：远端路径去前导斜杠，避免 `ssh:h1//root/...` 双斜杠）
+fn ssh_source_path(host_id: &str, remote_path: &str) -> String {
+    let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
+    format!("ssh:{host_id}/{rel}")
+}
+
+/// 消息正文 → 可原样出现在原始 JSONL 行里的最长前缀锚点：截到首个需
+/// JSON 转义的字符（`"` `\` 换行 制表 其余控制字符——写行方都会转义这些），
+/// 再限长 [`REMOTE_ANCHOR_MAX_CHARS`]。非 ASCII 不转义，中文正文锚点原样保留。
+fn anchor_prefix(text: &str) -> String {
+    let cut = text
+        .char_indices()
+        .find(|(_, c)| matches!(*c, '"' | '\\' | '\n' | '\r' | '\t') || (*c as u32) < 0x20)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let prefix = &text[..cut];
+    match prefix.char_indices().nth(REMOTE_ANCHOR_MAX_CHARS) {
+        Some((i, _)) => prefix[..i].to_string(),
+        None => prefix.to_string(),
+    }
+}
+
+/// 命中行 → 所属消息正文：在提取行（[`message_rows`] 口径）里找首个锚点
+/// （正文可原样出现在行内的前缀）命中的消息，返回其正文供 snippet 与高亮。
+/// 找不到（行内无消息正文：summary / meta / 工具输出行）→ None——该行仍
+/// 计入 match_count，只是不出 snippet。
+fn locate_hit_message<'a>(rows: &'a [(usize, String)], line_text: &str) -> Option<&'a str> {
+    for (_, text) in rows {
+        let anchor = anchor_prefix(text);
+        if anchor.chars().count() >= REMOTE_ANCHOR_MIN_CHARS && line_text.contains(&anchor) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// 消费侧归一化（Task 3 审阅裁决的确定性修复）：[`ssh::parse_search_output`]
+/// 从右向左锚定行号（计划锁定的解析取舍，不改），正文含 `:<纯数字>:` 形态
+/// （ISO 时间戳 `12:34:56` 等）时行号会错锚、path 截成
+/// `<真路径>:<真行号>:<正文前缀>` 残段——真实 JSONL 会话行几乎必含时间戳。
+/// 按已知文件清单（当批 grep 传入的文件集）在消费侧修复：
+///
+/// 1. path 精确命中已知文件 → 原样通过（未污染的正常行）
+/// 2. 某已知文件是 path 前缀且紧随 `:` → 真路径即该文件；path 残段与原
+///    行号 / 原正文无损拼回原始输出行，从已知文件边界后的
+///    `<真行号>:<完整正文>` 确定性重切（行号是剩余段开头的纯数字段）
+/// 3. 无匹配 → None（丢弃：连接 banner / 野路径防御）
+fn normalize_search_line(
+    line: RemoteSearchLine,
+    known_files: &[String],
+) -> Option<(String, u64, String)> {
+    if known_files.iter().any(|f| f == &line.path) {
+        return Some((line.path, line.line_no, line.text));
+    }
+    // 前缀 + 紧随冒号才能认定污染残段的真路径（目录边界：`/a` 不吃 `/a/b`）
+    let known = known_files.iter().find(|f| {
+        line.path
+            .strip_prefix(f.as_str())
+            .is_some_and(|rest| rest.starts_with(':'))
+    })?;
+    // Task 3 的切分无损：path + ":" + line_no + ":" + text == 原始输出行；
+    // 已知文件边界后的剩余段即 "<真行号>:<完整正文>"
+    let rest = format!(
+        "{}:{}:{}",
+        &line.path[known.len() + 1..],
+        line.line_no,
+        line.text
+    );
+    let (line_no, text) = rest.split_once(':')?;
+    let line_no: u64 = line_no.parse().ok()?;
+    if line_no == 0 {
+        return None; // grep / rg 行号从 1 起，0 = 拼接形态非法
+    }
+    Some((known.clone(), line_no, text.to_string()))
+}
+
+/// 远程命中行聚合为 [`ContentHit`]（spec §4.2 数据流 4-5 步的纯函数核心，
+/// 远端扫描与拉取解析均由注入闭包替换，单测不依赖真 ssh）：
+///
+/// - 按文件分组保序（首现序即批序：最近活跃的会话优先）
+/// - `provider_of` 归类失败（None）的文件跳过，不占 `limit` 名额
+/// - `fetch` 失败（超 32MB / 拉取错误）：保留 match_count 占位、不出
+///   snippet——单文件失败不毁整搜
+/// - snippet：命中行 → 所属消息正文（[`locate_hit_message`] 锚点定位）→
+///   本地大小写不敏感高亮（与本地搜索同口径）；`message_index` 统一 0
+///   （spec §4.2 跳转降级：前端从消息 0 起查找定位）
+fn aggregate_remote_hits(
+    query: &str,
+    host_id: &str,
+    lines: &[RemoteSearchLine],
+    provider_of: &dyn Fn(&str) -> Option<String>,
+    fetch: &dyn Fn(&str) -> Result<Vec<SessionMessage>, String>,
+    limit: usize,
+) -> Vec<ContentHit> {
+    if query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<&str> = Vec::new();
+    let mut grouped: HashMap<&str, Vec<&RemoteSearchLine>> = HashMap::new();
+    for line in lines {
+        grouped
+            .entry(line.path.as_str())
+            .or_insert_with(|| {
+                order.push(line.path.as_str());
+                Vec::new()
+            })
+            .push(line);
+    }
+
+    let mut hits = Vec::new();
+    for path in order {
+        if hits.len() >= limit {
+            break;
+        }
+        let Some(provider_id) = provider_of(path) else {
+            continue;
+        };
+        let file_lines = &grouped[path];
+        let snippets = match fetch(path) {
+            Ok(messages) => {
+                let rows = message_rows(&messages);
+                file_lines
+                    .iter()
+                    .filter_map(|line| locate_hit_message(&rows, &line.text))
+                    .take(MAX_SNIPPETS_PER_SESSION)
+                    .map(|text| {
+                        let (text, highlights) = make_highlighted_snippet(text, query);
+                        ContentSnippet {
+                            message_index: 0,
+                            text,
+                            highlights,
+                        }
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                // match_count 占位由 rg/grep 行数得出，会话不出 snippet
+                log::warn!("远程搜索跳过会话 {}: {e}", ssh_source_path(host_id, path));
+                Vec::new()
+            }
+        };
+        hits.push(ContentHit {
+            provider_id,
+            source_path: ssh_source_path(host_id, path),
+            snippets,
+            match_count: file_lines.len(),
+        });
+    }
+    hits
+}
+
+/// SSH 远程主机的正文搜索（spec §4.2 数据流五步）：扫描清单圈定未压缩
+/// `.jsonl` → 批 50 rg / grep（rg 优先，缺失降级 grep）→ 命中文件按需全文
+/// 拉回（复用 `load_messages` 的 `ssh:` 源链路）→ 本地定位消息正文并高亮。
+///
+/// - 无清单（registry miss，未扫描过）：空 hits + 默认状态——对齐
+///   「先刷新列表」语义，不发起任何 ssh 往返
+/// - 与本机 [`search`] 互不影响：远程无索引，状态恒为默认值
+pub fn search_remote(
+    query: &str,
+    host: &SshHostConfig,
+    providers: Option<Vec<String>>,
+    limit: usize,
+) -> ContentSearchResult {
+    let status = IndexStatus::default();
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return ContentSearchResult {
+            hits: Vec::new(),
+            status,
+        };
+    }
+
+    // ── 1. 扫描清单（未扫描过 → 空结果）──
+    let Some(manifest) = ssh::SshScanRegistry::global().manifest(&host.id) else {
+        return ContentSearchResult {
+            hits: Vec::new(),
+            status,
+        };
+    };
+
+    // ── 2. 文件圈定：未压缩 .jsonl + provider 归类 + 应用过滤 ──
+    // classify 与扫描链路同一口径（home_dirs 往返 + classify_remote_provider），
+    // 不从路径形态另立判定，避免双口径漂移
+    let dirs = match ssh::run_remote(host, &ssh::home_dirs_command(), super::REMOTE_DIRS_TIMEOUT) {
+        Ok(out) => ssh::parse_home_dirs(&out),
+        Err(e) => {
+            log::warn!(
+                "远程搜索解析会话根目录失败（SSH 主机「{}」）: {e}",
+                host.label
+            );
+            return ContentSearchResult {
+                hits: Vec::new(),
+                status,
+            };
+        }
+    };
+    if dirs.len() < 3 {
+        log::warn!(
+            "远程搜索会话根目录解析异常（SSH 主机「{}」）: 期望 3 个目录，实际 {} 个",
+            host.label,
+            dirs.len()
+        );
+        return ContentSearchResult {
+            hits: Vec::new(),
+            status,
+        };
+    }
+    let (claude_dir, codex_dirs) = (dirs[0].clone(), dirs[1..].to_vec());
+
+    let mut files: Vec<(String, &'static str, i64)> = manifest
+        .into_iter()
+        // zst 压缩形态不按行 grep（解压后行结构与 jsonl 不同构），跳过
+        .filter(|(path, _)| path.ends_with(".jsonl"))
+        .filter_map(|(path, meta)| {
+            ssh::classify_remote_provider(&path, &claude_dir, &codex_dirs)
+                .map(|provider| (path, provider, meta.mtime_ms))
+        })
+        .filter(|(_, provider, _)| {
+            providers
+                .as_ref()
+                .is_none_or(|list| list.iter().any(|p| p.as_str() == *provider))
+        })
+        .collect();
+    // 最近活跃的会话优先（清单 mtime 降序）；路径做次级排序稳定批序
+    files.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    if files.is_empty() {
+        return ContentSearchResult {
+            hits: Vec::new(),
+            status,
+        };
+    }
+
+    // ── 3. 批量 rg / grep（探测结果 per-host 缓存，缺失降级 grep）──
+    let use_rg = ssh::detect_remote_rg(host);
+    let mut lines: Vec<RemoteSearchLine> = Vec::new();
+    for batch in files.chunks(REMOTE_SEARCH_BATCH) {
+        let paths: Vec<String> = batch.iter().map(|(path, _, _)| path.clone()).collect();
+        let cmd = ssh::build_search_command(query, &paths, use_rg);
+        match ssh::run_remote_with_codes(host, &cmd, REMOTE_SEARCH_TIMEOUT, REMOTE_SEARCH_ACCEPTED)
+        {
+            Ok(out) => {
+                // 消费侧归一化：修复解析器对含 `:<数字>:` 正文（ISO 时间戳）
+                // 的错锚残段，未知路径行丢弃（banner / 野路径防御）
+                for line in ssh::parse_search_output(&out) {
+                    if let Some((path, line_no, text)) = normalize_search_line(line, &paths) {
+                        lines.push(RemoteSearchLine {
+                            path,
+                            line_no,
+                            text,
+                        });
+                    }
+                }
+            }
+            // 批内远端命令失败（权限 / 文件消失）：丢弃该批但不毁整搜
+            Err(ssh::SshError::Remote(e)) => {
+                log::warn!("远程搜索批失败（SSH 主机「{}」）: {e}", host.label);
+            }
+            // 连接层已坏（认证失败 / 超时 / 无 ssh）：后续批必然同样失败，收束
+            Err(e) => {
+                log::warn!("远程搜索中止（SSH 主机「{}」）: {e}", host.label);
+                break;
+            }
+        }
+    }
+
+    // ── 4. 聚合：命中文件拉回解析（复用 load_messages 的 ssh: 源链路）+ 本地高亮 ──
+    let provider_map: HashMap<&str, &str> = files
+        .iter()
+        .map(|(path, provider, _)| (path.as_str(), *provider))
+        .collect();
+    let host_id = host.id.clone();
+    let hits = aggregate_remote_hits(
+        query,
+        &host_id,
+        &lines,
+        &|path: &str| provider_map.get(path).map(|p| p.to_string()),
+        &|path: &str| {
+            let Some(provider) = provider_map.get(path) else {
+                return Err("会话文件未归类到任何应用".to_string());
+            };
+            super::load_messages(provider, &ssh_source_path(&host_id, path))
+        },
+        limit,
+    );
     ContentSearchResult { hits, status }
 }
 
@@ -1675,5 +1981,338 @@ mod tests {
 
         assert_eq!(make_snippet("Hello World", "world"), "Hello World");
         assert_eq!(make_snippet("short", "missing"), "short");
+    }
+
+    /* ===== 远程正文搜索（spec §4.2，Task 4）===== */
+
+    use super::ssh::RemoteSearchLine;
+
+    /// 造一条远程搜索命中行（`path:lineno:text` 解析产物形态）
+    fn remote_line(path: &str, line_no: u64, text: &str) -> RemoteSearchLine {
+        RemoteSearchLine {
+            path: path.to_string(),
+            line_no,
+            text: text.to_string(),
+        }
+    }
+
+    /// 造一条 user 消息（与既有 fixture 口径一致）
+    fn remote_msg(text: &str) -> SessionMessage {
+        SessionMessage::from_blocks("user", None, vec![SessionBlock::text(text)])
+    }
+
+    /// 以 UTF-16 坐标切 snippet 文本（与前端高亮同一坐标系）
+    fn utf16_text(snippet: &str, range: &ContentHighlight) -> String {
+        let units: Vec<u16> = snippet.encode_utf16().collect();
+        String::from_utf16_lossy(&units[range.start..range.end])
+    }
+
+    #[test]
+    fn remote_aggregate_maps_lines_to_content_hits() {
+        // 行文本 = 原始 JSONL 形态（正文原样内嵌，供锚点定位）
+        let lines = vec![
+            remote_line(
+                "/a.jsonl",
+                1,
+                r#"{"type":"user","message":{"role":"user","content":"deploy alpha done"}}"#,
+            ),
+            remote_line(
+                "/a.jsonl",
+                5,
+                r#"{"type":"assistant","message":{"role":"assistant","content":"deploy beta done"}}"#,
+            ),
+            remote_line(
+                "/b.jsonl",
+                2,
+                r#"{"type":"user","message":{"role":"user","content":"deploy gamma done"}}"#,
+            ),
+        ];
+        let provider_of = |path: &str| match path {
+            "/a.jsonl" => Some("claude".to_string()),
+            "/b.jsonl" => Some("codex".to_string()),
+            _ => None,
+        };
+        let fetch = |path: &str| -> Result<Vec<SessionMessage>, String> {
+            match path {
+                "/a.jsonl" => Ok(vec![
+                    remote_msg("intro without keyword"),
+                    remote_msg("deploy alpha done"),
+                    remote_msg("deploy beta done"),
+                ]),
+                _ => Ok(vec![remote_msg("deploy gamma done")]),
+            }
+        };
+
+        let hits = aggregate_remote_hits("deploy", "h1", &lines, &provider_of, &fetch, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].provider_id, "claude");
+        // 远端路径去前导斜杠拼接（与 rebind_remote_meta 的 ssh 源形态一致）
+        assert_eq!(hits[0].source_path, "ssh:h1/a.jsonl");
+        assert_eq!(hits[0].match_count, 2);
+        assert_eq!(hits[0].snippets.len(), 2);
+        // 跳转降级（spec §4.2）：message_index 统一 0
+        assert!(hits[0].snippets.iter().all(|s| s.message_index == 0));
+        assert!(hits[0].snippets.iter().all(|s| s.text.contains("deploy")));
+        assert_eq!(hits[1].provider_id, "codex");
+        assert_eq!(hits[1].source_path, "ssh:h1/b.jsonl");
+        assert_eq!(hits[1].match_count, 1);
+    }
+
+    #[test]
+    fn remote_aggregate_highlights_ascii_and_non_ascii_queries() {
+        let provider_of = |_: &str| Some("claude".to_string());
+        let fetch =
+            |_: &str| -> Result<Vec<SessionMessage>, String> { Ok(vec![remote_msg("正文")]) };
+
+        // ASCII：查询小写命中正文大写形态，高亮区间覆盖原文大小写
+        let lines = vec![remote_line(
+            "/a.jsonl",
+            1,
+            r#"{"type":"user","message":{"role":"user","content":"Deploy NEBULA now"}}"#,
+        )];
+        let fetch_nebula = |_: &str| -> Result<Vec<SessionMessage>, String> {
+            Ok(vec![remote_msg("Deploy NEBULA now")])
+        };
+        let hits = aggregate_remote_hits("nebula", "h1", &lines, &provider_of, &fetch_nebula, 10);
+        assert_eq!(hits[0].snippets.len(), 1);
+        let snippet = &hits[0].snippets[0];
+        assert_eq!(snippet.highlights.len(), 1);
+        assert_eq!(utf16_text(&snippet.text, &snippet.highlights[0]), "NEBULA");
+
+        // 非 ASCII：éclair / 希腊大小写折叠与本地搜索同口径
+        let lines = vec![remote_line(
+            "/a.jsonl",
+            1,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"吃了 Éclair 和 ΟΣ\"}}",
+        )];
+        let fetch_unicode = |_: &str| -> Result<Vec<SessionMessage>, String> {
+            Ok(vec![remote_msg("吃了 Éclair 和 ΟΣ")])
+        };
+        for query in ["éclair", "ÉCLAIR"] {
+            let hits = aggregate_remote_hits(query, "h1", &lines, &provider_of, &fetch_unicode, 10);
+            let snippet = &hits[0].snippets[0];
+            assert_eq!(snippet.highlights.len(), 1, "query {query}");
+            assert_eq!(utf16_text(&snippet.text, &snippet.highlights[0]), "Éclair");
+        }
+        let hits = aggregate_remote_hits("ος", "h1", &lines, &provider_of, &fetch_unicode, 10);
+        let snippet = &hits[0].snippets[0];
+        assert_eq!(utf16_text(&snippet.text, &snippet.highlights[0]), "ΟΣ");
+
+        // 定位不到消息正文时不出 snippet（fetch 返回的正文与行文本对不上）
+        let hits = aggregate_remote_hits("nebula", "h1", &lines, &provider_of, &fetch, 10);
+        assert_eq!(hits[0].match_count, 1, "行数仍计入 match_count");
+        assert!(hits[0].snippets.is_empty());
+    }
+
+    #[test]
+    fn remote_aggregate_keeps_match_count_placeholder_when_fetch_fails() {
+        let lines = vec![
+            remote_line(
+                "/big.jsonl",
+                3,
+                r#"{"type":"user","message":{"role":"user","content":"deploy big"}}"#,
+            ),
+            remote_line(
+                "/ok.jsonl",
+                1,
+                r#"{"type":"user","message":{"role":"user","content":"deploy ok"}}"#,
+            ),
+        ];
+        let provider_of = |_: &str| Some("claude".to_string());
+        let fetch = |path: &str| -> Result<Vec<SessionMessage>, String> {
+            match path {
+                // fetch_to_temp_file 超 32MB 上限的文案形态
+                "/big.jsonl" => Err("文件过大（超过 32MB 上限）".to_string()),
+                _ => Ok(vec![remote_msg("deploy ok")]),
+            }
+        };
+
+        // 拉取失败的文件跳过 snippet 产出但保留 match_count 占位，不 panic、不毁整搜
+        let hits = aggregate_remote_hits("deploy", "h1", &lines, &provider_of, &fetch, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].source_path, "ssh:h1/big.jsonl");
+        assert_eq!(hits[0].match_count, 1, "match_count 占位由命中行数得出");
+        assert!(hits[0].snippets.is_empty(), "拉取失败不出 snippet");
+        assert_eq!(hits[1].snippets.len(), 1, "单文件失败不影响其他文件");
+    }
+
+    #[test]
+    fn remote_aggregate_caps_snippets_but_counts_every_line() {
+        // 每文件 5 行命中（远端 -m 5 的上限形态）：snippet 3 段、match_count 5
+        let lines: Vec<_> = (0..5)
+            .map(|i| {
+                remote_line(
+                    "/a.jsonl",
+                    i + 1,
+                    &format!(
+                        r#"{{"type":"user","message":{{"role":"user","content":"deploy step {i}"}}}}"#
+                    ),
+                )
+            })
+            .collect();
+        let provider_of = |_: &str| Some("codex".to_string());
+        let messages: Vec<SessionMessage> = (0..5)
+            .map(|i| remote_msg(&format!("deploy step {i}")))
+            .collect();
+        let fetch = |_: &str| -> Result<Vec<SessionMessage>, String> { Ok(messages.clone()) };
+
+        let hits = aggregate_remote_hits("deploy", "h1", &lines, &provider_of, &fetch, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_count, 5);
+        assert_eq!(hits[0].snippets.len(), MAX_SNIPPETS_PER_SESSION);
+    }
+
+    #[test]
+    fn remote_aggregate_respects_limit_and_skips_unknown_providers() {
+        let lines = vec![
+            remote_line(
+                "/a.jsonl",
+                1,
+                r#"{"type":"user","message":{"role":"user","content":"deploy a"}}"#,
+            ),
+            remote_line(
+                "/b.jsonl",
+                1,
+                r#"{"type":"user","message":{"role":"user","content":"deploy b"}}"#,
+            ),
+            remote_line(
+                "/c.jsonl",
+                1,
+                r#"{"type":"user","message":{"role":"user","content":"deploy c"}}"#,
+            ),
+        ];
+        let provider_of = |path: &str| match path {
+            "/b.jsonl" => None, // 归类失败：跳过且不占 limit 名额
+            other => Some(
+                if other == "/a.jsonl" {
+                    "claude"
+                } else {
+                    "codex"
+                }
+                .to_string(),
+            ),
+        };
+        let fetch = |_: &str| -> Result<Vec<SessionMessage>, String> {
+            Ok(vec![remote_msg("deploy matched")])
+        };
+
+        let hits = aggregate_remote_hits("deploy", "h1", &lines, &provider_of, &fetch, 2);
+        assert_eq!(
+            hits.iter()
+                .map(|h| h.source_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ssh:h1/a.jsonl", "ssh:h1/c.jsonl"],
+            "limit 作用于返回的会话数，未知 provider 不占名额"
+        );
+
+        // 空命中行 → 空结果
+        assert!(aggregate_remote_hits("deploy", "h1", &[], &provider_of, &fetch, 2).is_empty());
+    }
+
+    #[test]
+    fn remote_anchor_prefix_stops_at_json_escapables() {
+        assert_eq!(anchor_prefix("hello world enough"), "hello world enough");
+        assert_eq!(anchor_prefix("line1\nline2"), "line1");
+        assert_eq!(anchor_prefix("quote\"tail"), "quote");
+        assert_eq!(anchor_prefix("tab\there"), "tab");
+        assert_eq!(anchor_prefix("back\\slash"), "back");
+        assert_eq!(
+            anchor_prefix("中文正文没有转义字符"),
+            "中文正文没有转义字符"
+        );
+        let long = "字".repeat(REMOTE_ANCHOR_MAX_CHARS + 10);
+        assert_eq!(
+            anchor_prefix(&long).chars().count(),
+            REMOTE_ANCHOR_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn remote_anchor_matches_message_body_inside_raw_json_line() {
+        let rows = vec![
+            (0, "line1\nline2 continues".to_string()), // 锚截断到 "line1"
+            (1, "plain body without keyword".to_string()),
+        ];
+        let line =
+            r#"{"type":"user","message":{"role":"user","content":"line1\nline2 continues"}}"#;
+        assert_eq!(
+            locate_hit_message(&rows, line),
+            Some("line1\nline2 continues")
+        );
+        // 行内不含任何消息正文锚点（summary / meta 行形态）
+        assert_eq!(
+            locate_hit_message(&rows, r#"{"type":"summary","summary":"无关"}"#),
+            None
+        );
+        // 锚点过短（不足最小字符数）不参与匹配，避免短锚误命中
+        let short = vec![(0, "ok".to_string())];
+        assert_eq!(locate_hit_message(&short, r#"{"content":"ok"}"#), None);
+    }
+
+    #[test]
+    fn remote_normalize_repairs_timestamp_poisoned_line() {
+        let known = vec!["/p/q.jsonl".to_string()];
+        // Task 3 解析器（从右向左锚定）对含 ISO 时间戳正文的实际产物形态：
+        // 行号错锚到 `:34:`，path 截成 `<真路径>:<真行号>:<正文前缀>` 残段
+        let poisoned = RemoteSearchLine {
+            path: "/p/q.jsonl:7:{\"ts\":\"2026-11-08T12".to_string(),
+            line_no: 34,
+            text: "56Z\",\"content\":\"hello world\"}".to_string(),
+        };
+        assert_eq!(
+            normalize_search_line(poisoned, &known),
+            Some((
+                "/p/q.jsonl".to_string(),
+                7,
+                "{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"hello world\"}".to_string(),
+            ))
+        );
+        // 精确命中已知文件：原样通过
+        let exact = remote_line("/p/q.jsonl", 7, "plain text");
+        assert_eq!(
+            normalize_search_line(exact, &known),
+            Some(("/p/q.jsonl".to_string(), 7, "plain text".to_string()))
+        );
+        // 未知路径（banner / 野路径）：丢弃
+        let wild = remote_line("/etc/other.jsonl", 1, "x");
+        assert_eq!(normalize_search_line(wild, &known), None);
+    }
+
+    #[test]
+    fn remote_pipeline_normalizes_parser_output_with_timestamps() {
+        // 端到端衔接：真实 stdout → Task 3 解析（从右向左，产出污染形态）
+        // → 消费侧归一化修复——保证手构造的污染形态与解析器实际产物一致
+        let out =
+            b"/p/q.jsonl:7:{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"zephyr hello world\"}\n";
+        let known = vec!["/p/q.jsonl".to_string()];
+        let normalized: Vec<_> = ssh::parse_search_output(out)
+            .into_iter()
+            .filter_map(|line| normalize_search_line(line, &known))
+            .collect();
+        assert_eq!(
+            normalized,
+            vec![(
+                "/p/q.jsonl".to_string(),
+                7,
+                "{\"ts\":\"2026-11-08T12:34:56Z\",\"content\":\"zephyr hello world\"}".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_search_without_manifest_returns_empty() {
+        let host = crate::settings::SshHostConfig {
+            id: "search-no-such-host".to_string(),
+            label: "未扫描主机".to_string(),
+            host: "example.invalid".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+        };
+        // 未扫描过（registry miss）：空 hits + 默认状态，不发起任何 ssh 往返
+        let result = search_remote("query", &host, None, DEFAULT_LIMIT);
+        assert!(result.hits.is_empty());
+        assert_eq!(result.status, IndexStatus::default());
     }
 }

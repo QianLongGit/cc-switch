@@ -891,7 +891,13 @@ mod tests {
             path: "/neg.jsonl".into(),
         })
         .unwrap();
-        assert_eq!(neg, Fingerprint { modified: None, len: 5 });
+        assert_eq!(
+            neg,
+            Fingerprint {
+                modified: None,
+                len: 5
+            }
+        );
 
         // 清单没有该条目：防御性报错，而不是静默当作没变化
         let err = fingerprint(&SourceLocation::Ssh {

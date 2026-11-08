@@ -79,7 +79,7 @@ pub fn last_sync_completed_at() -> Option<i64> {
 /// 逐文件的单行查询（文件数随历史只增不减，逐文件查询意味着每轮上千次
 /// 取锁）。`last_synced_at` 对 Pi 路径是编码后的 revision，其余路径是
 /// 真实同步时间戳。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SyncCursor {
     pub last_modified: i64,
     pub last_line_offset: i64,
@@ -212,18 +212,18 @@ pub struct DataSourceSummary {
 }
 
 /// 从 JSONL 中解析出的 assistant 消息使用数据
-#[derive(Debug)]
-struct ParsedAssistantUsage {
-    message_id: String,
-    model: String,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_read_tokens: u32,
-    cache_creation_tokens: u32,
-    cache_creation_1h_tokens: u32,
-    stop_reason: Option<String>,
-    timestamp: Option<String>,
-    session_id: Option<String>,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedAssistantUsage {
+    pub(crate) message_id: String,
+    pub(crate) model: String,
+    pub(crate) input_tokens: u32,
+    pub(crate) output_tokens: u32,
+    pub(crate) cache_read_tokens: u32,
+    pub(crate) cache_creation_tokens: u32,
+    pub(crate) cache_creation_1h_tokens: u32,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) timestamp: Option<String>,
+    pub(crate) session_id: Option<String>,
 }
 
 /// 估算出的请求耗时短于这个毫秒数就不要：真实请求不可能这么快，多半是起点取错了。
@@ -287,20 +287,17 @@ fn record_chain_node(chain: &mut ChainNodes, value: &serde_json::Value) {
 /// 起点行（用户消息、工具结果）在游标前面：工具结果先落盘，回复要等整条
 /// 结束才一次写完。起点行比这个窗口还大（比如带图片的工具结果）时，那一条
 /// 请求就不估耗时。
-const CHAIN_SEED_BYTES: i64 = 256 * 1024;
+pub(crate) const CHAIN_SEED_BYTES: i64 = 256 * 1024;
 
-/// 把游标前一小段里的行记进对话链和回复计时（只取这两样，不导入）。回复的
-/// 前几块可能已经被上一轮读走，这一轮要靠它们才知道回复从哪一块开始。返回后
-/// 文件位置停在 `offset`。回看读不出来不算错，只是少估几条耗时。
-fn read_chain_seed(
-    file: &mut fs::File,
-    offset: i64,
-    chain: &mut ChainNodes,
-    timings: &mut HashMap<String, MessageTiming>,
-) -> Result<(), AppError> {
+/// 读取游标前一小段字节（对话链回看窗口）。回复的前几块可能已经被上一轮读走，
+/// 这一轮要靠窗口里的行才知道回复从哪一块开始：窗口交给
+/// [`parse_claude_usage_segment`] 解析进对话链与回复计时。返回后文件位置停在
+/// `offset`。回看读不出来按空窗口处理（只是少估几条耗时），定位回 `offset`
+/// 失败才是错误。
+fn read_chain_seed_bytes(file: &mut fs::File, offset: i64) -> Result<Vec<u8>, AppError> {
     let len = offset.clamp(0, CHAIN_SEED_BYTES);
     if len == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut window = vec![0u8; len as usize];
     let read_ok = file
@@ -310,23 +307,9 @@ fn read_chain_seed(
     file.seek(SeekFrom::Start(offset as u64))
         .map_err(|e| AppError::Config(format!("无法定位文件偏移: {e}")))?;
     if !read_ok {
-        return Ok(());
+        return Ok(Vec::new());
     }
-
-    let mut lines = window.split(|b| *b == b'\n');
-    if offset > len {
-        // 窗口不是从文件头开始，第一段多半是半行
-        lines.next();
-    }
-    for line in lines {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
-            record_chain_node(chain, &value);
-            if let Some(msg_id) = assistant_message_id(&value) {
-                record_block_timing(timings, &value, msg_id);
-            }
-        }
-    }
-    Ok(())
+    Ok(window)
 }
 
 /// assistant 行的 `message.id`；别的行返回 None。
@@ -584,10 +567,10 @@ struct ClaudeFileSync {
 }
 
 /// 游标边界指纹覆盖的尾部字节数（与 Pi 的 `REVISION_TAIL_BYTES` 同值）。
-const TAIL_FINGERPRINT_BYTES: i64 = 4096;
+pub(crate) const TAIL_FINGERPRINT_BYTES: i64 = 4096;
 
 /// 游标边界前尾部字节的指纹。域标签防止与其他用途的哈希混淆。
-fn claude_tail_fingerprint(tail: &[u8]) -> i64 {
+pub(crate) fn claude_tail_fingerprint(tail: &[u8]) -> i64 {
     let mut hasher = Sha256::new();
     hasher.update(b"claude-session-tail-v1");
     hasher.update(tail);
@@ -620,157 +603,110 @@ fn push_committed_tail(tail_buf: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// 同步单个 JSONL 文件。
-///
-/// 增量语义：游标是字节偏移（`last_byte_offset`），文件追加时 seek 到
-/// 游标只读新增尾部，避免活跃会话文件每轮被整文件重读。游标只推进到
-/// 最后一个完整行（以 `\n` 结尾）之后——按行号计数的旧游标会把未写完
-/// 的半行也计入，导致该行补全后被跳过、记录永久丢失。
-///
-/// `last_byte_offset` 为 NULL（升级前的行号游标）时按旧行号跳过前 L 行、
-/// 转换为字节位置后继续增量。不能回退全量重读：`rollup_and_prune` 会把
-/// 30 天前的明细汇总后删除，request_id 去重只查明细表、对已剪条目失明，
-/// 重导会在下次 rollup 时二次累加、永久放大统计。代价是旧行号游标半行
-/// bug 吞掉的历史行无法找回（无持久账本时与已剪条目不可区分，双算比
-/// 丢行更糟）。
-///
-/// 同一双算风险决定了对非追加变化（Claude Code 正常路径纯追加，此情形
-/// 只来自外部干预）的处理：截断（游标超过文件大小）与重写（游标边界前
-/// 尾部指纹失配——同尺寸/更大的替换靠 size 检测不出来）都把游标钉到
-/// 当前 EOF、不重放任何旧区间，之后的追加恢复正常增量。
-fn sync_single_file(
-    db: &Database,
-    file_path: &Path,
-    cursor: Option<&SyncCursor>,
-) -> Result<ClaudeFileSync, AppError> {
-    let file_path_str = file_path.to_string_lossy().to_string();
+/* ═══════════════════════════════════════════════════════════════════════
+ * 字节段续读纯函数（本机 sync_single_file 与远程增量拉取共用的解析内核）
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * 边界契约（Task 8 远程增量拉取按此复用）：
+ *
+ *   输入  bytes   从游标边界起的增量字节段（本机 seek 读 / 远程 read_range）
+ *         cursor  旧游标（字节偏移即段起点）
+ *         seed    游标边界之前的窗口字节（链回看 + 指纹种子），同样只取字节
+ *   输出  解析出的 usage 条目（含估算计时）+ 推进后的新游标
+ *
+ * 全程无 IO、无全局状态：同一 (bytes, cursor, seed) 恒得同一输出。跨段状态
+ * 不经 parser_state 序列化（Claude 路径恒为 None）——对话链与计时线索靠
+ * seed.chain_window 每段重建，按 message.id 的跨段合并由入库 upsert 承担。
+ */
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
-    let file_size = metadata.len() as i64;
+/// 字节段续读的种子：游标边界之前的窗口字节，由调用方取回（本机 seek 回读 /
+/// 远程 read_range 一并拉取），纯函数只消费字节。
+pub(crate) struct ClaudeSegmentSeed<'a> {
+    /// 对话链回看窗口（≤ [`CHAIN_SEED_BYTES`]）：估算请求耗时的起点行在此重建
+    pub(crate) chain_window: &'a [u8],
+    /// 窗口是否从文件头开始；不是则开头一段是半行，解析时跳过
+    pub(crate) chain_window_from_start: bool,
+    /// 滚动尾部指纹缓冲的初值（≤ [`TAIL_FINGERPRINT_BYTES`] 的边界前尾部字节）
+    pub(crate) tail_seed: &'a [u8],
+}
 
-    let last_modified = cursor.map_or(0, |c| c.last_modified);
-    let last_byte_offset = cursor.and_then(|c| c.last_byte_offset);
-    let last_fingerprint = cursor.and_then(|c| c.last_tail_fingerprint);
+/// 段解析产出的一条用量：解析数据 + 按日志时间戳估出的计时（估不出为 None）
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeSegmentUsage {
+    pub(crate) parsed: ParsedAssistantUsage,
+    pub(crate) timing: Option<EstimatedTiming>,
+}
 
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
-        return Ok(ClaudeFileSync::default());
+/// 字节段解析结果
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeSegmentOutcome {
+    /// 本段解析出的 assistant 用量（按 message.id 去重后的代表行）
+    pub(crate) usages: Vec<ClaudeSegmentUsage>,
+    /// 推进后的游标：`last_byte_offset` 停在段内最后一个完整行之后，
+    /// 尾部指纹同步刷新；`last_modified` / `last_synced_at` / `parser_state`
+    /// 原样带回，由调用方写库时决定
+    pub(crate) cursor: SyncCursor,
+    /// 段尾残行（未以 `\n` 终结）：残行若解析成功仍会计入产出，但游标不越过，
+    /// 待补全后由下一段重读确认
+    pub(crate) incomplete_tail: bool,
+}
+
+/// 解析一段从 `cursor.last_byte_offset` 起的字节增量。
+///
+/// 段按 `\n` 切行：完整行推进游标与滚动指纹缓冲，尾段半行只解析不推进。
+/// 对话链与回复计时先由 [`ClaudeSegmentSeed::chain_window`] 重建（窗口里的
+/// 起点行/前几块对耗时估算不可少），再逐行累积 usage 并按 message.id 去重。
+/// 空段直接原样返回游标——远程清单 diff 无新增字节时无产出、无推进。
+pub(crate) fn parse_claude_usage_segment(
+    bytes: &[u8],
+    cursor: &SyncCursor,
+    seed: &ClaudeSegmentSeed<'_>,
+) -> ClaudeSegmentOutcome {
+    if bytes.is_empty() {
+        return ClaudeSegmentOutcome {
+            usages: Vec::new(),
+            cursor: cursor.clone(),
+            incomplete_tail: false,
+        };
     }
 
-    let mut file =
-        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
-
-    // 非追加变化检测（仅字节游标路径）。检出后游标钉到当前 EOF、旧偏移
-    // 一概不重放（见函数文档：重放会把已剪明细双算进汇总）。指纹为 NULL
-    // （升级存量行转换后的首轮之前）时无从校验，按纯追加处理——这是旧
-    // 行号游标本就存在的暴露面，首轮写入后即有指纹。
+    // ── 种子阶段：回看窗口重建对话链与计时线索（只取这两样，不导入）──
     let mut chain = ChainNodes::new();
     let mut timings: HashMap<String, MessageTiming> = HashMap::new();
-    let (start_byte, legacy_lines, mut tail_buf) = match last_byte_offset {
-        Some(offset) => {
-            let truncated = !(0..=file_size).contains(&offset);
-            // seed 同时用于指纹校验与滚动尾部缓冲；读取后文件位置恰好
-            // 停在 offset，无需再显式 seek
-            let seed = if truncated {
-                None
-            } else {
-                Some(read_tail_before(&mut file, offset)?)
-            };
-            let rewritten = match (&seed, last_fingerprint) {
-                (Some(seed), Some(expected)) => claude_tail_fingerprint(seed) != expected,
-                _ => false,
-            };
-            if truncated || rewritten {
-                let reason = if truncated { "截断" } else { "重写" };
-                log::warn!(
-                    "[SESSION-SYNC] 文件被外部{reason}，游标钉至 EOF、不重放旧区间: {}",
-                    file_path.display()
-                );
-                let tail = read_tail_before(&mut file, file_size)?;
-                let fingerprint = claude_tail_fingerprint(&tail);
-                let conn = lock_conn!(db.conn);
-                update_claude_sync_state_on_conn(
-                    &conn,
-                    &file_path_str,
-                    file_modified,
-                    file_size,
-                    Some(fingerprint),
-                )?;
-                return Ok(ClaudeFileSync {
-                    pinned_rewrite: Some(reason),
-                    ..Default::default()
-                });
+    let mut seed_lines = seed.chain_window.split(|b| *b == b'\n');
+    if !seed.chain_window_from_start && !seed.chain_window.is_empty() {
+        // 窗口不是从文件头开始，第一段多半是半行
+        seed_lines.next();
+    }
+    for line in seed_lines {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
+            record_chain_node(&mut chain, &value);
+            if let Some(msg_id) = assistant_message_id(&value) {
+                record_block_timing(&mut timings, &value, msg_id);
             }
-            read_chain_seed(&mut file, offset, &mut chain, &mut timings)?;
-            (offset, 0, seed.unwrap_or_default())
         }
-        // 旧行号游标：从头按行转换（下方转换段），tail 缓冲从空积累
-        None => (
-            0,
-            cursor.map_or(0, |c| c.last_line_offset.max(0)),
-            Vec::new(),
-        ),
-    };
-
-    let mut reader = BufReader::new(file);
-
-    // 游标只推进到最后一个完整行之后
-    let mut committed_offset = start_byte;
-    let mut incomplete_tail = false;
-    let mut buf: Vec<u8> = Vec::new();
-
-    // 旧行号 → 字节位置转换：只数字节不解析不导入。旧 `lines()` 把无换行
-    // 的尾段也计入行号，这里 read_until 的每次返回同样计一行，字节位置与
-    // 旧游标精确对齐。文件行数不足 L（截断）时停在 EOF，等价旧游标对
-    // 截断文件的"新内容行号偏小被跳过"语义。转换必须完整走完才能写游标：
-    // 中途读错误若照常落库，last_line_offset 会被清 0、剩余待跳行数丢失，
-    // 下轮会把旧代码已导入过的行当新行重导——所以这里出错直接整文件失败。
-    let mut skipped_legacy_lines: i64 = 0;
-    while skipped_legacy_lines < legacy_lines {
-        buf.clear();
-        let read = reader
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| AppError::Config(format!("转换旧行号游标失败: {e}")))?;
-        if read == 0 {
-            break;
-        }
-        push_committed_tail(&mut tail_buf, &buf);
-        committed_offset += read as i64;
-        skipped_legacy_lines += 1;
     }
 
-    let mut read_error: Option<String> = None;
+    // ── 增量阶段：逐行解析，游标只推进到最后一个完整行之后 ──
+    let mut tail_buf = seed.tail_seed.to_vec();
+    let mut committed_offset = cursor.last_byte_offset.unwrap_or(0);
+    let mut incomplete_tail = false;
     let mut messages: HashMap<String, ParsedAssistantUsage> = HashMap::new();
     let mut current_session_id: Option<String> = None;
 
-    loop {
-        buf.clear();
-        let read = match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                // IO 错误：已提交的部分照常入库；游标写旧 mtime 让下轮
-                // mtime 门放行、从 committed_offset 续读（见写入处）。
-                // 错误消息带回上层：手动同步没有下一轮，须让用户看到
-                read_error = Some(e.to_string());
-                break;
-            }
-        };
-        if buf.ends_with(b"\n") {
-            push_committed_tail(&mut tail_buf, &buf);
-            committed_offset += read as i64;
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        if line.ends_with(b"\n") {
+            push_committed_tail(&mut tail_buf, line);
+            committed_offset += line.len() as i64;
         } else {
             incomplete_tail = true;
         }
 
-        if buf.iter().all(u8::is_ascii_whitespace) {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
 
-        let value: serde_json::Value = match serde_json::from_slice(&buf) {
+        let value: serde_json::Value = match serde_json::from_slice(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -864,6 +800,194 @@ fn sync_single_file(
         }
     }
 
+    // ── 产出阶段：代表行配估算计时（只给写完整了的回复算，且看得到首块）──
+    let usages = messages
+        .into_values()
+        .map(|msg| {
+            let timing = timings
+                .get(&msg.message_id)
+                .filter(|timing| msg.stop_reason.is_some() && timing.starts_at_first_block)
+                .and_then(|timing| {
+                    let start_ms = resolve_request_start_ms(&chain, timing.first_parent)?;
+                    let latency_ms = estimated_latency_ms(start_ms, timing.end_ms?)?;
+                    let first_token_ms = timing.first_output_ms.and_then(|first_output_ms| {
+                        estimated_first_token_ms(start_ms, first_output_ms, latency_ms)
+                    });
+                    Some(EstimatedTiming {
+                        latency_ms,
+                        first_token_ms,
+                    })
+                });
+            ClaudeSegmentUsage {
+                parsed: msg,
+                timing,
+            }
+        })
+        .collect();
+
+    // tail_buf 始终恰好是 committed_offset 前的末段字节：种子是边界前的旧尾部，
+    // 之后只在游标推进（完整行）时追加
+    ClaudeSegmentOutcome {
+        usages,
+        cursor: SyncCursor {
+            last_modified: cursor.last_modified,
+            // 字节游标语义下行号不再维护，置 0 明确表示"行号游标不可用"
+            last_line_offset: 0,
+            last_byte_offset: Some(committed_offset),
+            last_tail_fingerprint: Some(claude_tail_fingerprint(&tail_buf)),
+            // Claude 路径无跨段序列化状态：链与计时靠窗口重建、合并靠入库 upsert
+            parser_state: None,
+            last_synced_at: cursor.last_synced_at,
+        },
+        incomplete_tail,
+    }
+}
+
+/// 同步单个 JSONL 文件。
+///
+/// 增量语义：游标是字节偏移（`last_byte_offset`），文件追加时 seek 到
+/// 游标只读新增尾部，避免活跃会话文件每轮被整文件重读。游标只推进到
+/// 最后一个完整行（以 `\n` 结尾）之后——按行号计数的旧游标会把未写完
+/// 的半行也计入，导致该行补全后被跳过、记录永久丢失。
+///
+/// `last_byte_offset` 为 NULL（升级前的行号游标）时按旧行号跳过前 L 行、
+/// 转换为字节位置后继续增量。不能回退全量重读：`rollup_and_prune` 会把
+/// 30 天前的明细汇总后删除，request_id 去重只查明细表、对已剪条目失明，
+/// 重导会在下次 rollup 时二次累加、永久放大统计。代价是旧行号游标半行
+/// bug 吞掉的历史行无法找回（无持久账本时与已剪条目不可区分，双算比
+/// 丢行更糟）。
+///
+/// 同一双算风险决定了对非追加变化（Claude Code 正常路径纯追加，此情形
+/// 只来自外部干预）的处理：截断（游标超过文件大小）与重写（游标边界前
+/// 尾部指纹失配——同尺寸/更大的替换靠 size 检测不出来）都把游标钉到
+/// 当前 EOF、不重放任何旧区间，之后的追加恢复正常增量。
+fn sync_single_file(
+    db: &Database,
+    file_path: &Path,
+    cursor: Option<&SyncCursor>,
+) -> Result<ClaudeFileSync, AppError> {
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    // 获取文件元数据
+    let metadata = fs::metadata(file_path)
+        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+    let file_modified = metadata_modified_nanos(&metadata);
+    let file_size = metadata.len() as i64;
+
+    let last_modified = cursor.map_or(0, |c| c.last_modified);
+    let last_byte_offset = cursor.and_then(|c| c.last_byte_offset);
+    let last_fingerprint = cursor.and_then(|c| c.last_tail_fingerprint);
+
+    // 文件未变化则跳过
+    if file_modified <= last_modified {
+        return Ok(ClaudeFileSync::default());
+    }
+
+    let mut file =
+        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+
+    // 非追加变化检测（仅字节游标路径）。检出后游标钉到当前 EOF、旧偏移
+    // 一概不重放（见函数文档：重放会把已剪明细双算进汇总）。指纹为 NULL
+    // （升级存量行转换后的首轮之前）时无从校验，按纯追加处理——这是旧
+    // 行号游标本就存在的暴露面，首轮写入后即有指纹。
+    let (start_byte, legacy_lines, mut tail_seed, chain_window, chain_window_from_start) =
+        match last_byte_offset {
+            Some(offset) => {
+                let truncated = !(0..=file_size).contains(&offset);
+                // seed 同时用于指纹校验与段种子的尾部缓冲；读取后文件位置恰好
+                // 停在 offset，无需再显式 seek
+                let seed = if truncated {
+                    None
+                } else {
+                    Some(read_tail_before(&mut file, offset)?)
+                };
+                let rewritten = match (&seed, last_fingerprint) {
+                    (Some(seed), Some(expected)) => claude_tail_fingerprint(seed) != expected,
+                    _ => false,
+                };
+                if truncated || rewritten {
+                    let reason = if truncated { "截断" } else { "重写" };
+                    log::warn!(
+                        "[SESSION-SYNC] 文件被外部{reason}，游标钉至 EOF、不重放旧区间: {}",
+                        file_path.display()
+                    );
+                    let tail = read_tail_before(&mut file, file_size)?;
+                    let fingerprint = claude_tail_fingerprint(&tail);
+                    let conn = lock_conn!(db.conn);
+                    update_claude_sync_state_on_conn(
+                        &conn,
+                        &file_path_str,
+                        file_modified,
+                        file_size,
+                        Some(fingerprint),
+                    )?;
+                    return Ok(ClaudeFileSync {
+                        pinned_rewrite: Some(reason),
+                        ..Default::default()
+                    });
+                }
+                // 链回看窗口只在这里读字节（解析在纯函数内），读后位置仍停在 offset
+                let chain_window = read_chain_seed_bytes(&mut file, offset)?;
+                (
+                    offset,
+                    0,
+                    seed.unwrap_or_default(),
+                    chain_window,
+                    offset <= CHAIN_SEED_BYTES,
+                )
+            }
+            // 旧行号游标：从头按行转换（下方转换段），链窗口与指纹种子从空积累
+            None => (
+                0,
+                cursor.map_or(0, |c| c.last_line_offset.max(0)),
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        };
+
+    let mut reader = BufReader::new(file);
+    let mut committed_offset = start_byte;
+    let mut buf: Vec<u8> = Vec::new();
+
+    // 旧行号 → 字节位置转换：只数字节不解析不导入。旧 `lines()` 把无换行
+    // 的尾段也计入行号，这里 read_until 的每次返回同样计一行，字节位置与
+    // 旧游标精确对齐。文件行数不足 L（截断）时停在 EOF，等价旧游标对
+    // 截断文件的"新内容行号偏小被跳过"语义。转换必须完整走完才能写游标：
+    // 中途读错误若照常落库，last_line_offset 会被清 0、剩余待跳行数丢失，
+    // 下轮会把旧代码已导入过的行当新行重导——所以这里出错直接整文件失败。
+    let mut skipped_legacy_lines: i64 = 0;
+    while skipped_legacy_lines < legacy_lines {
+        buf.clear();
+        let read = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| AppError::Config(format!("转换旧行号游标失败: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        push_committed_tail(&mut tail_seed, &buf);
+        committed_offset += read as i64;
+        skipped_legacy_lines += 1;
+    }
+
+    // 增量段：从 committed_offset（既有字节游标或行号转换后的边界）读到 EOF。
+    // IO 中断时已读部分照常解析入库，游标盖旧 mtime 让下轮从断点续读。
+    let mut segment = Vec::new();
+    let read_error = reader
+        .read_to_end(&mut segment)
+        .err()
+        .map(|e| e.to_string());
+    let segment_cursor = SyncCursor {
+        last_byte_offset: Some(committed_offset),
+        ..cursor.cloned().unwrap_or_default()
+    };
+    let seed = ClaudeSegmentSeed {
+        chain_window: &chain_window,
+        chain_window_from_start,
+        tail_seed: &tail_seed,
+    };
+    let outcome = parse_claude_usage_segment(&segment, &segment_cursor, &seed);
+
     // 写入数据库：单次取锁 + 事务，插入与游标推进原子提交，
     // 避免逐条插入时反复抢占连接锁
     let mut imported: u32 = 0;
@@ -877,7 +1001,8 @@ fn sync_single_file(
     // 下一文件/下一轮新建缓存，事务之间的定价更新或新增立即可见。
     let mut pricing_cache = SessionPricingCache::default();
 
-    for msg in messages.values() {
+    for entry in outcome.usages {
+        let msg = entry.parsed;
         // 只要产生了真实计费 token 就导入，不再强制要求 stop_reason 或 output>0。
         //
         // Anthropic 在受理请求时即对 input + cache_read + cache_creation 计费
@@ -887,9 +1012,11 @@ fn sync_single_file(
         // 非空 + output>0 双重过滤，会把这类请求整条丢弃，实测系统性低估约 4.1%，
         // 且 92% 集中在 workflow/subagent。这里改为「任一计费维度 > 0 即导入」。
         //
-        // 去重选择逻辑（上方按 message.id 取 stop_reason 优先 / output 最大者）保持
-        // 不变：它选出的代表行的 input/cache 本就准确；request_id = session:msg_id
-        // 主键 + INSERT OR IGNORE 保证一个 message 仍只落库一次，放宽 gate 不会双算。
+        // 去重选择逻辑（解析内核里按 message.id 取 stop_reason 优先 / output
+        // 最大者）保持不变：它选出的代表行的 input/cache 本就准确；request_id =
+        // session:msg_id 主键 + INSERT OR IGNORE 保证一个 message 仍只落库一次，
+        // 放宽 gate 不会双算。计时（含首字）由解析内核沿对话链估好随行带出，
+        // 只给写完整了的回复（有 stop_reason）且看得到首块的才算。
         let has_billable_tokens = msg.input_tokens > 0
             || msg.output_tokens > 0
             || msg.cache_read_tokens > 0
@@ -904,24 +1031,14 @@ fn sync_single_file(
             msg.message_id
         );
 
-        // 耗时估算：只给写完整了的回复算（有 stop_reason），而且要看得到它的第一块
-        // （这一批里，或游标前的回看窗口里），否则起点对不上
-        let timing = timings
-            .get(&msg.message_id)
-            .filter(|timing| msg.stop_reason.is_some() && timing.starts_at_first_block)
-            .and_then(|timing| {
-                let start_ms = resolve_request_start_ms(&chain, timing.first_parent)?;
-                let latency_ms = estimated_latency_ms(start_ms, timing.end_ms?)?;
-                let first_token_ms = timing.first_output_ms.and_then(|first_output_ms| {
-                    estimated_first_token_ms(start_ms, first_output_ms, latency_ms)
-                });
-                Some(EstimatedTiming {
-                    latency_ms,
-                    first_token_ms,
-                })
-            });
-
-        match upsert_session_log_entry_on_conn(&tx, &request_id, msg, timing, &mut pricing_cache) {
+        match upsert_session_log_entry_on_conn(
+            &tx,
+            &request_id,
+            &msg,
+            entry.timing,
+            "session_log",
+            &mut pricing_cache,
+        ) {
             // 补全已有的行也算进 imported：数据变了，界面要跟着刷新
             Ok(SessionRowOutcome::Inserted | SessionRowOutcome::Updated) => imported += 1,
             Ok(SessionRowOutcome::Skipped) => skipped += 1,
@@ -940,15 +1057,13 @@ fn sync_single_file(
     } else {
         file_modified
     };
-    // tail_buf 始终恰好是 committed_offset 前的末段字节：增量路径以边界
-    // seed 起始，之后只在游标推进（完整行）时追加
-    let fingerprint = claude_tail_fingerprint(&tail_buf);
+    // 游标值全部取自解析内核产出的新游标（字节边界 + 滚动指纹缓冲）
     update_claude_sync_state_on_conn(
         &tx,
         &file_path_str,
         stamped_modified,
-        committed_offset,
-        Some(fingerprint),
+        outcome.cursor.last_byte_offset.unwrap_or(committed_offset),
+        outcome.cursor.last_tail_fingerprint,
     )?;
     tx.commit()
         .map_err(|e| AppError::Database(format!("提交会话用量导入事务失败: {e}")))?;
@@ -956,15 +1071,16 @@ fn sync_single_file(
     Ok(ClaudeFileSync {
         imported,
         skipped,
-        incomplete_tail,
+        incomplete_tail: outcome.incomplete_tail,
         read_error,
         pinned_rewrite: None,
     })
 }
 
 /// 写入 Claude 路径的字节游标。`last_line_offset` 固定写 0：字节游标语义
-/// 下行号不再维护，置 0 明确表示"行号游标不可用"。
-fn update_claude_sync_state_on_conn(
+/// 下行号不再维护，置 0 明确表示"行号游标不可用"。远程主机路径（Task 8）
+/// 与本机共用此入口：`file_path` 键以 `ssh:<hostId>/` 前缀天然隔离。
+pub(crate) fn update_claude_sync_state_on_conn(
     conn: &rusqlite::Connection,
     file_path: &str,
     last_modified: i64,
@@ -1092,7 +1208,7 @@ pub(crate) fn update_byte_sync_state(
 
 /// 一条回复写库的结果。
 #[derive(Debug, PartialEq, Eq)]
-enum SessionRowOutcome {
+pub(crate) enum SessionRowOutcome {
     Inserted,
     /// 这条回复早先按中间块入过库，这次补全了用量或耗时；或者补全后发现它和
     /// 路由服务记的是同一次请求，把先前那一行删了。
@@ -1140,7 +1256,7 @@ fn find_stored_session_row(
 
 /// 单个文件导入事务的定价缓存；连接锁释放时一起丢弃，不跨事务缓存旧价或未命中。
 #[derive(Default)]
-struct SessionPricingCache {
+pub(crate) struct SessionPricingCache {
     entries: HashMap<String, Option<ModelPricing>>,
     #[cfg(test)]
     lookup_count: usize,
@@ -1214,7 +1330,10 @@ fn refresh_session_log_entry_on_conn(
     dedup_key: &DedupKey,
     pricing_cache: &mut SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
-    if stored.data_source != "session_log" {
+    // 补全只在同一来源内进行：本机行只被本机段补全，ssh:<hostId> 行只被
+    // 同主机的远程段补全——跨源（尤其与 proxy 行）互相补全会把对方账本
+    // 的字段改写掉。dedup_key.data_source 即本次入库的来源
+    if stored.data_source != dedup_key.data_source {
         return Ok(SessionRowOutcome::Skipped);
     }
     let output_grew = i64::from(msg.output_tokens) > stored.output_tokens;
@@ -1283,11 +1402,18 @@ fn refresh_session_log_entry_on_conn(
 ///
 /// 调用方持有连接锁（通常在事务内）。`timing` 是按日志时间戳估出来的
 /// 请求耗时（含首字等待）和首字时间，估不出来传 None。
-fn upsert_session_log_entry_on_conn(
+/// 单条 assistant 用量入库（INSERT OR IGNORE + 同源补全）。
+///
+/// `data_source` 是归属维度：本机路径传 `"session_log"`，SSH 远程路径传
+/// `"ssh:<hostId>"`（rollup 剪枝按此前缀分账到对应 host 行）。`ssh:` 前缀的
+/// 行不参与「会话行 vs proxy 行」跨源去重——远程流量不经本机代理，不存在
+/// 双记，跨源比对反而可能把远程行误伤成重复（设计 §4.4 裁定）。
+pub(crate) fn upsert_session_log_entry_on_conn(
     conn: &rusqlite::Connection,
     request_id: &str,
     msg: &ParsedAssistantUsage,
     timing: Option<EstimatedTiming>,
+    data_source: &str,
     pricing_cache: &mut SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
     let created_at = msg
@@ -1307,7 +1433,7 @@ fn upsert_session_log_entry_on_conn(
 
     let dedup_key = DedupKey {
         app_type: "claude",
-        data_source: "session_log",
+        data_source,
         model: &msg.model,
         input_tokens: msg.input_tokens,
         output_tokens: msg.output_tokens,
@@ -1326,7 +1452,9 @@ fn upsert_session_log_entry_on_conn(
             pricing_cache,
         );
     }
-    if has_matching_proxy_usage_log(conn, &dedup_key)? {
+    // 跨源去重只对本机会话行有意义（同一次请求可能同时被代理与会话日志
+    // 记下）；ssh: 行不与 proxy 行比对，见函数文档
+    if !data_source.starts_with("ssh:") && has_matching_proxy_usage_log(conn, &dedup_key)? {
         return Ok(SessionRowOutcome::Skipped);
     }
 
@@ -1366,7 +1494,7 @@ fn upsert_session_log_entry_on_conn(
                 1i64,               // is_streaming: Claude Code 通常使用流式
                 "1.0",              // cost_multiplier
                 created_at,
-                "session_log",      // data_source
+                data_source,        // data_source: 本机 session_log / 远程 ssh:<hostId>
             ],
         )
         .map_err(|e| AppError::Database(format!("插入会话日志失败: {e}")))?;
@@ -1498,7 +1626,14 @@ mod tests {
                 }
                 let id = format!("session:pricing-{model_index}-{index}");
                 assert_eq!(
-                    upsert_session_log_entry_on_conn(&tx, &id, &msg, None, &mut cache)?,
+                    upsert_session_log_entry_on_conn(
+                        &tx,
+                        &id,
+                        &msg,
+                        None,
+                        "session_log",
+                        &mut cache
+                    )?,
                     SessionRowOutcome::Inserted
                 );
                 let stored: [String; 5] = tx.query_row(
@@ -1531,6 +1666,7 @@ mod tests {
                 "session:pricing-0-0",
                 &completed,
                 None,
+                "session_log",
                 &mut cache,
             )?,
             SessionRowOutcome::Updated
@@ -1741,6 +1877,7 @@ mod tests {
                 "session:msg_1",
                 &msg,
                 None,
+                "session_log",
                 &mut SessionPricingCache::default(),
             )?
         };
@@ -2640,5 +2777,234 @@ mod tests {
 
         fs::remove_dir_all(&tmp).ok();
         Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 字节段续读纯函数（parse_claude_usage_segment）等价性
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 覆盖段间协作形态的样本会话：两条逐块写的回复（中间块无 stop_reason、
+    /// 最终块补全），各自前面有 user 起点行供耗时估算沿链回溯
+    fn segment_sample_bytes() -> Vec<u8> {
+        let lines = [
+            chain_line("user", 1, None, "2026-06-07T13:00:00.000Z"),
+            assistant_block_with("msg_a", 2, 1, 0, "2026-06-07T13:00:01.000Z", 5, false),
+            assistant_block_with("msg_a", 3, 2, 1, "2026-06-07T13:00:09.000Z", 900, true),
+            chain_line("user", 4, Some(3), "2026-06-07T13:01:00.000Z"),
+            assistant_block_with("msg_b", 5, 4, 0, "2026-06-07T13:01:02.000Z", 5, false),
+            assistant_block_with("msg_b", 6, 5, 1, "2026-06-07T13:01:12.000Z", 900, true),
+        ];
+        (lines.join("\n") + "\n").into_bytes()
+    }
+
+    /// 首扫形态：字节游标从 0 起、无任何种子，一次性喂入完整文件
+    fn parse_whole_segment(file_bytes: &[u8]) -> ClaudeSegmentOutcome {
+        let cursor = SyncCursor {
+            last_byte_offset: Some(0),
+            ..SyncCursor::default()
+        };
+        let seed = ClaudeSegmentSeed {
+            chain_window: &[],
+            chain_window_from_start: true,
+            tail_seed: &[],
+        };
+        parse_claude_usage_segment(file_bytes, &cursor, &seed)
+    }
+
+    /// 按切点接力喂入。每段从上一段游标边界起；种子（链回看窗口 + 指纹种子）
+    /// 由调用方从完整文件字节中切出——对应本机 seek 回读 / 远程 read_range
+    fn parse_split_segments(
+        file_bytes: &[u8],
+        cuts: &[usize],
+    ) -> (Vec<ClaudeSegmentUsage>, SyncCursor) {
+        let mut cursor = SyncCursor {
+            last_byte_offset: Some(0),
+            ..SyncCursor::default()
+        };
+        let mut collected = Vec::new();
+        for cut in cuts
+            .iter()
+            .copied()
+            .chain(std::iter::once(file_bytes.len()))
+        {
+            let start = cursor.last_byte_offset.unwrap_or(0) as usize;
+            assert!(start <= cut, "切点必须不早于游标边界");
+            let window_len = start.min(CHAIN_SEED_BYTES as usize);
+            let tail_len = start.min(TAIL_FINGERPRINT_BYTES as usize);
+            let seed = ClaudeSegmentSeed {
+                chain_window: &file_bytes[start - window_len..start],
+                chain_window_from_start: window_len == start,
+                tail_seed: &file_bytes[start - tail_len..start],
+            };
+            let outcome = parse_claude_usage_segment(&file_bytes[start..cut], &cursor, &seed);
+            collected.extend(outcome.usages);
+            cursor = outcome.cursor;
+        }
+        (collected, cursor)
+    }
+
+    /// 按 message.id 归并（后出现者覆盖）：后到的块补全已有行，与入库 upsert 同向
+    fn merge_usages_by_message_id(mut usages: Vec<ClaudeSegmentUsage>) -> Vec<ClaudeSegmentUsage> {
+        let mut merged: Vec<ClaudeSegmentUsage> = Vec::new();
+        for entry in usages.drain(..) {
+            match merged
+                .iter()
+                .position(|existing| existing.parsed.message_id == entry.parsed.message_id)
+            {
+                Some(at) => merged[at] = entry,
+                None => merged.push(entry),
+            }
+        }
+        merged.sort_by(|a, b| a.parsed.message_id.cmp(&b.parsed.message_id));
+        merged
+    }
+
+    fn assert_segment_usages_match(whole: &[ClaudeSegmentUsage], merged: &[ClaudeSegmentUsage]) {
+        assert_eq!(
+            whole.len(),
+            merged.len(),
+            "分段喂入归并后的条目数须与一次性喂入一致"
+        );
+        for (expected, actual) in whole.iter().zip(merged) {
+            assert_eq!(expected.parsed.message_id, actual.parsed.message_id);
+            assert_eq!(expected.parsed.output_tokens, actual.parsed.output_tokens);
+            assert_eq!(expected.parsed.stop_reason, actual.parsed.stop_reason);
+            assert_eq!(expected.timing, actual.timing, "计时估算须一致");
+        }
+    }
+
+    /// 前 `lines` 行（含行尾 `\n`）的累计字节长度
+    fn segment_line_cut(file_bytes: &[u8], lines: usize) -> usize {
+        file_bytes
+            .split(|b| *b == b'\n')
+            .take(lines)
+            .map(|line| line.len() + 1)
+            .sum()
+    }
+
+    #[test]
+    fn segment_feed_two_way_split_matches_whole_file() {
+        let file_bytes = segment_sample_bytes();
+        let mut whole = parse_whole_segment(&file_bytes);
+        whole
+            .usages
+            .sort_by(|a, b| a.parsed.message_id.cmp(&b.parsed.message_id));
+
+        // 一次性喂入时两条回复都能沿链估出耗时（起点各是前面的 user 行）
+        let msg_a = whole
+            .usages
+            .iter()
+            .find(|entry| entry.parsed.message_id == "msg_a")
+            .unwrap();
+        let msg_b = whole
+            .usages
+            .iter()
+            .find(|entry| entry.parsed.message_id == "msg_b")
+            .unwrap();
+        assert_eq!(
+            msg_a.timing.map(|timing| timing.latency_ms),
+            Some(9_000),
+            "msg_a 耗时 = user(13:00:00) → 末块(13:00:09)"
+        );
+        assert_eq!(
+            msg_b.timing.map(|timing| timing.latency_ms),
+            Some(12_000),
+            "msg_b 耗时 = user(13:01:00) → 末块(13:01:12)"
+        );
+
+        // 在 msg_a 的两块之间切一刀：跨段的同 message 块由归并收敛，
+        // 段 2 靠链回看窗口恢复首块计时线索后估出与一次性喂入相同的耗时
+        let cut = segment_line_cut(&file_bytes, 2);
+        let (split_usages, split_cursor) = parse_split_segments(&file_bytes, &[cut]);
+
+        assert_segment_usages_match(&whole.usages, &merge_usages_by_message_id(split_usages));
+        assert_eq!(split_cursor.last_byte_offset, whole.cursor.last_byte_offset);
+        assert_eq!(
+            split_cursor.last_tail_fingerprint, whole.cursor.last_tail_fingerprint,
+            "分段接力的边界指纹须与一次性喂入一致"
+        );
+    }
+
+    #[test]
+    fn segment_feed_three_way_split_with_mid_line_cut_matches_whole_file() {
+        let file_bytes = segment_sample_bytes();
+        let mut whole = parse_whole_segment(&file_bytes);
+        whole
+            .usages
+            .sort_by(|a, b| a.parsed.message_id.cmp(&b.parsed.message_id));
+
+        // 切点 1：第 1 行末（user 起点行之后）；切点 2：msg_a 首块行内（半行）。
+        // 半行段解析不出任何记录、游标停在半行之前，下一段重读补全
+        let first_cut = segment_line_cut(&file_bytes, 1);
+        let mid_line_cut = first_cut + 20;
+        let (split_usages, split_cursor) =
+            parse_split_segments(&file_bytes, &[first_cut, mid_line_cut]);
+
+        assert_segment_usages_match(&whole.usages, &merge_usages_by_message_id(split_usages));
+        assert_eq!(split_cursor.last_byte_offset, whole.cursor.last_byte_offset);
+        assert_eq!(
+            split_cursor.last_tail_fingerprint,
+            whole.cursor.last_tail_fingerprint
+        );
+    }
+
+    #[test]
+    fn segment_feed_three_way_line_covers_cross_segment_reply_tail() {
+        let file_bytes = segment_sample_bytes();
+        let mut whole = parse_whole_segment(&file_bytes);
+        whole
+            .usages
+            .sort_by(|a, b| a.parsed.message_id.cmp(&b.parsed.message_id));
+
+        // 三段行边界切法：msg_a 首块独占段 1、末块独占段 2、msg_b 两块同在段 3
+        let cuts = [
+            segment_line_cut(&file_bytes, 2),
+            segment_line_cut(&file_bytes, 4),
+        ];
+        let (split_usages, split_cursor) = parse_split_segments(&file_bytes, &cuts);
+
+        assert_segment_usages_match(&whole.usages, &merge_usages_by_message_id(split_usages));
+        assert_eq!(split_cursor.last_byte_offset, whole.cursor.last_byte_offset);
+        assert_eq!(
+            split_cursor.last_tail_fingerprint,
+            whole.cursor.last_tail_fingerprint
+        );
+    }
+
+    #[test]
+    fn segment_empty_input_yields_no_usages_and_keeps_cursor() {
+        let file_bytes = segment_sample_bytes();
+        let cut = segment_line_cut(&file_bytes, 3);
+        let (_, cursor) = parse_split_segments(&file_bytes, &[cut]);
+
+        // 远程清单 diff 无新增字节时的空拉取：无产出、游标逐字段原样
+        let seed = ClaudeSegmentSeed {
+            chain_window: &[],
+            chain_window_from_start: true,
+            tail_seed: &[],
+        };
+        let outcome = parse_claude_usage_segment(&[], &cursor, &seed);
+        assert!(outcome.usages.is_empty());
+        assert!(!outcome.incomplete_tail);
+        assert_eq!(outcome.cursor, cursor);
+    }
+
+    #[test]
+    fn segment_tail_without_newline_is_parsed_but_cursor_holds() {
+        let file_bytes = segment_sample_bytes();
+        // 去掉末行换行：尾段是完整 JSON 但未以 \n 终结——产出照常、游标停在它之前
+        let mut truncated = file_bytes.clone();
+        assert_eq!(truncated.pop(), Some(b'\n'));
+        let mut whole = parse_whole_segment(&truncated);
+        assert!(whole.incomplete_tail);
+        assert_eq!(
+            whole.cursor.last_byte_offset,
+            Some(segment_line_cut(&file_bytes, 5) as i64),
+            "游标不得越过未终结的尾段，停在前一条完整行末"
+        );
+        whole
+            .usages
+            .sort_by(|a, b| a.parsed.message_id.cmp(&b.parsed.message_id));
+        assert_eq!(whole.usages.len(), 2, "无换行的完整尾段也必须产出");
     }
 }

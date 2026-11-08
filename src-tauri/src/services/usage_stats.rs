@@ -281,6 +281,9 @@ pub struct LogFilters {
     pub end_date: Option<i64>,
     /// 来源项目路径精确匹配；None = 不筛选（NULL 行仅在不筛选时出现）
     pub project_dir: Option<String>,
+    /// SSH 远程主机维度（设计 §4.4）：Some(hostId) 只看 `ssh:<hostId>` 来源
+    /// 的行，None 排除一切 `ssh:` 行（本机视图，与既有行为一致）
+    pub host_id: Option<String>,
 }
 
 /// 分页请求日志响应
@@ -419,6 +422,31 @@ pub(crate) const SESSION_PROXY_DEDUP_WINDOW_SECONDS: i64 = 10 * 60;
 /// 都应通过此 helper 生成片段，避免遗漏。
 fn data_source_expr(log_alias: &str) -> String {
     format!("COALESCE({log_alias}.data_source, 'proxy')")
+}
+
+/// host 维度的明细过滤子句（设计 §4.4）：远程视图按 `ssh:<hostId>` 前缀
+/// LIKE 命中，本机视图 NOT LIKE 排除一切远程行。
+///
+/// 返回 `None` 表示「不过滤」留给调用方语义兜底；当前所有调用方在有查询时
+/// 恒注入（本机视图也显式排除 ssh 行），保留 Option 是为了与既有条件向量的
+/// 组装习惯一致。子句绑定固定别名 `l`（明细查询全库统一别名）；hostId 为
+/// 应用生成的 UUID（无引号 / LIKE 通配字符），单引号转义仅作纵深防御。
+pub(crate) fn host_data_source_filter(host_id: Option<&str>) -> Option<String> {
+    let expr = data_source_expr("l");
+    match host_id {
+        Some(host_id) => {
+            let safe = host_id.replace('\'', "''");
+            Some(format!("{expr} LIKE 'ssh:{safe}%'"))
+        }
+        None => Some(format!("{expr} NOT LIKE 'ssh:%'")),
+    }
+}
+
+/// host 维度的 rollup 过滤子句：rollup 行按 `host_id` 列等值归位（本机行
+/// 的 host_id 恒为空串，v27 起 host_id 入主键）。子句绑定固定别名 `r`。
+pub(crate) fn host_rollup_filter(host_id: Option<&str>) -> Option<String> {
+    let safe = host_id.unwrap_or("").replace('\'', "''");
+    Some(format!("r.host_id = '{safe}'"))
 }
 
 fn dedup_app_type_match_sql(left: &str, right: &str) -> String {
@@ -680,16 +708,18 @@ fn connection_total_changes(conn: &Connection) -> Result<u64, AppError> {
 }
 
 fn log_count_cache_key(filters: &LogFilters) -> String {
-    // project_dir 参与 WHERE（本地 fork 的来源项目筛选），必须一并入键：
-    // 否则「先筛选后不筛选」两次查询会命中同一条缓存，把收窄后的总数错报成全量
+    // project_dir / host_id 参与 WHERE（本地 fork 的来源项目筛选、SSH 主机
+    // 维度），必须一并入键：否则「先筛选后不筛选」两次查询会命中同一条
+    // 缓存，把收窄后的总数错报成全量
     format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         filters.app_type,
         filters.provider_name,
         filters.model,
         filters.status_code,
         filters.start_date,
-        filters.project_dir
+        filters.project_dir,
+        filters.host_id
     )
 }
 
@@ -759,7 +789,10 @@ pub(crate) fn should_skip_session_insert(
     has_matching_proxy_usage_log(conn, key)
 }
 
-fn proxy_request_id_exists(conn: &Connection, request_id: &str) -> Result<bool, AppError> {
+pub(crate) fn proxy_request_id_exists(
+    conn: &Connection,
+    request_id: &str,
+) -> Result<bool, AppError> {
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = ?1)")
         .and_then(|mut stmt| stmt.query_row(params![request_id], |row| row.get::<_, bool>(0)))
         .map_err(|e| AppError::Database(format!("查询 request_id 失败: {e}")))
@@ -1002,6 +1035,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<UsageSummary, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -1009,6 +1043,9 @@ impl Database {
         let mut conditions = vec![effective_usage_log_filter_for_range(
             &conn, "l", start_date, end_date,
         )?];
+        if let Some(clause) = host_data_source_filter(host_id) {
+            conditions.push(clause);
+        }
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(start) = start_date {
@@ -1066,6 +1103,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
 
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
@@ -1167,12 +1207,16 @@ impl Database {
         end_date: Option<i64>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<Vec<UsageSummaryByApp>, AppError> {
         let conn = lock_conn!(self.conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter_for_range(
             &conn, "l", start_date, end_date,
         )?];
+        if let Some(clause) = host_data_source_filter(host_id) {
+            detail_conditions.push(clause);
+        }
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(start) = start_date {
             detail_conditions.push("l.created_at >= ?".to_string());
@@ -1214,6 +1258,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1333,6 +1380,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<Vec<DailyStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -1370,6 +1418,9 @@ impl Database {
                 provider_name,
                 model,
             );
+            if let Some(clause) = host_data_source_filter(host_id) {
+                extra_conditions.push(clause);
+            }
             let extra_filter = extra_conditions
                 .iter()
                 .map(|c| format!("AND {c}"))
@@ -1484,6 +1535,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_data_source_filter(host_id) {
+            extra_conditions.push(clause);
+        }
         let extra_filter = extra_conditions
             .iter()
             .map(|c| format!("AND {c}"))
@@ -1568,6 +1622,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
 
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
@@ -1676,6 +1733,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<Option<String>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -1693,6 +1751,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_data_source_filter(host_id) {
+            detail_conditions.push(clause);
+        }
         let detail_where = if detail_conditions.is_empty() {
             String::new()
         } else {
@@ -1730,6 +1791,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1769,12 +1833,16 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<Vec<ProviderStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter_for_range(
             &conn, "l", start_date, end_date,
         )?];
+        if let Some(clause) = host_data_source_filter(host_id) {
+            detail_conditions.push(clause);
+        }
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(start) = start_date {
             detail_conditions.push("l.created_at >= ?".to_string());
@@ -1823,6 +1891,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1962,12 +2033,16 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<Vec<ModelStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter_for_range(
             &conn, "l", start_date, end_date,
         )?];
+        if let Some(clause) = host_data_source_filter(host_id) {
+            detail_conditions.push(clause);
+        }
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(start) = start_date {
             detail_conditions.push("l.created_at >= ?".to_string());
@@ -2021,6 +2096,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -2171,6 +2249,9 @@ impl Database {
             filters.start_date,
             filters.end_date,
         )?];
+        if let Some(clause) = host_data_source_filter(filters.host_id.as_deref()) {
+            conditions.push(clause);
+        }
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ref app_type) = filters.app_type {
@@ -3007,6 +3088,260 @@ mod tests {
         }
     }
 
+    // ── SSH 远程 host 维度（设计 §4.4）──
+
+    // host 过滤子句 SQL 形态：远程 LIKE 前缀 / 本机 NOT LIKE / rollup 等值归位
+    #[test]
+    fn host_filter_clause_shapes() {
+        assert_eq!(
+            host_data_source_filter(Some("h1")).unwrap(),
+            "COALESCE(l.data_source, 'proxy') LIKE 'ssh:h1%'"
+        );
+        assert_eq!(
+            host_data_source_filter(None).unwrap(),
+            "COALESCE(l.data_source, 'proxy') NOT LIKE 'ssh:%'"
+        );
+        assert_eq!(host_rollup_filter(Some("h1")).unwrap(), "r.host_id = 'h1'");
+        assert_eq!(host_rollup_filter(None).unwrap(), "r.host_id = ''");
+        // 纵深防御：单引号入参被转义，不产生 SQL 语法逃逸
+        assert_eq!(
+            host_data_source_filter(Some("h'1")).unwrap(),
+            "COALESCE(l.data_source, 'proxy') LIKE 'ssh:h''1%'"
+        );
+    }
+
+    // 本机视图排除 ssh: 行，远程视图只看 ssh:<hostId> 行（detail + rollup 双侧）
+    #[test]
+    fn usage_summary_filters_by_host() {
+        let db = Database::memory().unwrap();
+        let ts = local_ts(2026, 11, 1, 10, 0, 0);
+        let test_conn = || {
+            db.conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        {
+            let conn = test_conn();
+            insert_usage_log(
+                &conn,
+                "host-local-1",
+                "claude",
+                "p1",
+                "m1",
+                "session_log",
+                ts,
+                100,
+                10,
+                0,
+                0,
+                200,
+                "0.10",
+            )
+            .unwrap();
+            insert_usage_log(
+                &conn,
+                "host-remote-1",
+                "claude",
+                "p1",
+                "m1",
+                "ssh:h1",
+                ts,
+                200,
+                20,
+                0,
+                0,
+                200,
+                "0.20",
+            )
+            .unwrap();
+            insert_usage_log(
+                &conn,
+                "host-remote-2",
+                "claude",
+                "p1",
+                "m1",
+                "ssh:h2",
+                ts,
+                400,
+                40,
+                0,
+                0,
+                200,
+                "0.40",
+            )
+            .unwrap();
+        }
+
+        // 本机视图：只算本机行，两台远程主机的行都不见
+        let local = db
+            .get_usage_summary(None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(local.total_requests, 1);
+        assert_eq!(local.total_input_tokens, 100);
+
+        // 远程视图 h1：只算 ssh:h1 行（h2 不串台）
+        let h1 = db
+            .get_usage_summary(None, None, None, None, None, Some("h1"))
+            .unwrap();
+        assert_eq!(h1.total_requests, 1);
+        assert_eq!(h1.total_input_tokens, 200);
+
+        // rollup 侧同口径：手动写入两台主机的 rollup 行，本机视图不读远程行
+        let date_str = Local
+            .timestamp_opt(ts, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        {
+            let conn = test_conn();
+            for (host_id, input) in [("", 1000i64), ("h1", 2000), ("h2", 4000)] {
+                conn.execute(
+                    "INSERT INTO usage_daily_rollups
+                        (date, app_type, provider_id, model, host_id, request_count,
+                         success_count, input_tokens, output_tokens, total_cost_usd, avg_latency_ms)
+                     VALUES (?1, 'claude', 'p1', 'm1', ?2, 5, 5, ?3, 0, '0', 0)",
+                    params![date_str, host_id, input],
+                )
+                .unwrap();
+            }
+        }
+        let local_with_rollup = db
+            .get_usage_summary(None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            local_with_rollup.total_requests,
+            1 + 5,
+            "本机 = 本机明细 + host_id='' rollup"
+        );
+        assert_eq!(local_with_rollup.total_input_tokens, 100 + 1000);
+
+        let h1_with_rollup = db
+            .get_usage_summary(None, None, None, None, None, Some("h1"))
+            .unwrap();
+        assert_eq!(h1_with_rollup.total_requests, 1 + 5);
+        assert_eq!(h1_with_rollup.total_input_tokens, 200 + 2000);
+    }
+
+    // 请求日志列表的 host 过滤走 LogFilters.host_id（缓存 key 一并区分）
+    #[test]
+    fn request_logs_filter_by_host() {
+        let db = Database::memory().unwrap();
+        let ts = local_ts(2026, 11, 1, 10, 0, 0);
+        {
+            let conn = db
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            insert_usage_log(
+                &conn,
+                "logs-local-1",
+                "claude",
+                "p1",
+                "m1",
+                "session_log",
+                ts,
+                10,
+                1,
+                0,
+                0,
+                200,
+                "0.01",
+            )
+            .unwrap();
+            insert_usage_log(
+                &conn,
+                "logs-remote-1",
+                "claude",
+                "p1",
+                "m1",
+                "ssh:h1",
+                ts,
+                20,
+                2,
+                0,
+                0,
+                200,
+                "0.02",
+            )
+            .unwrap();
+        }
+        let local_filters = LogFilters::default();
+        let local = db.get_request_logs(&local_filters, 0, 10).unwrap();
+        assert_eq!(local.total, 1);
+        assert_eq!(local.data[0].request_id, "logs-local-1");
+
+        let remote_filters = LogFilters {
+            host_id: Some("h1".to_string()),
+            ..LogFilters::default()
+        };
+        let remote = db.get_request_logs(&remote_filters, 0, 10).unwrap();
+        assert_eq!(remote.total, 1);
+        assert_eq!(remote.data[0].request_id, "logs-remote-1");
+    }
+
+    // by_app / provider_stats 的 rollup 分支同样按 host 归位（Important-1）：
+    // 远程明细满 30 天剪枝聚入 rollup 后，本机视图不得把远程数字算进本机账本
+    #[test]
+    fn by_app_and_provider_stats_rollup_branches_filter_by_host() {
+        let db = Database::memory().unwrap();
+        let ts = local_ts(2026, 10, 1, 10, 0, 0);
+        let date_str = Local
+            .timestamp_opt(ts, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        {
+            let conn = db
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (host_id, requests) in [("", 3i64), ("h1", 7)] {
+                conn.execute(
+                    "INSERT INTO usage_daily_rollups
+                        (date, app_type, provider_id, model, host_id, request_count,
+                         success_count, input_tokens, output_tokens, total_cost_usd, avg_latency_ms)
+                     VALUES (?1, 'claude', 'p1', 'm1', ?2, ?3, ?3, ?3 * 10, 0, '0', 0)",
+                    params![date_str, host_id, requests],
+                )
+                .unwrap();
+            }
+        }
+
+        // by_app：本机视图 3，远程视图 7，互不串台
+        let local = db
+            .get_usage_summary_by_app(None, None, None, None, None)
+            .unwrap();
+        let claude_local = local.iter().find(|s| s.app_type == "claude").unwrap();
+        assert_eq!(
+            claude_local.summary.total_requests, 3,
+            "本机视图只算 host_id='' rollup"
+        );
+
+        let remote = db
+            .get_usage_summary_by_app(None, None, None, None, Some("h1"))
+            .unwrap();
+        let claude_remote = remote.iter().find(|s| s.app_type == "claude").unwrap();
+        assert_eq!(
+            claude_remote.summary.total_requests, 7,
+            "远程视图只算 host_id='h1' rollup"
+        );
+
+        // provider_stats：同口径（provider_id='p1' 行的请求数）
+        let local_stats = db
+            .get_provider_stats(None, None, None, None, None, None)
+            .unwrap();
+        let p1_local = local_stats.iter().find(|s| s.provider_id == "p1").unwrap();
+        assert_eq!(p1_local.request_count, 3);
+
+        let remote_stats = db
+            .get_provider_stats(None, None, None, None, None, Some("h1"))
+            .unwrap();
+        let p1_remote = remote_stats.iter().find(|s| s.provider_id == "p1").unwrap();
+        assert_eq!(p1_remote.request_count, 7);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_usage_log(
         conn: &Connection,
@@ -3694,7 +4029,7 @@ mod tests {
         }
 
         // ① 分应用汇总：desktop 折叠进 claude，不再单列 claude-desktop 桶。
-        let by_app = db.get_usage_summary_by_app(None, None, None, None)?;
+        let by_app = db.get_usage_summary_by_app(None, None, None, None, None)?;
         assert_eq!(by_app.len(), 1, "应只剩一个合并后的 claude 桶");
         assert_eq!(by_app[0].app_type, "claude");
         assert_eq!(by_app[0].summary.total_requests, 2, "两条行都计入 claude");
@@ -3704,7 +4039,7 @@ mod tests {
         );
 
         // ② 选中 claude 过滤：汇总应同时覆盖 desktop 行。
-        let claude_summary = db.get_usage_summary(None, None, Some("claude"), None, None)?;
+        let claude_summary = db.get_usage_summary(None, None, Some("claude"), None, None, None)?;
         assert_eq!(claude_summary.total_requests, 2);
 
         // ③ 请求日志按 claude 过滤返回两行，且 desktop 行投影仍是原始 app_type。
@@ -3723,7 +4058,7 @@ mod tests {
         );
 
         // ④ 折叠不外溢：codex 过滤为空。
-        let codex_summary = db.get_usage_summary(None, None, Some("codex"), None, None)?;
+        let codex_summary = db.get_usage_summary(None, None, Some("codex"), None, None, None)?;
         assert_eq!(codex_summary.total_requests, 0);
 
         Ok(())
@@ -4309,7 +4644,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 2);
         assert_eq!(summary.success_rate, 100.0);
 
@@ -4376,7 +4711,7 @@ mod tests {
     #[test]
     fn test_get_first_usage_date_spans_rollups_and_logs() -> Result<(), AppError> {
         let db = Database::memory()?;
-        assert_eq!(db.get_first_usage_date(None, None, None)?, None);
+        assert_eq!(db.get_first_usage_date(None, None, None, None)?, None);
 
         {
             let conn = lock_conn!(db.conn);
@@ -4421,25 +4756,28 @@ mod tests {
         }
 
         assert_eq!(
-            db.get_first_usage_date(None, None, None)?.as_deref(),
+            db.get_first_usage_date(None, None, None, None)?.as_deref(),
             Some("2023-12-31")
         );
         assert_eq!(
-            db.get_first_usage_date(Some("claude"), None, None)?
+            db.get_first_usage_date(Some("claude"), None, None, None)?
                 .as_deref(),
             Some("2023-12-31")
         );
         assert_eq!(
-            db.get_first_usage_date(Some("codex"), None, None)?
+            db.get_first_usage_date(Some("codex"), None, None, None)?
                 .as_deref(),
             Some("2025-01-02")
         );
         assert_eq!(
-            db.get_first_usage_date(None, None, Some("claude-3"))?
+            db.get_first_usage_date(None, None, Some("claude-3"), None)?
                 .as_deref(),
             Some("2023-12-31")
         );
-        assert_eq!(db.get_first_usage_date(Some("gemini"), None, None)?, None);
+        assert_eq!(
+            db.get_first_usage_date(Some("gemini"), None, None, None)?,
+            None
+        );
 
         Ok(())
     }
@@ -4517,7 +4855,8 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None)?;
+        let summary =
+            db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(summary.total_requests, 20);
         assert_eq!(summary.total_input_tokens, 2000);
         assert_eq!(summary.total_output_tokens, 1000);
@@ -4682,38 +5021,40 @@ mod tests {
         }
 
         // ① 汇总按 Provider 展示名过滤：明细 + rollup 都命中。
-        let packy = db.get_usage_summary(None, None, None, Some("Packy"), None)?;
+        let packy = db.get_usage_summary(None, None, None, Some("Packy"), None, None)?;
         assert_eq!(packy.total_requests, 7, "a-1 + a-2 + rollup 5");
 
         // ② 汇总按模型过滤（有效计价模型口径）。
-        let deepseek = db.get_usage_summary(None, None, None, None, Some("deepseek-v3"))?;
+        let deepseek = db.get_usage_summary(None, None, None, None, Some("deepseek-v3"), None)?;
         assert_eq!(deepseek.total_requests, 8, "b-1 + rollup 7");
 
         // ③ pricing_model 优先于 model：alias-model 查不到，real-model 查得到。
-        let by_alias = db.get_usage_summary(None, None, None, None, Some("alias-model"))?;
+        let by_alias = db.get_usage_summary(None, None, None, None, Some("alias-model"), None)?;
         assert_eq!(by_alias.total_requests, 0);
-        let by_real = db.get_usage_summary(None, None, None, None, Some("real-model"))?;
+        let by_real = db.get_usage_summary(None, None, None, None, Some("real-model"), None)?;
         assert_eq!(by_real.total_requests, 1);
 
         // ④ 会话占位行可按可读名选中。
-        let session = db.get_usage_summary(None, None, None, Some("Claude (Session)"), None)?;
+        let session =
+            db.get_usage_summary(None, None, None, Some("Claude (Session)"), None, None)?;
         assert_eq!(session.total_requests, 1);
 
         // ⑤ Provider 统计 + 模型过滤：只剩 DeepSeek 一行。
-        let provider_stats = db.get_provider_stats(None, None, None, None, Some("deepseek-v3"))?;
+        let provider_stats =
+            db.get_provider_stats(None, None, None, None, Some("deepseek-v3"), None)?;
         assert_eq!(provider_stats.len(), 1);
         assert_eq!(provider_stats[0].provider_name, "DeepSeek");
         assert_eq!(provider_stats[0].request_count, 8);
 
         // ⑥ 模型统计 + Provider 过滤：只剩 Packy 名下的模型。
-        let model_stats = db.get_model_stats(None, None, None, Some("Packy"), None)?;
+        let model_stats = db.get_model_stats(None, None, None, Some("Packy"), None, None)?;
         let models: Vec<&str> = model_stats.iter().map(|m| m.model.as_str()).collect();
         assert!(models.contains(&"claude-sonnet-4-6"));
         assert!(models.contains(&"real-model"));
         assert!(!models.contains(&"deepseek-v3"));
 
         // ⑦ 分应用汇总（Hero 卡片数据源）同样受过滤影响。
-        let by_app = db.get_usage_summary_by_app(None, None, Some("Packy"), None)?;
+        let by_app = db.get_usage_summary_by_app(None, None, Some("Packy"), None, None)?;
         assert_eq!(by_app.len(), 1);
         assert_eq!(by_app[0].app_type, "claude");
         assert_eq!(by_app[0].summary.total_requests, 7);
@@ -4721,7 +5062,8 @@ mod tests {
         // ⑧ 趋势（>24h 走天分桶 + rollup 分支）。
         let t_start = local_ts(2026, 6, 8, 0, 0, 0);
         let t_end = local_ts(2026, 6, 10, 23, 59, 0);
-        let trends = db.get_daily_trends(Some(t_start), Some(t_end), None, Some("Packy"), None)?;
+        let trends =
+            db.get_daily_trends(Some(t_start), Some(t_end), None, Some("Packy"), None, None)?;
         let total_req: u64 = trends.iter().map(|d| d.request_count).sum();
         assert_eq!(total_req, 7, "明细 2 + rollup 5");
 
@@ -4735,6 +5077,7 @@ mod tests {
             None,
             Some("Packy"),
             Some("claude-sonnet-4-6"),
+            None,
         )?;
         let hourly_req: u64 = hourly.iter().map(|d| d.request_count).sum();
         assert_eq!(hourly_req, 1, "仅 a-1 命中（a-2 计价模型不同）");
@@ -4808,7 +5151,8 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None)?;
+        let summary =
+            db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(summary.total_requests, 30);
         assert_eq!(summary.total_input_tokens, 3000);
         assert_eq!(summary.total_output_tokens, 1500);
@@ -4929,7 +5273,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 4);
         // codex-proxy contributes 100-10=90; gemini-proxy contributes 200-30=170
         // (both cache-inclusive providers). claude-proxy=300, codex-session-only=50.
@@ -4944,10 +5288,10 @@ mod tests {
         let expected_hit_rate = 60.0_f64 / 682.0_f64;
         assert!((summary.cache_hit_rate - expected_hit_rate).abs() < 1e-9);
 
-        let trends = db.get_daily_trends(Some(0), Some(40_000), None, None, None)?;
+        let trends = db.get_daily_trends(Some(0), Some(40_000), None, None, None, None)?;
         assert_eq!(trends.iter().map(|stat| stat.request_count).sum::<u64>(), 4);
 
-        let provider_stats = db.get_provider_stats(None, None, None, None, None)?;
+        let provider_stats = db.get_provider_stats(None, None, None, None, None, None)?;
         assert_eq!(
             provider_stats
                 .iter()
@@ -4965,7 +5309,7 @@ mod tests {
             .iter()
             .any(|stat| stat.provider_id == "_session"));
 
-        let model_stats = db.get_model_stats(None, None, None, None, None)?;
+        let model_stats = db.get_model_stats(None, None, None, None, None, None)?;
         assert_eq!(
             model_stats
                 .iter()
@@ -5157,7 +5501,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 9);
 
         let logs = db.get_request_logs(&LogFilters::default(), 0, 10)?;
@@ -5273,7 +5617,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_model_stats(None, None, None, None, None)?;
+        let stats = db.get_model_stats(None, None, None, None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-sonnet");
         assert_eq!(stats[0].request_count, 1);
@@ -5313,7 +5657,7 @@ mod tests {
             insert("slow-a", "slow", 400, 8_000, None, 200, "session_log")?;
         }
 
-        let stats = db.get_model_stats(None, None, None, None, None)?;
+        let stats = db.get_model_stats(None, None, None, None, None, None)?;
         let fast = stats.iter().find(|s| s.model == "fast").expect("fast");
         assert_eq!(fast.request_count, 2);
         assert!((fast.success_rate - 50.0).abs() < f32::EPSILON);
@@ -5383,7 +5727,7 @@ mod tests {
             insert("f", "p3", "m3", None, 200, "proxy")?;
         }
 
-        let providers = db.get_provider_stats(None, None, None, None, None)?;
+        let providers = db.get_provider_stats(None, None, None, None, None, None)?;
         let median_of = |id: &str| {
             providers
                 .iter()
@@ -5400,7 +5744,7 @@ mod tests {
         // 会话日志推出来的首字不算精确速度：进速度的只有路由的 a、b、c、err 四条
         assert_eq!(p1.speed_output_tokens, 2_000);
 
-        let models = db.get_model_stats(None, None, None, None, None)?;
+        let models = db.get_model_stats(None, None, None, None, None, None)?;
         let median_of = |m: &str| {
             models
                 .iter()
@@ -5413,7 +5757,7 @@ mod tests {
         assert_eq!(median_of("m3"), None);
 
         // 带筛选条件时 WHERE 要接上，不能拼出两个 WHERE
-        let filtered = db.get_provider_stats(None, None, Some("codex"), None, Some("m2"))?;
+        let filtered = db.get_provider_stats(None, None, Some("codex"), None, Some("m2"), None)?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].first_token_median_ms, Some(2_000));
 
@@ -5444,7 +5788,8 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(Some(1500), Some(2500), Some("claude"), None, None)?;
+        let stats =
+            db.get_provider_stats(Some(1500), Some(2500), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "p1");
         assert_eq!(stats[0].app_type, "claude");
@@ -5516,7 +5861,7 @@ mod tests {
         }
 
         // Folded query for "claude" matches both claude and claude-desktop
-        let stats = db.get_provider_stats(None, None, Some("claude"), None, None)?;
+        let stats = db.get_provider_stats(None, None, Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 2);
 
         let claude_stat = stats
@@ -5568,7 +5913,7 @@ mod tests {
             insert("burst", 500, 1_050, Some(1_000))?;
         }
 
-        let stats = db.get_provider_stats(None, None, None, None, None)?;
+        let stats = db.get_provider_stats(None, None, None, None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].request_count, 6);
         assert_eq!(stats[0].speed_output_tokens, 1_300);
@@ -5610,7 +5955,7 @@ mod tests {
             insert("too-fast", 800, 900, "session_log")?;
         }
 
-        let stats = db.get_provider_stats(None, None, None, None, None)?;
+        let stats = db.get_provider_stats(None, None, None, None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].est_speed_output_tokens, 2_200);
         assert_eq!(stats[0].est_speed_duration_ms, 25_000);
@@ -5644,7 +5989,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(None, None, Some("opencode"), None, None)?;
+        let stats = db.get_provider_stats(None, None, Some("opencode"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "_opencode_session");
         assert_eq!(stats[0].provider_name, "OpenCode (Session)");
@@ -5725,7 +6070,8 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats =
+            db.get_provider_stats(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "p-rollup");
         assert_eq!(stats[0].request_count, 8);
@@ -5761,7 +6107,14 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_daily_trends(Some(0), Some(15 * 60 * 60), Some("claude"), None, None)?;
+        let stats = db.get_daily_trends(
+            Some(0),
+            Some(15 * 60 * 60),
+            Some("claude"),
+            None,
+            None,
+            None,
+        )?;
         assert_eq!(stats.len(), 15);
         assert_eq!(stats[3].request_count, 1);
 
@@ -5838,7 +6191,8 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_daily_trends(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats =
+            db.get_daily_trends(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 3);
         assert_eq!(stats[0].request_count, 1);
         assert_eq!(stats[0].total_tokens, 150);
@@ -5912,10 +6266,10 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.real_total_tokens, 6300 + 1050 + 940);
 
-        let providers = db.get_provider_stats(None, None, None, None, None)?;
+        let providers = db.get_provider_stats(None, None, None, None, None, None)?;
         let tokens_of = |id: &str| {
             providers
                 .iter()
@@ -5927,7 +6281,7 @@ mod tests {
         let provider_sum: u64 = providers.iter().map(|s| s.total_tokens).sum();
         assert_eq!(provider_sum, summary.real_total_tokens);
 
-        let models = db.get_model_stats(None, None, None, None, None)?;
+        let models = db.get_model_stats(None, None, None, None, None, None)?;
         let model_sum: u64 = models.iter().map(|s| s.total_tokens).sum();
         assert_eq!(model_sum, summary.real_total_tokens);
 
@@ -6007,7 +6361,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_model_stats(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats = db.get_model_stats(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-haiku");
         assert_eq!(stats[0].request_count, 9);
@@ -6309,7 +6663,7 @@ mod tests {
             assert_eq!(kept, ["proxy", "session-other-alias"]);
         }
         assert_eq!(
-            db.get_usage_summary(None, None, Some("codex"), None, None)?
+            db.get_usage_summary(None, None, Some("codex"), None, None, None)?
                 .total_requests,
             2
         );
@@ -6461,9 +6815,7 @@ mod tests {
         assert!(!legacy.project_routed, "存量行 project_routed 应默认 0");
 
         // 详情查询共用 row_to_request_log_detail，同样验证一遍
-        let detail = db
-            .get_request_detail("proj-new")?
-            .expect("详情应存在");
+        let detail = db.get_request_detail("proj-new")?.expect("详情应存在");
         assert_eq!(detail.project_dir.as_deref(), Some("/x"));
         assert!(detail.project_routed);
         Ok(())

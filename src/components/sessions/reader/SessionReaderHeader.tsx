@@ -50,6 +50,7 @@ import {
   canDeleteSession,
   formatClock,
   formatShortDateTime,
+  isRemoteSession,
   isSessionAppId,
 } from "../utils";
 import { useReaderT } from "./i18n";
@@ -189,7 +190,8 @@ export const SessionReaderHeader = memo(function SessionReaderHeader({
                 {command}
               </span>
             </DropdownMenuItem>
-            {session.projectDir && (
+            {/* 远程会话隐藏：cd 语义已内嵌在 ssh 恢复命令里，前端再拼本机 cd 会错 */}
+            {session.projectDir && command && !isRemoteSession(session) && (
               <DropdownMenuItem
                 className={sessionMenuItemClass}
                 onSelect={() =>

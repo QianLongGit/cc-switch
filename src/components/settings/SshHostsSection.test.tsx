@@ -21,7 +21,8 @@ import { sessionsApi } from "@/lib/api";
 
 // ============================================================================
 // SSH 主机管理分区：zod schema / 导入匹配归一 / 组件渲染三层。
-// 组件测试从简（库内先例形态）：列表、空态、添加对话框开关、导入去重禁用。
+// 组件测试从简（库内先例形态）：列表、空态、添加对话框开关、导入去重禁用；
+// 另有一组样式类名断言，守护对话框与设置页表单惯例的对齐（Task 1）。
 // ============================================================================
 
 const HOSTS: SshHostConfig[] = [
@@ -248,5 +249,76 @@ describe("SshHostsSection", () => {
         sshHosts: [{ id: "h2", label: "NAS", host: "nas.local" }],
       }),
     );
+  });
+});
+
+// ─── 表单样式对齐（与设置页表单惯例统一） ───────────────────────────────────
+//
+// DialogContent 本体无 padding、Header/Footer 自带 px-6：中间内容必须自己
+// 包 px-6 才与标题对齐。断言用 closest 定位（radix Tabs Root 会多渲染一层
+// 无类名 div，不能假设直接父子关系）。
+
+describe("SshHostsSection 表单样式对齐", () => {
+  beforeEach(() => {
+    vi.mocked(sessionsApi.listSshConfigHosts).mockResolvedValue([]);
+  });
+
+  it("添加对话框：内容区包 px-6 与 Header 对齐；宽度收窄至 max-w-md", async () => {
+    const user = userEvent.setup();
+    renderSection([]);
+    await user.click(screen.getByRole("button", { name: /添加主机/ }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-w-md");
+    expect(dialog.className).not.toContain("max-w-lg");
+
+    // tablist 向上最近的 px-6 容器即 body 包裹层：只负责左右对齐，
+    // 不带 pb——底距交给各 tab 内 DialogFooter 的 pb-5，避免叠加
+    const body = screen.getByRole("tablist").closest("div.px-6");
+    expect(body).not.toBeNull();
+    expect(body?.className).toContain("px-6");
+    expect(body?.className).not.toContain("pb-5");
+  });
+
+  it("手动表单：user/port 双列为 1fr + 140px 窄列；底部按钮区为 DialogFooter", async () => {
+    const user = userEvent.setup();
+    renderSection([]);
+    await user.click(screen.getByRole("button", { name: /添加主机/ }));
+    await user.click(screen.getByRole("tab", { name: "手动添加" }));
+
+    // 端口输入框所在的 grid 行：端口窄列先例（CodexFormFields.tsx:1735）
+    const gridRow = screen.getByPlaceholderText("22").closest("div.grid");
+    expect(gridRow?.className).toContain("grid-cols-[1fr_140px]");
+
+    // 按钮区迁入 DialogFooter：结构特征类（px-0 抵消外层 px-6，边距靠 pb-5/pt-3）
+    const footer = screen.getByRole("button", { name: "添加" }).parentElement;
+    expect(footer?.className).toContain("justify-end");
+    expect(footer?.className).toContain("pb-5");
+    expect(footer?.className).toContain("pt-3");
+  });
+
+  it("编辑对话框：表单区包 px-6；宽度收窄至 max-w-md", async () => {
+    const user = userEvent.setup();
+    renderSection(HOSTS);
+    await user.click(screen.getAllByRole("button", { name: "编辑" })[0]);
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-w-md");
+    expect(dialog.className).not.toContain("max-w-lg");
+
+    const form = screen.getByPlaceholderText("如：build-box").closest("form");
+    expect(form?.closest("div.px-6")).not.toBeNull();
+  });
+
+  it("导入列表行密度收紧至 py-1.5", async () => {
+    vi.mocked(sessionsApi.listSshConfigHosts).mockResolvedValue([
+      { alias: "staging", hostName: "stg.example.com" },
+    ]);
+    const user = userEvent.setup();
+    renderSection([]);
+    await user.click(screen.getByRole("button", { name: /添加主机/ }));
+
+    const checkbox = await screen.findByRole("checkbox", { name: "staging" });
+    expect(checkbox.closest("label")?.className).toContain("py-1.5");
   });
 });

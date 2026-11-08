@@ -407,7 +407,7 @@ mod tests {
             );
         }
         let stats = db
-            .get_provider_stats(None, None, Some("kimi"), None, None)
+            .get_provider_stats(None, None, Some("kimi"), None, None, None)
             .unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].request_count, 2);
@@ -423,7 +423,7 @@ mod tests {
             (0, 0, None)
         );
         let models = db
-            .get_model_stats(None, None, Some("kimi"), None, None)
+            .get_model_stats(None, None, Some("kimi"), None, None, None)
             .unwrap();
         assert_eq!(models.len(), 2);
         assert!(models

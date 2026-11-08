@@ -153,30 +153,30 @@ impl RequestContext {
             stack
         };
         let is_stack = stack.is_some();
-        let (provider, providers, current_provider_id, request_model, project_routed) =
-            match stack {
-                Some(target) => {
-                    // Stack 模型：只发往 Stack 里的那一家，不读代理路由、不经熔断器选家。按「单家、
-                    // 不转移」处理：换成有效副本，转发和读响应两个阶段都从这里取，超时和重试
-                    // 跟着关掉（见 `create_forwarder`）。
-                    app_config.auto_failover_enabled = false;
-                    log::debug!(
-                        "[{}] Stacked model {} → provider {}, upstream model {}, session: {}",
-                        tag,
-                        target.original_model,
-                        target.provider.name,
-                        target.upstream_model,
-                        session_id
-                    );
-                    let current_provider_id = target.provider.id.clone();
-                    (
-                        target.provider.clone(),
-                        vec![target.provider],
-                        current_provider_id,
-                        target.original_model,
-                        false,
-                    )
-                }
+        let (provider, providers, current_provider_id, request_model, project_routed) = match stack
+        {
+            Some(target) => {
+                // Stack 模型：只发往 Stack 里的那一家，不读代理路由、不经熔断器选家。按「单家、
+                // 不转移」处理：换成有效副本，转发和读响应两个阶段都从这里取，超时和重试
+                // 跟着关掉（见 `create_forwarder`）。
+                app_config.auto_failover_enabled = false;
+                log::debug!(
+                    "[{}] Stacked model {} → provider {}, upstream model {}, session: {}",
+                    tag,
+                    target.original_model,
+                    target.provider.name,
+                    target.upstream_model,
+                    session_id
+                );
+                let current_provider_id = target.provider.id.clone();
+                (
+                    target.provider.clone(),
+                    vec![target.provider],
+                    current_provider_id,
+                    target.original_model,
+                    false,
+                )
+            }
             None => {
                 let current_provider = crate::mode::current::provider_in_use(&state.db, &app_type)
                     .ok()

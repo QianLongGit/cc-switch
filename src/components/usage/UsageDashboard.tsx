@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { toast } from "@/lib/toast";
 import {
   Check,
@@ -12,6 +13,7 @@ import {
   RefreshCw,
   ListTree,
   Settings2,
+  TriangleAlert,
 } from "lucide-react";
 import { AppPageHeader } from "@/components/shell/AppPageHeader";
 import { AppGlyph, APP_DISPLAY_NAME } from "@/components/shell/AppGlyph";
@@ -19,6 +21,8 @@ import { HelpTip } from "@/components/ui/help-tip";
 import { PageTabs } from "@/components/ui/page-tabs";
 import { Button } from "@/components/ui/button";
 import { HoverTip } from "@/components/ui/hover-tip";
+import { SessionHostMenu } from "@/components/sessions/SessionHostMenu";
+import { normalizeHostId } from "@/components/sessions/utils";
 import {
   SegmentThumb,
   useSlidingIndicator,
@@ -38,11 +42,13 @@ import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import {
   KNOWN_APP_TYPES,
   type AppTypeFilter,
+  type RemoteUsageSyncStatus,
   type UsageRangePreset,
   type UsageRangeSelection,
 } from "@/types/usage";
 import {
   usageKeys,
+  UsageHostProvider,
   useModelStats,
   useProviderStats,
   useRequestLogs,
@@ -129,6 +135,19 @@ function useMinuteTicker() {
     return () => window.clearInterval(timer);
   }, []);
   return now;
+}
+
+/** 首扫预告 / 同步进度的字节量：1024 进制，统一保留一位小数（52,428,800 → "50.0 MB"） */
+function formatSyncBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit += 1;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
 
 const LOG_PAGE_SIZE_OPTIONS = LOG_PAGE_SIZES.map(Number);
@@ -317,14 +336,34 @@ export function UsageDashboard({
   const { data: lastScanAt } = useSessionUsageLastSync({
     refetchInterval: false,
   });
+
+  // ── 主机切换（SSH 远程迭代 2，设计 §4.4）──────────────────────────────
+  // null = 本机；主机清单来自设置。选中主机被删时归一回本机（会话页同款），
+  // 查询与菜单都吃归一值，避免界面显示「本机」、数据层还在请求旧主机
+  const [hostId, setHostId] = useState<string | null>(null);
+  const { data: settings } = useSettingsQuery();
+  const remoteHostId = normalizeHostId(hostId, settings?.sshHosts);
+  const isRemote = remoteHostId != null;
+
+  // 远程同步运行态：首扫与手动增量共用（force 区分）；进度来自后端逐文件事件
+  const [remoteSyncing, setRemoteSyncing] = useState(false);
+  const [remoteProgress, setRemoteProgress] =
+    useState<RemoteUsageSyncStatus | null>(null);
+  const cancelRequested = useRef(false);
+
   const { syncSessionUsage } = useUsageAutoRefresh({
     refreshIntervalMs,
     sessionAutoSyncEnabled,
     paused: rebuildingCodex || !settingsReady,
     // 预设范围和「结束于现在」的自定义范围都随时间移动，没有新用量也要定时重算
     rollingRange: range.preset !== "custom" || !!range.liveEndTime,
+    // 远程视图停扫本机会话，自动刷新改走查询内建的轻同步（清单 diff）
+    remoteHostId,
   });
-  const lastSyncAt = Math.max(lastManualSyncAt ?? 0, lastScanAt ?? 0) || null;
+  // 远程视图的「上次同步」只认手动同步时间：本机后台扫描时间与远程无关
+  const lastSyncAt = isRemote
+    ? (lastManualSyncAt ?? null)
+    : Math.max(lastManualSyncAt ?? 0, lastScanAt ?? 0) || null;
   const [containerRef, measuredWidth] = useElementWidth<HTMLDivElement>();
   const now = useMinuteTicker();
 
@@ -364,6 +403,34 @@ export function UsageDashboard({
 
   // 后端写入新日志时 emit `usage-log-recorded`，立刻 invalidate 所有 usage 查询
   useUsageEventBridge();
+
+  // 远程同步进度：手动同步期间后端每处理完一个文件 emit 一次；
+  // 轻同步（查询内建）不 emit，这里只在远程视图挂监听（先例 useSessionContentSearch）
+  useEffect(() => {
+    if (!isRemote) return;
+    let unlisten: UnlistenFn | undefined;
+    let disposed = false;
+    (async () => {
+      const off = await listen<RemoteUsageSyncStatus>(
+        "remote-usage-sync-status",
+        (event) => setRemoteProgress(event.payload),
+      );
+      if (disposed) {
+        off();
+      } else {
+        unlisten = off;
+      }
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [isRemote]);
+
+  // 切主机时丢掉上一台主机的进度
+  useEffect(() => {
+    setRemoteProgress(null);
+  }, [remoteHostId]);
 
   const changeRefreshInterval = async (next: number) => {
     const normalized = normalizeRefreshInterval(next);
@@ -431,6 +498,41 @@ export function UsageDashboard({
     }
   };
 
+  // ── 远程用量同步（首扫 force=true / 手动增量 force=false）─────────────
+  // 取消或单文件失败都不毁整轮：命令以部分进度正常返回，失败才走 catch。
+  // 结束后统一失效 usage 前缀——数据查询与 peek 预告一起刷新。
+  const runRemoteSync = async (force: boolean) => {
+    if (!remoteHostId || remoteSyncing) return;
+    cancelRequested.current = false;
+    setRemoteSyncing(true);
+    setRemoteProgress(null);
+    try {
+      const result = await usageApi.syncRemoteUsage(remoteHostId, force);
+      lastManualSessionSyncAt = Date.now();
+      setLastManualSyncAt(lastManualSessionSyncAt);
+      if (cancelRequested.current) {
+        toast.info(t("usage.remoteSync.cancelled"));
+      } else if (result.skipped > 0) {
+        toast.warning(
+          t("usage.remoteSync.completedSkipped", {
+            files: result.doneFiles,
+            skipped: result.skipped,
+          }),
+        );
+      } else {
+        toast.success(
+          t("usage.remoteSync.completed", { files: result.doneFiles }),
+        );
+      }
+    } catch (error) {
+      toast.error(t("usage.remoteSync.failed", { error: String(error) }));
+    } finally {
+      setRemoteSyncing(false);
+      setRemoteProgress(null);
+      await queryClient.invalidateQueries({ queryKey: usageKeys.all });
+    }
+  };
+
   const language = i18n.resolvedLanguage || i18n.language || "en";
   const locale = getLocaleFromLanguage(language);
   const resolvedRange = useMemo(() => resolveUsageRange(range), [range]);
@@ -459,15 +561,39 @@ export function UsageDashboard({
   const { data: providerOptionsData } = useProviderStats(
     range,
     { appType },
-    refetch,
+    { ...refetch, hostId: remoteHostId },
   );
-  // 有没有任何用量（不分时间范围）：一条都没有时显示空状态
-  const { data: allTimeSummary } = useQuery({
-    queryKey: [...usageKeys.all, "all-time-summary"],
-    queryFn: () => usageApi.getUsageSummary(),
+  // 有没有任何用量（不分时间范围）：一条都没有时显示空状态；远程视图同时
+  // 兼任链路探针——带 hostId 的这条查询失败即远程加载失败（错误条 + 重试）
+  const { data: allTimeSummary, error: allTimeError } = useQuery({
+    queryKey: [...usageKeys.all, remoteHostId ?? "local", "all-time-summary"],
+    queryFn: () =>
+      usageApi.getUsageSummary(
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        remoteHostId ?? undefined,
+      ),
+    retry: false,
     refetchInterval: refetch.refetchInterval,
   });
   const isEmpty = allTimeSummary != null && allTimeSummary.totalRequests === 0;
+
+  // 首扫预告：清单 diff 单往返统计待同步文件数 / 待拉总字节（不拉取不写库）。
+  // 失败静默（无预告即正常展示数据），链路错误由上面的汇总探针统一报
+  const { data: remotePeek } = useQuery({
+    queryKey: usageKeys.remotePeek(remoteHostId ?? "local"),
+    queryFn: () => usageApi.peekRemoteUsage(remoteHostId!),
+    enabled: isRemote && !remoteSyncing,
+    retry: false,
+    refetchInterval: false,
+  });
+  // 无任何已入库数据（从未建过游标）且确有待同步文件 → 首扫确认态
+  const needsFirstSync =
+    isRemote && isEmpty && (remotePeek?.totalFiles ?? 0) > 0;
+  const remoteLoadFailed = isRemote && allTimeError != null;
 
   const providerOptions = useMemo(() => {
     const counts = new Map<string, number>();
@@ -505,7 +631,10 @@ export function UsageDashboard({
       ? t("usage.syncStatus.justNow")
       : t("usage.syncStatus.minutesAgo", { count: minutes });
   }, [lastSyncAt, now, t]);
-  const syncButtonLabel = syncingSession
+  // 页头同步按钮：本机扫会话日志；远程走轻量增量（force=false）。
+  // 两态互斥禁用，标签共用「同步中 / 刚刚同步 / 立即同步」
+  const manualSyncBusy = syncingSession || remoteSyncing;
+  const syncButtonLabel = manualSyncBusy
     ? t("usage.syncStatus.syncing")
     : (syncedLabel ?? t("usage.sessionSync.syncNow"));
   const drawerSyncedLabel =
@@ -527,14 +656,16 @@ export function UsageDashboard({
         <button
           type="button"
           className="inline-flex items-center gap-1.5 whitespace-nowrap pe-3 ps-2.5 text-body font-medium tabular-nums text-fg-1 transition-colors hover:bg-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:text-fg-2"
-          disabled={syncingSession}
-          onClick={() => void runManualSessionSync()}
+          disabled={manualSyncBusy}
+          onClick={() =>
+            void (isRemote ? runRemoteSync(false) : runManualSessionSync())
+          }
         >
           <RefreshCw
             aria-hidden="true"
             className={cn(
               "h-3.5 w-3.5 text-fg-2",
-              syncingSession && "motion-safe:animate-spin",
+              manualSyncBusy && "motion-safe:animate-spin",
             )}
           />
           {syncButtonLabel}
@@ -559,7 +690,6 @@ export function UsageDashboard({
   // 只列「应用」页设为显示的应用；Claude Code 的用量在 Claude Desktop 显示时也算，
   // DeepSeek Harness（Web 与 Desktop 的会话用量合并记在 dsh 下）在 Desktop 显示时也算，
   // 当前选中的即使被隐藏也留着，免得筛选状态无处可见
-  const { data: settings } = useSettingsQuery();
   const filterApps = useMemo(() => {
     const visible = { ...DEFAULT_VISIBLE_APPS, ...settings?.visibleApps };
     return KNOWN_APP_TYPES.filter(
@@ -581,6 +711,89 @@ export function UsageDashboard({
         : "font-medium text-fg-2 hover:text-fg-1",
     );
 
+  // 远程同步区（filterRow 内、主机菜单旁）：同步中进度 / 首扫预告 / 加载失败，
+  // 三态互斥，本机视图不渲染任何东西
+  const remoteSyncBar = !isRemote ? null : remoteSyncing ? (
+    <div className="flex h-8 shrink-0 items-center gap-2 rounded-control border border-border-strong bg-surface px-2.5">
+      <Loader2
+        aria-hidden="true"
+        className="h-3.5 w-3.5 shrink-0 animate-spin text-fg-2"
+      />
+      {remoteProgress ? (
+        <span className="whitespace-nowrap text-caption tabular-nums text-fg-2">
+          {t("usage.remoteSync.progress", {
+            done: remoteProgress.doneFiles,
+            total: remoteProgress.totalFiles,
+            bytes: formatSyncBytes(remoteProgress.doneBytes),
+          })}
+        </span>
+      ) : (
+        <span className="whitespace-nowrap text-caption text-fg-2">
+          {t("usage.syncStatus.syncing")}
+        </span>
+      )}
+      <Button
+        type="button"
+        variant="quiet"
+        size="compact"
+        className="text-caption"
+        onClick={() => {
+          // 请求取消：引擎在下一个文件边界停止，已入库数据与游标保留
+          cancelRequested.current = true;
+          void usageApi.cancelRemoteUsageSync();
+        }}
+      >
+        {t("usage.remoteSync.cancel")}
+      </Button>
+    </div>
+  ) : needsFirstSync ? (
+    <div className="flex h-8 shrink-0 items-center gap-2 rounded-control border border-border-strong bg-surface px-2.5">
+      <span className="whitespace-nowrap text-caption text-fg-2">
+        {t("usage.remoteSync.firstSyncPreview", {
+          files: remotePeek!.totalFiles,
+          size: formatSyncBytes(remotePeek!.doneBytes),
+        })}
+      </span>
+      <Button
+        type="button"
+        variant="neutral"
+        size="compact"
+        className="text-caption"
+        onClick={() => void runRemoteSync(true)}
+      >
+        {t("usage.remoteSync.start")}
+      </Button>
+    </div>
+  ) : remoteLoadFailed ? (
+    <div className="flex h-8 min-w-0 shrink-0 items-center gap-2 rounded-control border border-border-strong bg-surface px-2.5">
+      <TriangleAlert
+        aria-hidden="true"
+        className="h-3.5 w-3.5 shrink-0 text-destructive"
+      />
+      <span
+        className="min-w-0 truncate text-caption text-fg-2"
+        title={String(allTimeError)}
+      >
+        {t("usage.remoteSync.loadFailed", {
+          error: String(allTimeError),
+        })}
+      </span>
+      <Button
+        type="button"
+        variant="quiet"
+        size="compact"
+        className="shrink-0 text-caption"
+        onClick={() =>
+          void queryClient.invalidateQueries({
+            queryKey: usageKeys.all,
+          })
+        }
+      >
+        {t("usage.remoteSync.retry")}
+      </Button>
+    </div>
+  ) : null;
+
   // 范围栏：决定下面所有数据的四个条件放一组、左对齐；时间排第一，图表和指标都跟着它
   const filterRow = (
     <div className="flex min-h-12 shrink-0 flex-wrap items-center gap-2 px-6 py-2">
@@ -590,6 +803,20 @@ export function UsageDashboard({
         onApply={applyRange}
       />
       <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
+      {/* 主机切换：本机 / 远程 SSH 主机；没配主机时整块不渲染。
+          span 包一层：HostMenu 本身不接 ref，HoverTip 的 asChild 挂到 span 上 */}
+      {(settings?.sshHosts?.length ?? 0) > 0 && (
+        <HoverTip content={t("usage.hostSelector.hint")}>
+          <span className="inline-flex shrink-0">
+            <SessionHostMenu
+              hostId={hostId}
+              sshHosts={settings?.sshHosts}
+              onSelect={setHostId}
+            />
+          </span>
+        </HoverTip>
+      )}
+      {remoteSyncBar}
       <div
         ref={appFilterIndicator.ref}
         role="group"
@@ -723,17 +950,17 @@ export function UsageDashboard({
     range,
     page: 0,
     pageSize: logPageSize,
-    options: refetch,
+    options: { ...refetch, hostId: remoteHostId },
   });
   const providerCount = useProviderStats(
     range,
     { appType, providerName, model },
-    refetch,
+    { ...refetch, hostId: remoteHostId },
   );
   const modelCount = useModelStats(
     range,
     { appType, providerName, model },
-    refetch,
+    { ...refetch, hostId: remoteHostId },
   );
   const tabCount: Record<UsageTab, number | undefined> = {
     logs: logCount.data?.total,
@@ -930,16 +1157,20 @@ export function UsageDashboard({
           <p className="m-0 text-section text-fg-1">{t("usage.empty.title")}</p>
           <p className="m-0 text-body text-fg-2">{t("usage.empty.body")}</p>
         </div>
-        <Button
-          type="button"
-          variant="neutral"
-          size="regular"
-          disabled={syncingSession}
-          onClick={() => void runManualSessionSync()}
-        >
-          {syncingSession && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-          {t("usage.sessionSync.syncNow")}
-        </Button>
+        {/* 远程视图的首扫入口集中在 filterRow 的预告条（含文件数 / 流量预告），
+            这里不再放一个语义不明的「立即同步」 */}
+        {!isRemote && (
+          <Button
+            type="button"
+            variant="neutral"
+            size="regular"
+            disabled={syncingSession}
+            onClick={() => void runManualSessionSync()}
+          >
+            {syncingSession && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {t("usage.sessionSync.syncNow")}
+          </Button>
+        )}
         <Button
           type="button"
           variant="quiet"
@@ -961,62 +1192,66 @@ export function UsageDashboard({
   );
 
   return (
-    <div ref={containerRef} className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <AppPageHeader
-        icon={<ChartColumn className="h-5 w-5" strokeWidth={1.5} />}
-        title={t("nav.usage")}
-        titleExtra={
-          <HelpTip title={t("nav.usage")}>{t("usage.subtitle")}</HelpTip>
-        }
-        actions={headerActions}
-      />
-      {filterRow}
-      {body}
+    // 当前统计主机下发给子树：Hero / 图表 / 表格的查询 hooks 从 context 取
+    // hostId，组件自身不逐层透传（页面本体的查询已显式传过）
+    <UsageHostProvider value={remoteHostId}>
+      <div ref={containerRef} className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <AppPageHeader
+          icon={<ChartColumn className="h-5 w-5" strokeWidth={1.5} />}
+          title={t("nav.usage")}
+          titleExtra={
+            <HelpTip title={t("nav.usage")}>{t("usage.subtitle")}</HelpTip>
+          }
+          actions={headerActions}
+        />
+        {filterRow}
+        {body}
 
-      <RequestDetailPanel
-        requestId={detailRequestId}
-        onClose={() => setDetailRequestId(null)}
-      />
-      <UsageSettingsSheet
-        open={settingsOpen}
-        onOpenChange={setSettingsOpen}
-        sessionAutoSyncEnabled={sessionAutoSyncEnabled}
-        onSessionAutoSyncEnabledChange={(value) =>
-          void onSessionAutoSyncEnabledChange?.(value)
-        }
-        syncedLabel={drawerSyncedLabel}
-        syncing={syncingSession}
-        onSyncNow={() => void runManualSessionSync()}
-        onOpenRoutingSettings={onOpenRoutingSettings}
-        rebuildingCodex={rebuildingCodex}
-        onRebuildCodex={() => setShowRebuildConfirm(true)}
-        refreshIntervalMs={refreshIntervalMs}
-        refreshIntervalOptions={REFRESH_INTERVAL_OPTIONS_MS}
-        onRefreshIntervalChange={(next) => void changeRefreshInterval(next)}
-        usageDisplay={usageDisplay}
-        onUsageDisplayChange={onUsageDisplayChange}
-        onOpenPricing={() => setPricingOpen(true)}
-      />
-      {/* 定价是二级页不是模态框：新增 / 编辑定价的编辑页也是 FullScreenPanel，
+        <RequestDetailPanel
+          requestId={detailRequestId}
+          onClose={() => setDetailRequestId(null)}
+        />
+        <UsageSettingsSheet
+          open={settingsOpen}
+          onOpenChange={setSettingsOpen}
+          sessionAutoSyncEnabled={sessionAutoSyncEnabled}
+          onSessionAutoSyncEnabledChange={(value) =>
+            void onSessionAutoSyncEnabledChange?.(value)
+          }
+          syncedLabel={drawerSyncedLabel}
+          syncing={syncingSession}
+          onSyncNow={() => void runManualSessionSync()}
+          onOpenRoutingSettings={onOpenRoutingSettings}
+          rebuildingCodex={rebuildingCodex}
+          onRebuildCodex={() => setShowRebuildConfirm(true)}
+          refreshIntervalMs={refreshIntervalMs}
+          refreshIntervalOptions={REFRESH_INTERVAL_OPTIONS_MS}
+          onRefreshIntervalChange={(next) => void changeRefreshInterval(next)}
+          usageDisplay={usageDisplay}
+          onUsageDisplayChange={onUsageDisplayChange}
+          onOpenPricing={() => setPricingOpen(true)}
+        />
+        {/* 定价是二级页不是模态框：新增 / 编辑定价的编辑页也是 FullScreenPanel，
           放进模态框会被压在遮罩下、点不到 */}
-      <FullScreenPanel
-        isOpen={pricingOpen}
-        title={t("usage.tabs.pricing")}
-        onClose={() => setPricingOpen(false)}
-      >
-        <PricingConfigPanel />
-      </FullScreenPanel>
-      <ConfirmDialog
-        isOpen={showRebuildConfirm}
-        title={t("usage.rebuildCodex.confirmTitle")}
-        message={t("usage.rebuildCodex.confirmMessage")}
-        confirmText={t("usage.rebuildCodex.confirmAction")}
-        // 重建前会自动备份数据库，可从备份恢复：不算不可撤销，不用红色确认键
-        variant="info"
-        zIndex="top"
-        onConfirm={() => void rebuildCodexUsage()}
-        onCancel={() => setShowRebuildConfirm(false)}
-      />
-    </div>
+        <FullScreenPanel
+          isOpen={pricingOpen}
+          title={t("usage.tabs.pricing")}
+          onClose={() => setPricingOpen(false)}
+        >
+          <PricingConfigPanel />
+        </FullScreenPanel>
+        <ConfirmDialog
+          isOpen={showRebuildConfirm}
+          title={t("usage.rebuildCodex.confirmTitle")}
+          message={t("usage.rebuildCodex.confirmMessage")}
+          confirmText={t("usage.rebuildCodex.confirmAction")}
+          // 重建前会自动备份数据库，可从备份恢复：不算不可撤销，不用红色确认键
+          variant="info"
+          zIndex="top"
+          onConfirm={() => void rebuildCodexUsage()}
+          onCancel={() => setShowRebuildConfirm(false)}
+        />
+      </div>
+    </UsageHostProvider>
   );
 }

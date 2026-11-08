@@ -286,6 +286,8 @@ impl Database {
         // request_model 保留路由接管的「客户端别名 → 真实模型」映射维度，
         // pricing_model 保留写入时的计价基准（request 计价模式下与 model 分叉），
         // 否则明细被 prune 后接管计费不可审计；历史行迁移时填 ''（未知）。
+        // host_id 区分本机（''）与 SSH 远程宿主的分账维度：明细 prune 不可逆，
+        // 缺该维度时远程数字会被并入本机同键 rollup，本机统计永久污染。
         conn.execute(
             "CREATE TABLE IF NOT EXISTS usage_daily_rollups (
                 date TEXT NOT NULL,
@@ -294,6 +296,7 @@ impl Database {
                 model TEXT NOT NULL,
                 request_model TEXT NOT NULL DEFAULT '',
                 pricing_model TEXT NOT NULL DEFAULT '',
+                host_id TEXT NOT NULL DEFAULT '',
                 request_count INTEGER NOT NULL DEFAULT 0,
                 success_count INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -303,7 +306,7 @@ impl Database {
                 input_token_semantics INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd TEXT NOT NULL DEFAULT '0',
                 avg_latency_ms INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, host_id)
             )",
             [],
         )
@@ -708,6 +711,13 @@ impl Database {
                             )?;
                         }
                         Self::set_user_version(conn, 26)?;
+                    }
+                    // SSH 远程会话二期：rollup 增加 host 分账维度，
+                    // 远程明细经 30 天剪枝不再并入本机同键聚合。
+                    26 => {
+                        log::info!("迁移数据库从 v26 到 v27（usage_daily_rollups 增加 host 维度）");
+                        Self::migrate_v26_to_v27(conn)?;
+                        Self::set_user_version(conn, 27)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1809,6 +1819,60 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+        Ok(())
+    }
+
+    /// v26 -> v27：usage_daily_rollups 增加 host_id 维度（主键尾列）。
+    ///
+    /// SSH 远程会话用量入库后，远程明细与本机明细共用旧六元组主键，
+    /// `rollup_and_prune` 的 30 天剪枝会把远程数字并入本机同键 rollup——
+    /// 明细剪枝不可逆，本机统计被永久污染。host_id 纳入主键后聚合/剪枝/
+    /// 查询按宿主归位，本机行恒为 ''。SQLite 改主键必须重建表；存量行
+    /// 全部来自本机（远程数据此前从未写入），host_id 一律填 ''。
+    fn migrate_v26_to_v27(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "usage_daily_rollups")? {
+            log::info!("v26 -> v27：usage_daily_rollups 不存在，跳过重建");
+            return Ok(());
+        }
+
+        conn.execute_batch(
+            "ALTER TABLE usage_daily_rollups RENAME TO usage_daily_rollups_v26;
+             CREATE TABLE usage_daily_rollups (
+                 date TEXT NOT NULL,
+                 app_type TEXT NOT NULL,
+                 provider_id TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 request_model TEXT NOT NULL DEFAULT '',
+                 pricing_model TEXT NOT NULL DEFAULT '',
+                 host_id TEXT NOT NULL DEFAULT '',
+                 request_count INTEGER NOT NULL DEFAULT 0,
+                 success_count INTEGER NOT NULL DEFAULT 0,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                 input_token_semantics INTEGER NOT NULL DEFAULT 0,
+                 total_cost_usd TEXT NOT NULL DEFAULT '0',
+                 avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, host_id)
+             );
+             INSERT INTO usage_daily_rollups
+                 (date, app_type, provider_id, model, request_model, pricing_model, host_id,
+                  request_count, success_count, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens, input_token_semantics,
+                  total_cost_usd, avg_latency_ms)
+             SELECT date, app_type, provider_id, model, request_model, pricing_model, '',
+                  request_count, success_count, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens, input_token_semantics,
+                  total_cost_usd, avg_latency_ms
+             FROM usage_daily_rollups_v26;
+             DROP TABLE usage_daily_rollups_v26;",
+        )
+        .map_err(|e| {
+            AppError::Database(format!("v26 -> v27 重建 usage_daily_rollups 失败: {e}"))
+        })?;
+
+        log::info!("v26 -> v27 迁移完成：usage_daily_rollups 已增加 host_id 分账维度");
         Ok(())
     }
 
@@ -4109,8 +4173,27 @@ mod tests {
             "CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY)",
             [],
         )?;
+        // v12 库的 rollup 表是 v10->v11 重建后的完整形状（14 列）；
+        // 起点低于 v26 的全链迁移会一路走到 v27 的 host 维度重建，
+        // 夹具必须保真真实列集，否则链尾迁移无列可搬。
         conn.execute(
-            "CREATE TABLE usage_daily_rollups (date TEXT PRIMARY KEY)",
+            "CREATE TABLE usage_daily_rollups (
+                date TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                request_model TEXT NOT NULL DEFAULT '',
+                pricing_model TEXT NOT NULL DEFAULT '',
+                request_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd TEXT NOT NULL DEFAULT '0',
+                avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+            )",
             [],
         )?;
         Database::set_user_version(&conn, 12)?;
@@ -4520,6 +4603,124 @@ mod tests {
         )?);
         assert!(Database::has_column(&conn, "mcp_servers", "enabled_mcode")?);
         assert!(Database::has_column(&conn, "skills", "enabled_mcode")?);
+        Ok(())
+    }
+
+    // SSH 远程会话二期：rollup 增加 host 维度（v26 -> v27）。远程明细与本机
+    // 明细共用旧六元组主键时，30 天剪枝会把远程数字不可逆并入本机统计；
+    // host_id 入主键尾列后按宿主分账，存量行全部来自本机、一律填 ''。
+    #[test]
+    fn migrate_v26_to_v27_preserves_rollups_and_adds_host_dimension() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        // v26 形状夹具：六元组主键 + v13 补的 input_token_semantics 列
+        conn.execute_batch(
+            "CREATE TABLE usage_daily_rollups (
+                date TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                request_model TEXT NOT NULL DEFAULT '',
+                pricing_model TEXT NOT NULL DEFAULT '',
+                request_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                input_token_semantics INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd TEXT NOT NULL DEFAULT '0',
+                avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+            );
+            INSERT INTO usage_daily_rollups
+                (date, app_type, provider_id, model, request_model, pricing_model,
+                 request_count, success_count, input_tokens, output_tokens,
+                 cache_read_tokens, cache_creation_tokens, input_token_semantics,
+                 total_cost_usd, avg_latency_ms)
+            VALUES
+                ('2026-05-01', 'claude', 'p1', 'kimi-k2', 'claude-sonnet-4-6', 'kimi-k2',
+                 7, 7, 1000, 500, 80, 20, 2, '0.07', 120),
+                ('2026-05-02', 'codex', 'p2', 'gpt-5.5', 'gpt-5.5', 'gpt-5.5',
+                 3, 2, 300, 150, 30, 10, 1, '0.03', 90);",
+        )?;
+        Database::set_user_version(&conn, 26)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+
+        // host_id 列：TEXT NOT NULL DEFAULT ''
+        let host_col: (String, i64, Option<String>) = conn.query_row(
+            "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('usage_daily_rollups')
+             WHERE name = 'host_id'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(host_col, ("TEXT".to_string(), 1, Some("''".to_string())));
+
+        // host_id 进主键尾列：pk 序号 = 7
+        let host_pk: i64 = conn.query_row(
+            "SELECT pk FROM pragma_table_info('usage_daily_rollups') WHERE name = 'host_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(host_pk, 7);
+
+        // 存量行数值原样保留（含 input_token_semantics），host_id 全为 ''
+        let mut stmt = conn.prepare(
+            "SELECT date, app_type, model, request_count, input_tokens,
+                    input_token_semantics, total_cost_usd, host_id
+             FROM usage_daily_rollups ORDER BY date",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2, "迁移不得丢失存量聚合行");
+        assert_eq!(
+            rows[0],
+            (
+                "2026-05-01".to_string(),
+                "claude".to_string(),
+                "kimi-k2".to_string(),
+                7,
+                1000,
+                2,
+                "0.07".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "2026-05-02".to_string(),
+                "codex".to_string(),
+                "gpt-5.5".to_string(),
+                3,
+                300,
+                1,
+                "0.03".to_string(),
+                String::new()
+            )
+        );
+
+        // 主键含 host_id：同键不同宿主可共存（本机 '' 与远程 'ssh:h1'）
+        conn.execute(
+            "INSERT INTO usage_daily_rollups
+                (date, app_type, provider_id, model, host_id, request_count)
+             VALUES ('2026-05-01', 'claude', 'p1', 'kimi-k2', 'ssh:h1', 1)",
+            [],
+        )?;
         Ok(())
     }
 }

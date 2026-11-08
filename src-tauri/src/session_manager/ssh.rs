@@ -19,6 +19,14 @@
 //! - [`home_dirs_command`] / [`parse_home_dirs`] / [`classify_remote_provider`] /
 //!   [`prefer_plain_entries`] / [`remote_head_tail_request`] / [`rebind_remote_meta`]：
 //!   远程扫描链路的清单归类与请求组装纯函数（由 `mod.rs::scan_remote_sessions` 编排）
+//! - [`build_remote_resume_command`]：远程会话的可复制恢复命令生成
+//!   （`ssh -t ... 'cd <dir> && <内层>'`，用户手动执行口径，无自动执行参数）
+//! - [`run_remote_with_codes`]：[`run_remote`] 的退出码变体——code 命中
+//!   accepted 集合同样成功（搜索路径 grep/rg 无匹配 exit 1 = 空结果），
+//!   255 恒为连接错误；共享执行体 [`spawn_and_collect`]，既有原语不动
+//! - [`build_search_command`] / [`parse_search_output`] / [`detect_remote_rg`]：
+//!   远程正文搜索原语（rg 优先 / grep 降级、`path:lineno:text` 单一解析
+//!   器、rg 可用性 per-host 进程内缓存）
 
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
@@ -275,11 +283,27 @@ fn mux_disabled_for_test() -> bool {
 
 /* ===== 进程执行 ===== */
 
-/// 执行命令：双线程并发读 stdout（截 40MB，超限语义见 [`MAX_STDOUT_BYTES`]）/
-/// stderr（截 4KB），`try_wait` 轮询直到退出或超时，超时 kill 整个进程组。
+/// 非零退出的错误文案：stderr 非空用 stderr，否则给退出码数字
+///（`run_command` 与 [`resolve_exit_aware`] 共用，口径不分叉）。
+fn exit_detail(stderr: &str, code: Option<i32>) -> String {
+    if stderr.is_empty() {
+        format!("退出码 {}", code.unwrap_or(-1))
+    } else {
+        stderr.to_string()
+    }
+}
+
+/// 执行并采集（[`run_command`] 与 [`run_remote_with_codes`] 的共享执行体）：
+/// 双线程并发读 stdout（截 40MB，超限语义见 [`MAX_STDOUT_BYTES`]）/ stderr
+/// （截 4KB），`try_wait` 轮询直到退出或超时，超时 kill 整个进程组。
 ///
-/// 退出码映射：255 → [`SshError::ConnectOrAuth`]，其余非零 → [`SshError::Remote`]。
-pub(crate) fn run_command(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, SshError> {
+/// 返回 `(退出状态, stdout, stderr 文本)`——超时时状态为 `None`（由调用方
+/// 各自映射 [`SshError::Timeout`]）；启动失败在此层返回 Err
+/// （NotFound → SshUnavailable，其余 → ConnectOrAuth）。
+fn spawn_and_collect(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(Option<std::process::ExitStatus>, Vec<u8>, String), SshError> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -326,17 +350,20 @@ pub(crate) fn run_command(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>
     let stderr = String::from_utf8_lossy(&stderr_handle.join().unwrap_or_default())
         .trim()
         .to_string();
+    Ok((status, stdout, stderr))
+}
 
+/// 执行命令并取回 stdout。
+///
+/// 退出码映射：255 → [`SshError::ConnectOrAuth`]，其余非零 → [`SshError::Remote`]。
+pub(crate) fn run_command(cmd: Command, timeout: Duration) -> Result<Vec<u8>, SshError> {
+    let (status, stdout, stderr) = spawn_and_collect(cmd, timeout)?;
     match status {
         None => Err(SshError::Timeout),
         Some(status) if status.success() => Ok(stdout),
         Some(status) => {
             // ssh 约定：255 表示连接/认证层失败，其余非零为远端命令失败
-            let detail = if stderr.is_empty() {
-                format!("退出码 {}", status.code().unwrap_or(-1))
-            } else {
-                stderr
-            };
+            let detail = exit_detail(&stderr, status.code());
             if status.code() == Some(255) {
                 Err(SshError::ConnectOrAuth(detail))
             } else {
@@ -355,6 +382,47 @@ pub(crate) fn run_remote(
     timeout: Duration,
 ) -> Result<Vec<u8>, SshError> {
     run_command(build_ssh_command(host, remote_cmd), timeout)
+}
+
+/// 退出码感知的结果装配（[`run_remote_with_codes`] 的映射核心，纯函数，
+/// 表驱动单测目标）：
+///
+/// - exit 0（success）或 code 命中 `accepted` → `Ok(stdout)`——搜索路径的
+///   grep / rg 无匹配 exit 1 = 空结果语义，属正常而非错误
+/// - exit 255 恒为连接/认证错误——判定**优先于** accepted，防调用方把
+///   连接层失败误当「可接受退出码」吞成空结果
+/// - 其余非零（含信号终止无 code）→ [`SshError::Remote`] 真错误透传
+///   （权限 / 文件消失等，禁止 `; :` 归零静默）
+fn resolve_exit_aware(
+    stdout: Vec<u8>,
+    success: bool,
+    code: Option<i32>,
+    accepted: &[i32],
+    stderr: &str,
+) -> Result<Vec<u8>, SshError> {
+    if code == Some(255) {
+        return Err(SshError::ConnectOrAuth(exit_detail(stderr, code)));
+    }
+    if success || code.is_some_and(|c| accepted.contains(&c)) {
+        return Ok(stdout);
+    }
+    Err(SshError::Remote(exit_detail(stderr, code)))
+}
+
+/// [`run_remote`] 的退出码变体：退出码在 `accepted` 集合内（含 0）同样
+/// 视为成功并返回 stdout。仅搜索路径使用（无匹配非错误的退出码语义），
+/// 既有 [`run_remote`] 原语不动。
+pub(crate) fn run_remote_with_codes(
+    host: &SshHostConfig,
+    remote_cmd: &str,
+    timeout: Duration,
+    accepted: &[i32],
+) -> Result<Vec<u8>, SshError> {
+    let (status, stdout, stderr) = spawn_and_collect(build_ssh_command(host, remote_cmd), timeout)?;
+    let Some(status) = status else {
+        return Err(SshError::Timeout);
+    };
+    resolve_exit_aware(stdout, status.success(), status.code(), accepted, &stderr)
 }
 
 /* ===== 源路径解析 ===== */
@@ -418,6 +486,12 @@ impl SshScanRegistry {
     /// 查询某主机某路径的元数据
     pub(crate) fn lookup(&self, host_id: &str, path: &str) -> Option<RemoteFileMeta> {
         self.lock_read().get(host_id)?.get(path).copied()
+    }
+
+    /// 取某主机的整份清单（远程搜索按清单圈定 grep 文件集）；
+    /// 该主机从未扫描过 → None（调用方据此返回空结果）。
+    pub(crate) fn manifest(&self, host_id: &str) -> Option<HashMap<String, RemoteFileMeta>> {
+        self.lock_read().get(host_id).cloned()
     }
 
     /// 摘除单条条目（删除远端会话成功后调用）；返回条目原本是否存在
@@ -898,12 +972,69 @@ pub(crate) fn mtime_to_system_time(ms: i64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
 }
 
+/* ===== 远程恢复命令 ===== */
+
+/// 内层 resume 命令（按 provider 重新生成，不沿用本机 meta 里的旧值——
+/// 那是本机路径语义）：claude `claude --resume <id>`、codex `codex resume <id>`，
+/// 与 claude.rs / codex.rs 本地扫描同式两行；其它 provider 返回 `None`。
+fn inner_resume_command(provider_id: &str, session_id: &str) -> Option<String> {
+    match provider_id {
+        "claude" => Some(format!("claude --resume {session_id}")),
+        "codex" => Some(format!("codex resume {session_id}")),
+        _ => None,
+    }
+}
+
+/// 生成可复制到本机终端执行的远程恢复命令：
+/// `ssh [-p N] [-i key] -t [user@]host 'cd <dir> && <内层>'`。
+///
+/// - 与 [`build_ssh_command`] 口径相反：**不含** BatchMode / ConnectTimeout /
+///   ControlMaster 等自动执行参数——用户手动执行场景，无需免密探测与连接复用
+/// - `project_dir` 存在时拼 `cd` 前缀（远端绝对路径）；缺失时仅内层命令
+/// - 目录与整条远端命令均经 [`escape_remote_path`] 单引号转义
+/// - `identity_file` 非空时拼 `-i '<key>'`（本机 shell 参数层单引号包裹，
+///   空串忽略——与 [`build_ssh_command`] 同惯例）
+/// - provider 非 claude / codex 返回 `None`（MVP 范围，无内层命令可拼）
+pub(crate) fn build_remote_resume_command(
+    host: &SshHostConfig,
+    provider_id: &str,
+    session_id: &str,
+    project_dir: Option<&str>,
+) -> Option<String> {
+    let inner = inner_resume_command(provider_id, session_id)?;
+    let remote_cmd = match project_dir {
+        Some(dir) => format!("cd {} && {inner}", escape_remote_path(dir)),
+        None => inner,
+    };
+    let target = host
+        .user
+        .as_deref()
+        .map(|user| format!("{user}@{}", host.host))
+        .unwrap_or_else(|| host.host.clone());
+    let mut prefix = String::from("ssh");
+    if let Some(port) = host.port {
+        prefix.push_str(&format!(" -p {port}"));
+    }
+    if let Some(key) = host.identity_file.as_deref().filter(|s| !s.is_empty()) {
+        // identity 是本机路径，这串命令由用户复制到本机 shell 执行：单引号
+        // 包裹防空格 / 引号碎参（`'` → `'\''`，与 escape_remote_path 同为
+        // POSIX 单引号算法，但层次不同——那是远端命令内嵌层，勿混语义）
+        prefix.push_str(&format!(" -i {}", escape_remote_path(key)));
+    }
+    Some(format!(
+        "{prefix} -t {target} {}",
+        escape_remote_path(&remote_cmd)
+    ))
+}
+
 /// 远程会话标识覆盖：`session_id` = 文件 stem、`source_path` =
 /// `ssh:<hostId><远端路径>`（与 [`parse_ssh_source`] 的解析形态及 registry
-/// 清单 key 严格一致）、`resume_command` 置空；解析产出的其余字段原样保留。
+/// 清单 key 严格一致）；`resume_command` 按 [`build_remote_resume_command`]
+/// 重新生成为完整可复制 ssh 命令（本机语义的旧值不沿用）；解析产出的
+/// 其余字段原样保留。
 pub(crate) fn rebind_remote_meta(
     mut meta: SessionMeta,
-    host_id: &str,
+    host: &SshHostConfig,
     remote_path: &str,
 ) -> SessionMeta {
     if let Some(stem) = remote_session_stem(remote_path) {
@@ -911,8 +1042,14 @@ pub(crate) fn rebind_remote_meta(
     }
     // 远端路径自带前导 `/`，拼接时去重避免 `ssh:h1//root/...` 双斜杠形态
     let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
-    meta.source_path = Some(format!("ssh:{host_id}/{rel}"));
-    meta.resume_command = None;
+    meta.source_path = Some(format!("ssh:{}/{rel}", host.id));
+    // 内层 session_id 用覆盖后的远端 stem；project_dir 是解析保留的远端路径
+    meta.resume_command = build_remote_resume_command(
+        host,
+        &meta.provider_id,
+        &meta.session_id,
+        meta.project_dir.as_deref(),
+    );
     meta
 }
 
@@ -1075,6 +1212,132 @@ pub(crate) fn fetch_to_temp_file(
     std::fs::write(&dest, &bytes)
         .map_err(|e| SshError::Local(format!("写入 SSH 临时文件失败: {e}")))?;
     Ok(dest)
+}
+
+/* ===== 远端原语：正文搜索（Task 3）===== */
+
+/// rg 可用性探测命令：POSIX shell 内建 `command -v`，rg 在远端 PATH 时
+/// exit 0，缺失时 exit 1——单次轻量往返（独立常量供本地 sh 真跑验证语义）
+const RG_PROBE_COMMAND: &str = "command -v rg";
+/// 探测超时：单次轻量往返口径（连接超时 8s + 余量）
+const RG_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// rg 可用性的进程内 per-host 缓存（hostId → 可用与否）。首次探测后缓存，
+/// 探测失败（连接错误 / 超时等）同样缓存 false——降级 grep 后不再重复
+/// 探测（重复探测每次搜索都多付一次 ssh 往返，取舍为缓存到底）。
+static REMOTE_RG_CACHE: LazyLock<RwLock<HashMap<String, bool>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 单条远程搜索命中：rg / grep 统一的 `path:lineno:text` 输出行解析产物。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteSearchLine {
+    pub path: String,
+    pub line_no: u64,
+    pub text: String,
+}
+
+/// 构造远程正文搜索命令（rg 优先 / grep 降级，参数形态设计 §4.2 逐字锁定）：
+///
+/// - rg：`-i` 忽略大小写、`-n` 行号、`-F` 固定串防正则元字符、
+///   `--no-heading` 行式输出、`--with-filename` 强制文件名前缀（单文件时
+///   rg 默认省略，与多文件批混跑输出会不同构）、`--no-ignore` 防 .gitignore
+///   干扰、`-m 5` 每文件截断命中数防超长输出
+/// - grep：`-inFH -m 5` 一组短参等价覆盖（`-H` 强制文件名前缀，与 rg 的
+///   `--with-filename` 对齐）
+/// - pattern 与 files 均经 [`escape_remote_path`] 单引号转义；`--` 双保险
+///   防 pattern 以 `-` 开头被解析为选项（单引号不防选项解析，`--` 才防）
+/// - 空文件列表返回空命令（调用方据空串跳过执行）
+pub(crate) fn build_search_command(pattern: &str, files: &[String], use_rg: bool) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let quoted_files = files
+        .iter()
+        .map(|f| escape_remote_path(f))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quoted_pattern = escape_remote_path(pattern);
+    if use_rg {
+        format!("rg -i -n -F --no-heading --with-filename --no-ignore -m 5 -- {quoted_pattern} {quoted_files}")
+    } else {
+        format!("grep -inFH -m 5 -- {quoted_pattern} {quoted_files}")
+    }
+}
+
+/// 解析 rg / grep 统一的 `path:lineno:text` 输出（两命令形态输出同构，
+/// 单一解析器）。
+///
+/// 逐行容错——无分隔段 / path 为空 / 非 UTF-8 的行整行跳过。
+pub(crate) fn parse_search_output(stdout: &[u8]) -> Vec<RemoteSearchLine> {
+    let mut lines = Vec::new();
+    for raw in stdout.split(|&b| b == b'\n') {
+        // 非 UTF-8 行：内容已损坏，无拯救价值，整行丢弃（对齐
+        // parse_list_output 的容错口径）
+        let Ok(text) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        if let Some(parsed) = split_search_line(text) {
+            lines.push(parsed);
+        }
+    }
+    lines
+}
+
+/// 切分单条 `path:lineno:text` 行：**从右向左**定位第一个 `:<纯数字>:` 段。
+///
+/// 路径与正文都可含冒号，行号段是唯一「冒号夹纯数字」锚点；从右向左
+/// 保证含冒号路径完整保留（`/a:b/c.jsonl:42:{...}` 的行号锚定 `:42:` 而
+/// 非路径里的 `:b`）。已知边界：正文自身含 `:<数字>:` 形态时行号会锚到
+/// 正文段（策略性取舍；消费侧以已知文件清单做归一化修复，见
+/// `search.rs::normalize_search_line`）。
+/// 切分点均落在 `:` / ASCII 数字边界，UTF-8 字符边界天然安全。
+fn split_search_line(line: &str) -> Option<RemoteSearchLine> {
+    let bytes = line.as_bytes();
+    // 倒序枚举冒号下标，检查其后是否紧跟「纯数字(≥1 位) + 冒号」
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != b':' {
+            continue;
+        }
+        // 数字段结束位置：首个非 ASCII 数字处（None = 数字延伸到行尾，
+        // 缺收尾冒号，不构成锚段，继续向左找）
+        let Some(digits_end) = (i + 1..bytes.len()).find(|&j| !bytes[j].is_ascii_digit()) else {
+            continue;
+        };
+        if digits_end > i + 1 && bytes[digits_end] == b':' {
+            let path = &line[..i];
+            if path.is_empty() {
+                return None; // 路径为空 = 噪声行（如连接 banner）
+            }
+            // 纯数字段保证可 parse；防御性 ok() 兜底超大数字
+            let line_no = line[i + 1..digits_end].parse().ok()?;
+            return Some(RemoteSearchLine {
+                path: path.to_string(),
+                line_no,
+                text: line[digits_end + 1..].to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// 探测远端 rg 可用性：`command -v rg` 单次往返，结果按 hostId 进程内
+/// 缓存（[`REMOTE_RG_CACHE`]）。exit 0 → true；缺失 exit 1 / 连接失败 /
+/// 超时 → false 并同样缓存，调用方降级 grep 后不再重复探测。
+pub(crate) fn detect_remote_rg(host: &SshHostConfig) -> bool {
+    {
+        let cache = REMOTE_RG_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = cache.get(&host.id) {
+            return *hit;
+        }
+    }
+    let available = run_remote(host, RG_PROBE_COMMAND, RG_DETECT_TIMEOUT).is_ok();
+    REMOTE_RG_CACHE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(host.id.clone(), available);
+    available
 }
 
 #[cfg(test)]
@@ -2217,6 +2480,130 @@ mod tests {
         assert_eq!(mtime_to_system_time(-500), None);
     }
 
+    /* ===== 远程恢复命令生成（Task 2）===== */
+
+    /// 全参数主机（user + port + identity），锁定完整形态的期望值
+    fn resume_host() -> SshHostConfig {
+        SshHostConfig {
+            id: "host-1".to_string(),
+            label: "构建机".to_string(),
+            host: "host".to_string(),
+            user: Some("guqiu".to_string()),
+            port: Some(50051),
+            identity_file: Some("/key".to_string()),
+        }
+    }
+
+    #[test]
+    fn build_remote_resume_full_options_shape() {
+        // 全参数 + cd 前缀：逐字符锁定（含两层单引号转义），复制即可粘贴执行
+        let cmd =
+            build_remote_resume_command(&resume_host(), "claude", "sess-9", Some("/data/proj"))
+                .unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/key' -t guqiu@host \
+             'cd '\\''/data/proj'\\'' && claude --resume sess-9'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_without_project_dir_skips_cd_prefix() {
+        // project_dir 缺失：仅内层命令，无 cd 前缀；codex 内层为 `codex resume`
+        let cmd = build_remote_resume_command(&resume_host(), "codex", "roll-1", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/key' -t guqiu@host 'codex resume roll-1'"
+        );
+        assert!(!cmd.contains("cd "), "无目录时不得拼 cd 前缀");
+    }
+
+    #[test]
+    fn build_remote_resume_minimal_host_omits_optional_parts() {
+        // 仅 host（无 user/port/identity）：无 -p / -i / user@ 前缀
+        let cmd = build_remote_resume_command(&host(None, None, None), "claude", "s", Some("/p"))
+            .unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -t example.com 'cd '\\''/p'\\'' && claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_escapes_single_quote_in_dir() {
+        // 目录含单引号 → 目录层 `'\''`；含引号的远端命令整体再包一层单引号
+        // （本机 shell 剥外层 → 远端收到 `cd '/data/it'\''s' && ...` 再剥一层）
+        let cmd =
+            build_remote_resume_command(&resume_host(), "claude", "s", Some("/data/it's")).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/key' -t guqiu@host \
+             'cd '\\''/data/it'\\''\\'\\'''\\''s'\\'' && claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_quotes_identity_with_spaces() {
+        // identity 含空格：本机 shell 参数层单引号包裹，复制粘贴不碎参
+        let mut host = resume_host();
+        host.identity_file = Some("/my keys/id_ed25519".to_string());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/my keys/id_ed25519' -t guqiu@host 'claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_escapes_single_quote_in_identity() {
+        // identity 含单引号：本机 shell 转义 `'` → `'\''`。算法与远端路径
+        // 转义同源（POSIX 单引号），但层次不同——这是用户复制到本机 shell
+        // 执行的参数，不是远端命令内嵌路径
+        let mut host = resume_host();
+        host.identity_file = Some("/it's/id".to_string());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert_eq!(
+            cmd,
+            "ssh -p 50051 -i '/it'\\''s/id' -t guqiu@host 'claude --resume s'"
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_ignores_empty_identity() {
+        // 空串 identity（与 build_ssh_command 同惯例）：不拼 -i 参数
+        let mut host = resume_host();
+        host.identity_file = Some(String::new());
+        let cmd = build_remote_resume_command(&host, "claude", "s", None).unwrap();
+        assert!(!cmd.contains("-i"), "空串 identity 不应产生 -i 参数");
+    }
+
+    #[test]
+    fn build_remote_resume_unsupported_provider_returns_none() {
+        // MVP 范围：仅 claude / codex 有内层命令，其它 provider 无恢复命令
+        assert_eq!(
+            build_remote_resume_command(&resume_host(), "gemini", "g", Some("/p")),
+            None
+        );
+        assert_eq!(
+            build_remote_resume_command(&resume_host(), "opencode", "o", None),
+            None
+        );
+    }
+
+    #[test]
+    fn build_remote_resume_omits_batch_and_control_flags() {
+        // 用户手动执行场景：不带免密探测与连接复用参数（与 build_ssh_command 口径相反）
+        let cmd = build_remote_resume_command(&resume_host(), "claude", "s", Some("/p")).unwrap();
+        for flag in [
+            "BatchMode",
+            "ControlMaster",
+            "ConnectTimeout",
+            "ControlPath",
+        ] {
+            assert!(!cmd.contains(flag), "恢复命令不应包含 {flag}");
+        }
+    }
+
     #[test]
     fn rebind_overrides_identity_fields_keeps_rest() {
         let meta = SessionMeta {
@@ -2230,19 +2617,304 @@ mod tests {
             source_path: Some("/root/x.jsonl".to_string()),
             resume_command: Some("claude --resume x".to_string()),
         };
-        let rebound = rebind_remote_meta(meta, "host-1", "/root/x.jsonl");
+        let rebound = rebind_remote_meta(meta, &host(None, None, None), "/root/x.jsonl");
         // session_id = 文件 stem；source_path = ssh:<hostId><远端路径>（单斜杠，
         // 与 parse_ssh_source 的解析形态、registry 清单 key 严格一致）
         assert_eq!(rebound.session_id, "x");
         assert_eq!(
             rebound.source_path.as_deref(),
-            Some("ssh:host-1/root/x.jsonl")
+            Some("ssh:test-host/root/x.jsonl")
         );
-        assert_eq!(rebound.resume_command, None, "远程会话不支持本地 resume");
+        // resume_command 按 provider 重新生成完整 ssh 命令（本机旧值不沿用）
+        assert_eq!(
+            rebound.resume_command.as_deref(),
+            Some("ssh -t example.com 'cd '\\''/work'\\'' && claude --resume x'")
+        );
         // 解析产出字段原样保留
         assert_eq!(rebound.title.as_deref(), Some("标题"));
         assert_eq!(rebound.project_dir.as_deref(), Some("/work"));
         assert_eq!(rebound.created_at, Some(1));
         assert_eq!(rebound.last_active_at, Some(2));
+    }
+
+    /* ===== 远端原语：正文搜索（Task 3）===== */
+
+    /// 构造带独特 id 的搜索测试主机：缓存类测试按 host.id 键控全局态，
+    /// 独立 id 避免并行互扰（同 registry 测试模式）；host 指向不可免密
+    /// 地址——若实现未命中缓存真发探测，结果必为 false，与预填值矛盾
+    fn search_host(id: &str) -> SshHostConfig {
+        SshHostConfig {
+            id: id.to_string(),
+            label: "搜索测试".to_string(),
+            host: "example.com".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+        }
+    }
+
+    /// 构造单元素文件列表的便捷形态
+    fn files(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    // —— (a) build_search_command：双路径参数串逐字锁定 + 转义 + 空文件 ——
+
+    #[test]
+    fn build_search_rg_shape_is_exact() {
+        // rg 参数串逐字锁定（设计 §4.2 指定形态）；pattern 与 files 均单引号转义
+        let cmd = build_search_command("error", &files(&["/f1.jsonl", "/f2.jsonl"]), true);
+        assert_eq!(
+            cmd,
+            "rg -i -n -F --no-heading --with-filename --no-ignore -m 5 -- \
+             'error' '/f1.jsonl' '/f2.jsonl'"
+        );
+    }
+
+    #[test]
+    fn build_search_grep_shape_is_exact() {
+        // grep 降级形态：`-inFH -m 5` 一组短参等价覆盖 rg 各长参
+        let cmd = build_search_command("error", &files(&["/f1.jsonl", "/f2.jsonl"]), false);
+        assert_eq!(cmd, "grep -inFH -m 5 -- 'error' '/f1.jsonl' '/f2.jsonl'");
+    }
+
+    #[test]
+    fn build_search_escapes_pattern_and_files() {
+        // pattern 含空格 / 单引号 / `--foo` 选项伪装：整体单引号包裹 +
+        // 内嵌单引号 `'\''`；`--` 双保险防 pattern 被解析为选项
+        // （单引号不防选项解析，`--` 才防）。文件路径含空格同理转义
+        let tricky = "--foo bar'baz";
+        let rg_cmd = build_search_command(tricky, &files(&["/p a/x.jsonl"]), true);
+        assert_eq!(
+            rg_cmd,
+            "rg -i -n -F --no-heading --with-filename --no-ignore -m 5 -- \
+             '--foo bar'\\''baz' '/p a/x.jsonl'"
+        );
+        let grep_cmd = build_search_command(tricky, &files(&["/p a/x.jsonl"]), false);
+        assert_eq!(
+            grep_cmd,
+            "grep -inFH -m 5 -- '--foo bar'\\''baz' '/p a/x.jsonl'"
+        );
+    }
+
+    #[test]
+    fn build_search_empty_files_yields_empty_command() {
+        // 空文件列表返回空命令（调用方据空串跳过执行），两路径同口径
+        assert_eq!(build_search_command("p", &[], true), "");
+        assert_eq!(build_search_command("p", &[], false), "");
+    }
+
+    // —— (b) parse_search_output：单一解析器，容错口径 ——
+
+    #[test]
+    fn parse_search_reads_regular_lines() {
+        let out = b"/p/a.jsonl:3:first hit\n/p/b.jsonl:17:second line text\n";
+        assert_eq!(
+            parse_search_output(out),
+            vec![
+                RemoteSearchLine {
+                    path: "/p/a.jsonl".to_string(),
+                    line_no: 3,
+                    text: "first hit".to_string(),
+                },
+                RemoteSearchLine {
+                    path: "/p/b.jsonl".to_string(),
+                    line_no: 17,
+                    text: "second line text".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_search_tolerates_colons_in_path_and_text() {
+        // 设计 §4.2 样例行：路径含冒号时行号锚定 `:42:`（最右的
+        // `:<纯数字>:` 段），路径与 JSON 正文完整保留
+        let mut out = b"/a:b/c.jsonl:42:{\"x\":1}\n".to_vec();
+        // 正文含冒号（时间字面量）：`:30` 后非冒号，不构成锚段，行号仍取 `:7:`
+        out.extend_from_slice(b"/p/q.jsonl:7:logged at 12:30 ok\n");
+        let lines = parse_search_output(&out);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].path, "/a:b/c.jsonl");
+        assert_eq!(lines[0].line_no, 42);
+        assert_eq!(lines[0].text, "{\"x\":1}");
+        assert_eq!(lines[1].path, "/p/q.jsonl");
+        assert_eq!(lines[1].line_no, 7);
+        assert_eq!(lines[1].text, "logged at 12:30 ok");
+    }
+
+    #[test]
+    fn parse_search_skips_lines_without_numbered_segment() {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"garbage without colon\n"); // 无冒号
+        out.extend_from_slice(b"/p/a.jsonl:abc:text\n"); // 行号段非纯数字
+        out.extend_from_slice(b":7:empty-path\n"); // 路径为空（噪声行）
+        out.extend_from_slice(b"/p/\xffbad.jsonl:9:text\n"); // 非 UTF-8 行
+        out.extend_from_slice(b"/p/ok.jsonl:5:real match\n"); // 唯一合法行
+        assert_eq!(
+            parse_search_output(&out),
+            vec![RemoteSearchLine {
+                path: "/p/ok.jsonl".to_string(),
+                line_no: 5,
+                text: "real match".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_search_keeps_megabyte_line_intact() {
+        // jsonl 单行 JSON 可达 MB 级：解析器不得截断或跳过（-m 已在命令侧
+        // 截断命中数，这里只保护行内容本身完整透传）
+        let huge = "x".repeat(1024 * 1024);
+        let mut out = format!("/p/big.jsonl:9:{huge}").into_bytes();
+        out.push(b'\n');
+        let lines = parse_search_output(&out);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_no, 9);
+        assert_eq!(lines[0].text.len(), 1024 * 1024);
+        assert!(lines[0].text.starts_with('x') && lines[0].text.ends_with('x'));
+    }
+
+    #[test]
+    fn parse_search_empty_input_returns_empty() {
+        assert!(parse_search_output(b"").is_empty());
+        // 纯换行切出的空行同样忽略
+        assert!(parse_search_output(b"\n\n").is_empty());
+    }
+
+    // —— (c) run_remote_with_codes 退出码语义 ——
+
+    /// 表驱动期望分类
+    #[derive(Debug, Clone, Copy)]
+    enum ExitExpect {
+        Ok,
+        Remote,
+        Connect,
+    }
+
+    #[test]
+    fn exit_mapping_is_table_driven() {
+        // (success, code, accepted) → 期望分类：
+        // exit 0 / accepted 命中 → Ok；255 恒连接层；其余非零与无 code → Remote
+        let table: &[(bool, Option<i32>, &[i32], ExitExpect)] = &[
+            (true, Some(0), &[0, 1], ExitExpect::Ok),
+            (false, Some(1), &[0, 1], ExitExpect::Ok), // grep 无匹配 = 空结果
+            (false, Some(1), &[1], ExitExpect::Ok),    // 最小 accepted 集
+            (false, Some(2), &[0, 1], ExitExpect::Remote), // 真错误透传
+            (false, Some(255), &[0, 1], ExitExpect::Connect),
+            // 255 即使被误放进 accepted 也不得吞成空结果（连接层恒优先）
+            (false, Some(255), &[0, 1, 255], ExitExpect::Connect),
+            // 信号终止无 code：无法归入连接层，按远端失败透传
+            (false, None, &[0, 1], ExitExpect::Remote),
+            // 常规成功与 accepted 内容无关
+            (true, Some(0), &[], ExitExpect::Ok),
+        ];
+        for &(success, code, accepted, expect) in table {
+            let result = resolve_exit_aware(b"payload".to_vec(), success, code, accepted, "详情");
+            match expect {
+                ExitExpect::Ok => assert_eq!(
+                    result.expect("应成功并回传 stdout"),
+                    b"payload".to_vec(),
+                    "success={success} code={code:?} accepted={accepted:?}"
+                ),
+                ExitExpect::Remote => assert!(
+                    matches!(result, Err(SshError::Remote(_))),
+                    "应分类为 Remote: success={success} code={code:?} accepted={accepted:?}"
+                ),
+                ExitExpect::Connect => assert!(
+                    matches!(result, Err(SshError::ConnectOrAuth(_))),
+                    "应分类为 ConnectOrAuth: success={success} code={code:?} accepted={accepted:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn run_with_codes_process_level_via_local_sh() {
+        // 进程级退出码路径：本地 sh 真实退出 → spawn_and_collect 采集 +
+        // 映射装配的完整组合（与 run_remote_with_codes 同一条代码路径，
+        // 仅免 ssh 环境的等价冒烟）
+        // (脚本, accepted, 期望 Ok 与否, 期望的具体错误类)
+        let cases: &[(&str, &[i32], bool, Option<&str>)] = &[
+            ("exit 0", &[0, 1], true, None),
+            ("exit 1", &[0, 1], true, None), // 无匹配语义 → Ok
+            ("exit 2", &[0, 1], false, Some("remote")), // 真错误 → Remote
+            ("exit 255", &[0, 1], false, Some("connect")), // 连接层 → ConnectOrAuth
+        ];
+        for &(script, accepted, expect_ok, expect_kind) in cases {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", script]);
+            let (status, stdout, stderr) =
+                spawn_and_collect(cmd, Duration::from_secs(5)).expect("采集应成功");
+            let status = status.expect("本地 sh 必然正常退出");
+            let result =
+                resolve_exit_aware(stdout, status.success(), status.code(), accepted, &stderr);
+            assert_eq!(
+                result.is_ok(),
+                expect_ok,
+                "脚本 {script} 的结果与期望不符: {result:?}"
+            );
+            if let Some(kind) = expect_kind {
+                let err = result.expect_err("期望错误");
+                match kind {
+                    "remote" => assert!(matches!(err, SshError::Remote(_)), "{script}: {err:?}"),
+                    _ => assert!(
+                        matches!(err, SshError::ConnectOrAuth(_)),
+                        "{script}: {err:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    // —— (d) detect_remote_rg：探测语义 + per-host 缓存 ——
+
+    #[test]
+    fn detect_rg_probe_semantics_via_local_sh() {
+        // 探测命令真跑（本地 sh，免远端环境）：本机 rg 在 PATH（macOS 开发
+        // 环境）→ exit 0 → true 态；缺失二进制 → exit 1 → false 态。
+        // run 语义：Ok → true / 非零 → false，与 detect_remote_rg 的映射一致
+        let mut ok_probe = std::process::Command::new("/bin/sh");
+        ok_probe.arg("-c").arg(RG_PROBE_COMMAND);
+        let ok = run_command(ok_probe, Duration::from_secs(5));
+        assert!(ok.is_ok(), "本机 command -v rg 应 exit 0: {:?}", ok.err());
+
+        let mut miss_probe = std::process::Command::new("/bin/sh");
+        miss_probe
+            .arg("-c")
+            .arg("command -v cc-switch-definitely-missing-bin");
+        let miss = run_command(miss_probe, Duration::from_secs(5));
+        assert!(miss.is_err(), "缺失二进制应 exit 1 → false 态");
+        assert!(
+            matches!(miss, Err(SshError::Remote(_))),
+            "exit 1 应为 Remote 而非连接错误: {miss:?}"
+        );
+    }
+
+    #[test]
+    fn detect_rg_cache_hit_returns_cached_without_probe() {
+        // 预填 true / false 两态：host 指向不可免密的 example.com，若实现
+        // 未命中缓存真发探测 → 连接/认证失败必得 false，与预填 true 矛盾
+        // ——断言成立即证明缓存命中且零 ssh 往返
+        let host_true = search_host("t-rg-cache-true");
+        let host_false = search_host("t-rg-cache-false");
+        {
+            let mut cache = REMOTE_RG_CACHE
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert("t-rg-cache-true".to_string(), true);
+            cache.insert("t-rg-cache-false".to_string(), false);
+        }
+        assert!(detect_remote_rg(&host_true), "预填 true 应命中缓存直接返回");
+        assert!(
+            !detect_remote_rg(&host_false),
+            "预填 false 应命中缓存直接返回"
+        );
+        // 命中后条目仍在缓存中（未被探测路径覆写）
+        let cache = REMOTE_RG_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(cache.get("t-rg-cache-true"), Some(&true));
+        assert_eq!(cache.get("t-rg-cache-false"), Some(&false));
     }
 }

@@ -154,8 +154,9 @@ pub(crate) fn scan_sessions_with_status() -> SessionScan {
 
 /* ===== SSH 远程扫描链路（spec §5.4）===== */
 
-/// 远端目录解析命令超时（连接建立 + printf，亚秒级完成）
-const REMOTE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
+/// 远端目录解析命令超时（连接建立 + printf，亚秒级完成）；搜索链路的
+/// home_dirs 往返同口径复用
+pub(crate) const REMOTE_DIRS_TIMEOUT: Duration = Duration::from_secs(15);
 /// 远端清单命令超时（大目录 `find` 遍历较慢，放宽）
 const REMOTE_LIST_TIMEOUT: Duration = Duration::from_secs(120);
 /// 单批头尾拉取超时
@@ -249,14 +250,13 @@ pub fn scan_remote_sessions(host: &crate::settings::SshHostConfig) -> Result<Ses
         .iter()
         .map(|entry| (Path::new(&entry.path).to_string_lossy().into_owned(), entry))
         .collect();
-    let host_id = host.id.clone();
     let mut sessions = cache.scan_remote(cache_files, |path: &Path| {
         let key = path.to_string_lossy();
         if let Some(entry) = claude_by_key.get(key.as_ref()) {
-            return parse_claude_entry(path, entry, &data, &host_id);
+            return parse_claude_entry(path, entry, &data, host);
         }
         if let Some(entry) = codex_by_key.get(key.as_ref()) {
-            return parse_codex_entry(path, entry, &data, &host_id);
+            return parse_codex_entry(path, entry, &data, host);
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -332,7 +332,7 @@ fn parse_claude_entry(
     path: &Path,
     entry: &ssh::RemoteFileEntry,
     data: &HashMap<String, ssh::HeadTailData>,
-    host_id: &str,
+    host: &crate::settings::SshHostConfig,
 ) -> std::io::Result<Option<SessionMeta>> {
     let Some(file) = data.get(&entry.path) else {
         return Err(std::io::Error::new(
@@ -346,7 +346,7 @@ fn parse_claude_entry(
         .and_then(|window| claude::parse_relocated_from_tail_bytes(window, entry.size));
     Ok(
         claude::parse_session_lines(path, file.head.clone(), file.tail.clone(), relocated)
-            .map(|meta| ssh::rebind_remote_meta(meta, host_id, &entry.path)),
+            .map(|meta| ssh::rebind_remote_meta(meta, host, &entry.path)),
     )
 }
 
@@ -357,7 +357,7 @@ fn parse_codex_entry(
     path: &Path,
     entry: &ssh::RemoteFileEntry,
     data: &HashMap<String, ssh::HeadTailData>,
-    host_id: &str,
+    host: &crate::settings::SshHostConfig,
 ) -> std::io::Result<Option<SessionMeta>> {
     let Some(file) = data.get(&entry.path) else {
         return Err(std::io::Error::new(
@@ -389,7 +389,7 @@ fn parse_codex_entry(
         }
     };
     Ok(codex::parse_session_lines(path, lines, &HashMap::new())
-        .map(|meta| ssh::rebind_remote_meta(meta, host_id, &entry.path)))
+        .map(|meta| ssh::rebind_remote_meta(meta, host, &entry.path)))
 }
 
 /// 分批（≤[`REMOTE_HEAD_TAIL_BATCH`]）执行头尾帧协议拉取；sentinel 每批
@@ -700,6 +700,18 @@ mod tests {
         }
     }
 
+    /// 构造最小远程主机配置（无 user/port/identity，恢复命令仅 `-t <host>`）
+    fn remote_host(id: &str) -> crate::settings::SshHostConfig {
+        crate::settings::SshHostConfig {
+            id: id.to_string(),
+            label: format!("主机 {id}"),
+            host: "192.0.2.10".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+        }
+    }
+
     /// 测试内 zstd 压缩（单帧完整数据，模拟远端压缩前缀）
     fn zst_compress(text: &str) -> Vec<u8> {
         use std::io::Write;
@@ -787,18 +799,27 @@ mod tests {
             },
         );
 
-        let meta = parse_claude_entry(Path::new(&entry.path), &entry, &data, "host-1")
-            .unwrap()
-            .expect("应解析出会话");
+        let meta = parse_claude_entry(
+            Path::new(&entry.path),
+            &entry,
+            &data,
+            &remote_host("host-1"),
+        )
+        .unwrap()
+        .expect("应解析出会话");
 
-        // session_id 用文件 stem 而非内容里的 id；source_path 带 ssh: 前缀且不可 resume
+        // session_id 用文件 stem 而非内容里的 id；source_path 带 ssh: 前缀；
+        // resume_command 重新生成为完整可复制 ssh 命令
         assert_eq!(meta.provider_id, "claude");
         assert_eq!(meta.session_id, "sess-1");
         assert_eq!(
             meta.source_path.as_deref(),
             Some("ssh:host-1/h/.claude/projects/p/sess-1.jsonl")
         );
-        assert_eq!(meta.resume_command, None);
+        assert_eq!(
+            meta.resume_command.as_deref(),
+            Some("ssh -t 192.0.2.10 'cd '\\''/after/cd'\\'' && claude --resume sess-1'")
+        );
         // 字节尾窗里的 relocated 记录覆盖起始 cwd（size > 64KiB → 首行按半截丢弃）
         assert_eq!(meta.project_dir.as_deref(), Some("/after/cd"));
     }
@@ -824,9 +845,14 @@ mod tests {
             },
         );
 
-        let meta = parse_codex_entry(Path::new(&entry.path), &entry, &data, "host-2")
-            .unwrap()
-            .expect("应解析出会话");
+        let meta = parse_codex_entry(
+            Path::new(&entry.path),
+            &entry,
+            &data,
+            &remote_host("host-2"),
+        )
+        .unwrap()
+        .expect("应解析出会话");
 
         assert_eq!(meta.provider_id, "codex");
         assert_eq!(meta.session_id, "rollout-b");
@@ -834,7 +860,10 @@ mod tests {
             meta.source_path.as_deref(),
             Some("ssh:host-2/h/.codex/sessions/2026/rollout-b.jsonl.zst")
         );
-        assert_eq!(meta.resume_command, None);
+        assert_eq!(
+            meta.resume_command.as_deref(),
+            Some("ssh -t 192.0.2.10 'cd '\\''/tmp/project'\\'' && codex resume rollout-b'")
+        );
         // 压缩形态无 tail 行：最后活跃时间以清单 mtime 兜底
         assert_eq!(meta.last_active_at, Some(1_700_000_123_456));
         // 标题来自解压出的首条 user message（远程无 state.db 线程标题）
@@ -859,7 +888,7 @@ mod tests {
             },
         );
 
-        let meta = parse_codex_entry(Path::new(&entry.path), &entry, &data, "h")
+        let meta = parse_codex_entry(Path::new(&entry.path), &entry, &data, &remote_host("h"))
             .unwrap()
             .expect("应解析出会话");
         assert_eq!(meta.last_active_at, None, "负 mtime 不做兜底");
@@ -870,8 +899,12 @@ mod tests {
         // 头尾数据缺失按读取失败处理：不缓存、下一轮重试
         let entry = remote_entry("/h/a.jsonl", 1, 1);
         let empty = HashMap::new();
-        assert!(parse_claude_entry(Path::new(&entry.path), &entry, &empty, "h").is_err());
-        assert!(parse_codex_entry(Path::new(&entry.path), &entry, &empty, "h").is_err());
+        assert!(
+            parse_claude_entry(Path::new(&entry.path), &entry, &empty, &remote_host("h")).is_err()
+        );
+        assert!(
+            parse_codex_entry(Path::new(&entry.path), &entry, &empty, &remote_host("h")).is_err()
+        );
     }
 
     #[test]

@@ -240,7 +240,8 @@ function SshHostForm({
             </FormItem>
           )}
         />
-        <div className="grid grid-cols-2 gap-4">
+        {/* user/port 双列：端口窄列先例（CodexFormFields.tsx:1735），user 弹性占满 */}
+        <div className="grid grid-cols-[1fr_140px] gap-4">
           <FormField
             control={form.control}
             name="user"
@@ -303,7 +304,9 @@ function SshHostForm({
             </FormItem>
           )}
         />
-        <div className="flex justify-end gap-2 pt-1">
+        {/* 迁入 DialogFooter 统一按钮区规格；px-0 抵消外层 body 的 px-6，
+            自身只留 pb-5/pt-3 竖向边距（左右对齐完全由包裹层负责） */}
+        <DialogFooter className="px-0">
           <Button
             type="button"
             variant="neutral"
@@ -323,7 +326,7 @@ function SshHostForm({
             )}
             {submitLabel}
           </Button>
-        </div>
+        </DialogFooter>
       </form>
     </Form>
   );
@@ -380,7 +383,7 @@ function AddHostDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent zIndex="nested" className="max-w-lg">
+      <DialogContent zIndex="nested" className="max-w-md">
         <DialogHeader>
           <DialogTitle>
             {t("settings.sshHosts.addTitle", { defaultValue: "添加 SSH 主机" })}
@@ -392,120 +395,129 @@ function AddHostDialog({
             })}
           </DialogDescription>
         </DialogHeader>
-        <Tabs defaultValue="import">
-          <TabsList className="w-full">
-            <TabsTrigger value="import" className="flex-1">
-              {t("settings.sshHosts.importTab", {
-                defaultValue: "从 SSH Config 导入",
-              })}
-            </TabsTrigger>
-            <TabsTrigger value="manual" className="flex-1">
-              {t("settings.sshHosts.manualTab", { defaultValue: "手动添加" })}
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="import" className="mt-4">
-            {configQuery.isPending ? (
-              <div className="flex items-center justify-center gap-2 py-8 text-body text-fg-2">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {t("settings.sshHosts.import.loading", {
-                  defaultValue: "正在读取 ~/.ssh/config…",
+        {/* body 包裹层：DialogContent 本体无 padding、Header/Footer 自带
+            px-6——中间内容靠这层与标题左右对齐（NewLayoutDialog.tsx:122
+            惯例）。不加 pb：底距交给各 tab 内 DialogFooter 的 pb-5，防叠加 */}
+        <div className="px-6">
+          <Tabs defaultValue="import">
+            <TabsList className="w-full">
+              <TabsTrigger value="import" className="flex-1">
+                {t("settings.sshHosts.importTab", {
+                  defaultValue: "从 SSH Config 导入",
                 })}
-              </div>
-            ) : configQuery.isError ? (
-              <div className="py-6 text-center text-body text-fg-2">
-                {t("settings.sshHosts.import.error", {
-                  defaultValue: "读取 SSH Config 失败：{{error}}",
-                  error: String(
-                    (configQuery.error as Error)?.message ?? configQuery.error,
-                  ),
-                })}
-              </div>
-            ) : (configQuery.data ?? []).length === 0 ? (
-              <div className="py-6 text-center text-body text-fg-2">
-                {t("settings.sshHosts.import.empty", {
-                  defaultValue:
-                    "~/.ssh/config 里没有可导入的 Host 段，可切到「手动添加」。",
-                })}
-              </div>
-            ) : (
-              <>
-                <ul className="m-0 max-h-72 list-none overflow-y-auto rounded-panel border border-border bg-subtle p-1.5">
-                  {(configQuery.data ?? []).map((configHost) => {
-                    const imported = isSshConfigHostImported(
-                      configHost,
-                      existingHosts,
-                    );
-                    return (
-                      <li key={configHost.alias}>
-                        <label
-                          className={`flex cursor-pointer items-center gap-3 rounded-control px-2.5 py-2 text-body hover:bg-surface ${
-                            imported ? "pointer-events-none opacity-50" : ""
-                          }`}
-                        >
-                          <Checkbox
-                            checked={imported || selected.has(configHost.alias)}
-                            disabled={imported}
-                            onCheckedChange={() =>
-                              toggleAlias(configHost.alias)
-                            }
-                            aria-label={configHost.alias}
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate font-medium text-fg-1">
-                              {configHost.alias}
-                            </span>
-                            <span className="block truncate text-caption text-fg-2">
-                              {formatHostLine({
-                                id: "",
-                                label: "",
-                                host: configHost.hostName ?? configHost.alias,
-                                user: configHost.user,
-                                port: configHost.port,
-                              })}
-                            </span>
-                          </span>
-                          {imported && (
-                            <span className="shrink-0 text-caption text-fg-3">
-                              {t("settings.sshHosts.import.imported", {
-                                defaultValue: "已导入",
-                              })}
-                            </span>
-                          )}
-                        </label>
-                      </li>
-                    );
+              </TabsTrigger>
+              <TabsTrigger value="manual" className="flex-1">
+                {t("settings.sshHosts.manualTab", { defaultValue: "手动添加" })}
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="import" className="mt-4">
+              {configQuery.isPending ? (
+                <div className="flex items-center justify-center gap-2 py-8 text-body text-fg-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t("settings.sshHosts.import.loading", {
+                    defaultValue: "正在读取 ~/.ssh/config…",
                   })}
-                </ul>
-                <DialogFooter>
-                  <Button
-                    variant="solid"
-                    size="regular"
-                    disabled={selected.size === 0}
-                    onClick={() => void handleImport()}
-                  >
-                    {t("settings.sshHosts.import.action", {
-                      defaultValue: "导入所选 {{count}} 台主机",
-                      count: selected.size,
+                </div>
+              ) : configQuery.isError ? (
+                <div className="py-6 text-center text-body text-fg-2">
+                  {t("settings.sshHosts.import.error", {
+                    defaultValue: "读取 SSH Config 失败：{{error}}",
+                    error: String(
+                      (configQuery.error as Error)?.message ??
+                        configQuery.error,
+                    ),
+                  })}
+                </div>
+              ) : (configQuery.data ?? []).length === 0 ? (
+                <div className="py-6 text-center text-body text-fg-2">
+                  {t("settings.sshHosts.import.empty", {
+                    defaultValue:
+                      "~/.ssh/config 里没有可导入的 Host 段，可切到「手动添加」。",
+                  })}
+                </div>
+              ) : (
+                <>
+                  <ul className="m-0 max-h-72 list-none overflow-y-auto rounded-panel border border-border bg-subtle p-1.5">
+                    {(configQuery.data ?? []).map((configHost) => {
+                      const imported = isSshConfigHostImported(
+                        configHost,
+                        existingHosts,
+                      );
+                      return (
+                        <li key={configHost.alias}>
+                          <label
+                            className={`flex cursor-pointer items-center gap-3 rounded-control px-2.5 py-1.5 text-body hover:bg-surface ${
+                              imported ? "pointer-events-none opacity-50" : ""
+                            }`}
+                          >
+                            <Checkbox
+                              checked={
+                                imported || selected.has(configHost.alias)
+                              }
+                              disabled={imported}
+                              onCheckedChange={() =>
+                                toggleAlias(configHost.alias)
+                              }
+                              aria-label={configHost.alias}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-medium text-fg-1">
+                                {configHost.alias}
+                              </span>
+                              <span className="block truncate text-caption text-fg-2">
+                                {formatHostLine({
+                                  id: "",
+                                  label: "",
+                                  host: configHost.hostName ?? configHost.alias,
+                                  user: configHost.user,
+                                  port: configHost.port,
+                                })}
+                              </span>
+                            </span>
+                            {imported && (
+                              <span className="shrink-0 text-caption text-fg-3">
+                                {t("settings.sshHosts.import.imported", {
+                                  defaultValue: "已导入",
+                                })}
+                              </span>
+                            )}
+                          </label>
+                        </li>
+                      );
                     })}
-                  </Button>
-                </DialogFooter>
-              </>
-            )}
-          </TabsContent>
-          <TabsContent value="manual" className="mt-4">
-            <SshHostForm
-              initial={null}
-              submitLabel={t("settings.sshHosts.form.submitAdd", {
-                defaultValue: "添加",
-              })}
-              onSubmit={async (host) => {
-                const added = await onAdd([host]);
-                if (added) onClose();
-              }}
-              onCancel={onClose}
-            />
-          </TabsContent>
-        </Tabs>
+                  </ul>
+                  {/* px-0 抵消外层 body 的 px-6，与手动 tab 的 Footer 同构 */}
+                  <DialogFooter className="px-0">
+                    <Button
+                      variant="solid"
+                      size="regular"
+                      disabled={selected.size === 0}
+                      onClick={() => void handleImport()}
+                    >
+                      {t("settings.sshHosts.import.action", {
+                        defaultValue: "导入所选 {{count}} 台主机",
+                        count: selected.size,
+                      })}
+                    </Button>
+                  </DialogFooter>
+                </>
+              )}
+            </TabsContent>
+            <TabsContent value="manual" className="mt-4">
+              <SshHostForm
+                initial={null}
+                submitLabel={t("settings.sshHosts.form.submitAdd", {
+                  defaultValue: "添加",
+                })}
+                onSubmit={async (host) => {
+                  const added = await onAdd([host]);
+                  if (added) onClose();
+                }}
+                onCancel={onClose}
+              />
+            </TabsContent>
+          </Tabs>
+        </div>
       </DialogContent>
     </Dialog>
   );
@@ -525,7 +537,7 @@ function EditHostDialog({
   const { t } = useTranslation();
   return (
     <Dialog open={!!host} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent zIndex="nested" className="max-w-lg">
+      <DialogContent zIndex="nested" className="max-w-md">
         <DialogHeader>
           <DialogTitle>
             {t("settings.sshHosts.editTitle", {
@@ -539,16 +551,19 @@ function EditHostDialog({
             })}
           </DialogDescription>
         </DialogHeader>
+        {/* 表单区包 px-6 与 Header 对齐；底距交给表单内 DialogFooter 的 pb-5 */}
         {host && (
-          <SshHostForm
-            initial={host}
-            submitLabel={t("common.save", { defaultValue: "保存" })}
-            onSubmit={async (next) => {
-              const saved = await onEdit(next);
-              if (saved) onClose();
-            }}
-            onCancel={onClose}
-          />
+          <div className="px-6">
+            <SshHostForm
+              initial={host}
+              submitLabel={t("common.save", { defaultValue: "保存" })}
+              onSubmit={async (next) => {
+                const saved = await onEdit(next);
+                if (saved) onClose();
+              }}
+              onCancel={onClose}
+            />
+          </div>
         )}
       </DialogContent>
     </Dialog>

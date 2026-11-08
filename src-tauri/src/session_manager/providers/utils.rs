@@ -696,7 +696,11 @@ mod tests {
         };
 
         // 首轮解析；同 meta 二次扫描命中缓存
-        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+        let files = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            10u64,
+        )];
         assert_eq!(cache.scan_remote(files.clone(), parse).len(), 1);
         assert_eq!(calls.get(), 1);
         assert_eq!(cache.scan_remote(files, parse).len(), 1);
@@ -726,16 +730,25 @@ mod tests {
         };
         assert!(cache
             .scan_remote(
-                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
+                vec![(
+                    PathBuf::from("/home/u/a.jsonl"),
+                    Some(SystemTime::UNIX_EPOCH),
+                    11u64
+                )],
                 failing
             )
             .is_empty());
         assert_eq!(
-            cache.scan_remote(
-                vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 11u64)],
-                parse
-            )
-            .len(),
+            cache
+                .scan_remote(
+                    vec![(
+                        PathBuf::from("/home/u/a.jsonl"),
+                        Some(SystemTime::UNIX_EPOCH),
+                        11u64
+                    )],
+                    parse
+                )
+                .len(),
             1
         );
         assert_eq!(calls.get(), 4, "失败的文件下一轮要重试，不能命中缓存");
@@ -748,18 +761,18 @@ mod tests {
     fn cached_fresh_agrees_with_scan_remote_reuse() {
         use std::time::Duration;
 
-        let files = vec![(PathBuf::from("/home/u/a.jsonl"), Some(SystemTime::UNIX_EPOCH), 10u64)];
+        let files = vec![(
+            PathBuf::from("/home/u/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            10u64,
+        )];
 
         let cache = FileParseCache::new();
-        assert!(
-            cache.cached_fresh(&files).is_empty(),
-            "首轮无缓存，全 miss"
-        );
+        assert!(cache.cached_fresh(&files).is_empty(), "首轮无缓存，全 miss");
 
         // 解析失败不缓存：cached_fresh 仍 miss（与 scan_remote 语义一致）
-        let failing = |_: &Path| -> io::Result<Option<SessionMeta>> {
-            Err(std::io::Error::other("boom"))
-        };
+        let failing =
+            |_: &Path| -> io::Result<Option<SessionMeta>> { Err(std::io::Error::other("boom")) };
         assert!(cache.scan_remote(files.clone(), failing).is_empty());
         assert!(
             cache.cached_fresh(&files).is_empty(),
