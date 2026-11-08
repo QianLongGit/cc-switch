@@ -127,10 +127,8 @@ impl Database {
         // 可能为 NULL（历史/手工数据），归一为 ''。
         // host_id 推导是纯 SQL（substr 剥前缀），hostId 为应用生成的 UUID，
         // 不含引号与 LIKE 通配字符。
-        let host_id_expr = format!(
-            "CASE WHEN COALESCE(l.data_source, '') LIKE 'ssh:%' \
-             THEN substr(COALESCE(l.data_source, ''), 5) ELSE '' END"
-        );
+        let host_id_expr = "CASE WHEN COALESCE(l.data_source, '') LIKE 'ssh:%' \
+             THEN substr(COALESCE(l.data_source, ''), 5) ELSE '' END";
         let aggregation_sql = format!(
             "INSERT OR REPLACE INTO usage_daily_rollups
                 (date, app_type, provider_id, model, request_model, pricing_model, host_id,

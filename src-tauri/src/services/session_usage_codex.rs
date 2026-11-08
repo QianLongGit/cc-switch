@@ -1327,12 +1327,6 @@ impl CodexSegmentState {
         self.root_meta_seen
     }
 
-    /// 本段是否解析出了计费 token。无计费文件也要推游标（本机同语义），
-    /// 远程侧据此区分「推进游标」与「跳过文件」。
-    pub(crate) fn has_billable_tokens(&self) -> bool {
-        self.has_billable_tokens
-    }
-
     /// root meta 的线程 ID（`session_id` 列的值；未见 meta 时 None）。
     pub(crate) fn meta_thread_id(&self) -> Option<&str> {
         self.meta_thread_id.as_deref()

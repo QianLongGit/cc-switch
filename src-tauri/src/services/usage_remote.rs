@@ -370,6 +370,10 @@ pub(crate) fn sync_host_usage_with_io(
         progress(&status);
     }
 
+    // 取消请求是一次性的：本轮退出（无论正常完成还是观察到取消而停止）
+    // 即消费完毕，复位标志——否则残留 true 会让后续每一轮轻同步在首文件
+    // 前静默 break，远程视图停更直到手动同步
+    SYNC_CANCELLED.store(false, Ordering::Relaxed);
     Ok(status)
 }
 
@@ -780,6 +784,9 @@ pub(crate) fn peek_host_usage_with_io(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    // SYNC_CANCELLED 是模块级全局：消费测试会翻转它，整个测试模块串行
+    // 防并行用例在窗口内读到误取消
+    use serial_test::serial;
 
     /* ===== 内存假远端 ===== */
 
@@ -1016,6 +1023,7 @@ mod tests {
 
     // 无变化：首扫建游标后，第二次同步零区间拉取（清单 diff 短路）
     #[test]
+    #[serial]
     fn manifest_diff_unchanged_fetches_nothing() {
         let db = Database::memory().unwrap();
         let path = claude_path("a");
@@ -1038,6 +1046,7 @@ mod tests {
     // size 增长：从游标边界增量拉取——区间起点 = committed 回看窗口（256KB），
     // 前置填充行把文件撑过窗口长度，让增量区间与「全文件重拉」可区分
     #[test]
+    #[serial]
     fn manifest_diff_growth_fetches_incremental_segment() {
         let db = Database::memory().unwrap();
         let path = claude_path("b");
@@ -1071,6 +1080,7 @@ mod tests {
 
     // 新文件：轻同步不拉（首扫候选留给 peek 预告 + 手动 force）
     #[test]
+    #[serial]
     fn new_file_waits_for_force_scan() {
         let db = Database::memory().unwrap();
         let path = claude_path("c");
@@ -1095,6 +1105,7 @@ mod tests {
 
     // 文件从清单消失：游标删除，已入库数据保留
     #[test]
+    #[serial]
     fn vanished_file_deletes_cursor_but_keeps_rows() {
         let db = Database::memory().unwrap();
         let path = claude_path("d");
@@ -1119,6 +1130,7 @@ mod tests {
 
     // 旧 mtime 文件：不拉取、不建游标、计 skipped
     #[test]
+    #[serial]
     fn stale_mtime_file_is_never_synced() {
         let db = Database::memory().unwrap();
         let path = claude_path("old");
@@ -1143,6 +1155,7 @@ mod tests {
 
     // zst 归档：read_full + 本地解压 + 全量解析入库，游标记压缩 size
     #[test]
+    #[serial]
     fn zst_archive_uses_full_read() {
         let db = Database::memory().unwrap();
         let path =
@@ -1176,6 +1189,7 @@ mod tests {
 
     // 超过 32MB 的文件：skipped+1，不拉取
     #[test]
+    #[serial]
     fn oversize_file_is_skipped() {
         let db = Database::memory().unwrap();
         let path = claude_path("big");
@@ -1198,6 +1212,7 @@ mod tests {
 
     // 中途置位取消：立即停止，已处理文件的游标保留
     #[test]
+    #[serial]
     fn cancel_midway_stops_with_partial_progress() {
         let db = Database::memory().unwrap();
         let path_a = claude_path("ca");
@@ -1241,6 +1256,7 @@ mod tests {
 
     // 同文件同字节二次 force 同步：request_id 主键 + INSERT OR IGNORE 不重复计数
     #[test]
+    #[serial]
     fn resync_same_bytes_is_idempotent() {
         let db = Database::memory().unwrap();
         let path = claude_path("idem");
@@ -1259,6 +1275,7 @@ mod tests {
 
     // codex 未压缩：追加 token_count → 增量拉取新段，parser_state 接力不重放
     #[test]
+    #[serial]
     fn codex_increment_appends_events() {
         let db = Database::memory().unwrap();
         let path = codex_path(&format!("rollout-{CODEX_THREAD_ID}"));
@@ -1298,6 +1315,7 @@ mod tests {
 
     // 明细行的 data_source = ssh:<hostId>（rollup 分账依据）
     #[test]
+    #[serial]
     fn rows_carry_ssh_data_source() {
         let db = Database::memory().unwrap();
         let path = claude_path("src");
@@ -1323,6 +1341,7 @@ mod tests {
 
     // peek：统计待同步文件数与待拉字节，不拉取不写库
     #[test]
+    #[serial]
     fn peek_counts_pending_without_fetching() {
         let db = Database::memory().unwrap();
         let path = claude_path("pk1");
@@ -1346,5 +1365,28 @@ mod tests {
         let after = peek_host_usage_with_io(&db, HOST_ID, &mut io).unwrap();
         assert_eq!(after.total_files, 0, "同步完成后无待同步");
         assert_eq!(after.done_bytes, 0);
+    }
+
+    // 取消标志是一次性消费（Minor-1）：观察到取消停止后标志复位，
+    // 下一轮轻同步不被残留 true 拦在首文件前
+    #[test]
+    #[serial]
+    fn cancelled_flag_is_consumed_after_sync_stops() {
+        let db = Database::memory().unwrap();
+        let path = claude_path("cancel-flag");
+        let mut io = FakeRemote::new();
+        io.upsert(&path, claude_line("msg_cf", 5).as_bytes(), fresh_mtime());
+
+        SYNC_CANCELLED.store(true, Ordering::Relaxed);
+        let cancel = AtomicBool::new(false);
+        let first = sync_host_usage_with_io(&db, HOST_ID, &mut io, true, &mut |_| {}, &cancel)
+            .expect("取消不是错误");
+        assert_eq!(first.done_files, 0, "取消在首文件前生效");
+        // 引擎退出时已消费复位：无需手动 reset，下一轮正常处理
+        assert!(!SYNC_CANCELLED.load(Ordering::Relaxed));
+        let second = sync_host_usage_with_io(&db, HOST_ID, &mut io, true, &mut |_| {}, &cancel)
+            .expect("残留标志不应拦截下一轮");
+        assert_eq!(second.done_files, 1, "下一轮应正常处理文件");
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
     }
 }

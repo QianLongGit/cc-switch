@@ -1258,6 +1258,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1888,6 +1891,9 @@ impl Database {
             provider_name,
             model,
         );
+        if let Some(clause) = host_rollup_filter(host_id) {
+            rollup_conditions.push(clause);
+        }
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -3082,7 +3088,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     // ── SSH 远程 host 维度（设计 §4.4）──
 
     // host 过滤子句 SQL 形态：远程 LIKE 前缀 / 本机 NOT LIKE / rollup 等值归位
@@ -3266,13 +3271,78 @@ mod tests {
         assert_eq!(local.total, 1);
         assert_eq!(local.data[0].request_id, "logs-local-1");
 
-        let mut remote_filters = LogFilters::default();
-        remote_filters.host_id = Some("h1".to_string());
+        let remote_filters = LogFilters {
+            host_id: Some("h1".to_string()),
+            ..LogFilters::default()
+        };
         let remote = db.get_request_logs(&remote_filters, 0, 10).unwrap();
         assert_eq!(remote.total, 1);
         assert_eq!(remote.data[0].request_id, "logs-remote-1");
     }
 
+    // by_app / provider_stats 的 rollup 分支同样按 host 归位（Important-1）：
+    // 远程明细满 30 天剪枝聚入 rollup 后，本机视图不得把远程数字算进本机账本
+    #[test]
+    fn by_app_and_provider_stats_rollup_branches_filter_by_host() {
+        let db = Database::memory().unwrap();
+        let ts = local_ts(2026, 10, 1, 10, 0, 0);
+        let date_str = Local
+            .timestamp_opt(ts, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        {
+            let conn = db
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (host_id, requests) in [("", 3i64), ("h1", 7)] {
+                conn.execute(
+                    "INSERT INTO usage_daily_rollups
+                        (date, app_type, provider_id, model, host_id, request_count,
+                         success_count, input_tokens, output_tokens, total_cost_usd, avg_latency_ms)
+                     VALUES (?1, 'claude', 'p1', 'm1', ?2, ?3, ?3, ?3 * 10, 0, '0', 0)",
+                    params![date_str, host_id, requests],
+                )
+                .unwrap();
+            }
+        }
+
+        // by_app：本机视图 3，远程视图 7，互不串台
+        let local = db
+            .get_usage_summary_by_app(None, None, None, None, None)
+            .unwrap();
+        let claude_local = local.iter().find(|s| s.app_type == "claude").unwrap();
+        assert_eq!(
+            claude_local.summary.total_requests, 3,
+            "本机视图只算 host_id='' rollup"
+        );
+
+        let remote = db
+            .get_usage_summary_by_app(None, None, None, None, Some("h1"))
+            .unwrap();
+        let claude_remote = remote.iter().find(|s| s.app_type == "claude").unwrap();
+        assert_eq!(
+            claude_remote.summary.total_requests, 7,
+            "远程视图只算 host_id='h1' rollup"
+        );
+
+        // provider_stats：同口径（provider_id='p1' 行的请求数）
+        let local_stats = db
+            .get_provider_stats(None, None, None, None, None, None)
+            .unwrap();
+        let p1_local = local_stats.iter().find(|s| s.provider_id == "p1").unwrap();
+        assert_eq!(p1_local.request_count, 3);
+
+        let remote_stats = db
+            .get_provider_stats(None, None, None, None, None, Some("h1"))
+            .unwrap();
+        let p1_remote = remote_stats.iter().find(|s| s.provider_id == "p1").unwrap();
+        assert_eq!(p1_remote.request_count, 7);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn insert_usage_log(
         conn: &Connection,
         request_id: &str,
