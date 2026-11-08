@@ -517,6 +517,49 @@ pub async fn peek_remote_usage(
         .map_err(|error| AppError::Message(format!("远程用量统计任务失败: {error}")))?
 }
 
+/// 重置一台远程主机的用量镜像（设计 §4.4）：明细 / 日聚合 / 同步游标 /
+/// 去重台账四表一事务原子清空，「游标已推进但明细未入库」的脏状态归零，
+/// 下一轮同步回到首扫路径重放全量。本机与其它主机的数据零影响。
+#[tauri::command]
+pub async fn reset_remote_usage(
+    state: State<'_, AppState>,
+    hostId: String,
+) -> Result<usage_remote::ResetUsageSummary, AppError> {
+    // 存在性校验在阻塞线程外先行：未知 hostId 不触发任何删除
+    resolve_remote_host(&hostId)?;
+    run_db_query(&state, move |db| {
+        usage_remote::reset_host_usage(db, &hostId)
+    })
+    .await
+}
+
+/// purge 组合核心（命令薄封装之上抽出的一层，测试直调）：用量镜像事务
+/// 重置 + 会话侧内存缓存清理。会话缓存全部是可重建态、清理不可失败，
+/// 不阻断已完成的用量重置；若未来引入可失败步骤，也应 log warn 后继续。
+fn purge_remote_host_data_blocking(
+    db: &crate::database::Database,
+    host_id: &str,
+) -> Result<usage_remote::ResetUsageSummary, AppError> {
+    let summary = usage_remote::reset_host_usage(db, host_id)?;
+    crate::session_manager::purge_host_session_caches(host_id);
+    Ok(summary)
+}
+
+/// 彻底清除一台远程主机的本地数据：[`reset_remote_usage`] 的全部内容，
+/// 加会话侧内存缓存（扫描清单 / 远程解析缓存 / 会话正文缓存）。删除
+/// SSH 主机前调用（或对现存主机手动清理），主机移除后无残留。
+#[tauri::command]
+pub async fn purge_remote_host_data(
+    state: State<'_, AppState>,
+    hostId: String,
+) -> Result<usage_remote::ResetUsageSummary, AppError> {
+    resolve_remote_host(&hostId)?;
+    run_db_query(&state, move |db| {
+        purge_remote_host_data_blocking(db, &hostId)
+    })
+    .await
+}
+
 /// 手动触发会话日志同步
 #[tauri::command]
 pub async fn sync_session_usage(
@@ -592,6 +635,7 @@ pub async fn fetch_exchange_rates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn test_host(id: &str) -> SshHostConfig {
         SshHostConfig {
@@ -656,5 +700,81 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(crate::usage_events::take_test_notify_count(), 1);
+    }
+
+    /* ===== reset / purge 远程主机数据（Task A）===== */
+
+    // reset / purge 共用的存在性校验：未知 hostId 在任何删除发生前即 Err，
+    // 文案与既有远程命令一致（主机清单为空 = 主机已全部移除的形态）
+    #[test]
+    fn reset_and_purge_reject_unknown_host_before_any_delete() {
+        let err = find_remote_host(None, "no-such-host").expect_err("未知主机应被拒绝");
+        match err {
+            AppError::InvalidInput(msg) => {
+                assert!(msg.contains("SSH 主机不存在或已移除"))
+            }
+            other => panic!("期望 InvalidInput，实际 {other:?}"),
+        }
+    }
+
+    // purge 组合核心：一次调用同时完成用量镜像重置（DB 事务）与
+    // 会话侧缓存清理（清单 / 正文缓存）。触碰进程级单例，serial 互斥。
+    #[test]
+    #[serial]
+    fn purge_blocking_resets_mirror_and_session_caches() {
+        let db = crate::database::Database::memory().unwrap();
+        let host = "t-purge-cmd";
+
+        // 用量镜像：游标一行（四表完整断言见 usage_remote 引擎侧测试）
+        {
+            let conn = db
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            conn.execute(
+                "INSERT INTO session_log_sync
+                 (file_path, last_modified, last_line_offset, last_synced_at)
+                 VALUES ('ssh:t-purge-cmd/root/a.jsonl', 1, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        // 会话侧：扫描清单 + 正文缓存各一条
+        crate::session_manager::ssh::SshScanRegistry::global().replace_manifest(
+            host,
+            std::collections::HashMap::from([(
+                "/root/a.jsonl".to_string(),
+                crate::session_manager::ssh::RemoteFileMeta {
+                    len: 1,
+                    mtime_ms: 1,
+                },
+            )]),
+        );
+        let key = ("claude".to_string(), format!("ssh:{host}/root/a.jsonl"));
+        let fp = crate::session_manager::cache::Fingerprint {
+            modified: None,
+            len: 1,
+        };
+        crate::session_manager::cache::global().insert(
+            key.clone(),
+            fp,
+            std::sync::Arc::new(crate::session_manager::cache::Transcript::new(Vec::new())),
+        );
+
+        let summary = purge_remote_host_data_blocking(&db, host).expect("purge 组合核心应成功");
+
+        assert_eq!(summary.deleted_cursors, 1, "游标已随镜像重置删除");
+        assert!(
+            crate::session_manager::ssh::SshScanRegistry::global()
+                .manifest(host)
+                .is_none(),
+            "扫描清单应被清理"
+        );
+        assert!(
+            crate::session_manager::cache::global()
+                .get(&key, fp)
+                .is_none(),
+            "远程正文缓存条目应被清理"
+        );
     }
 }

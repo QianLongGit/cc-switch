@@ -823,6 +823,76 @@ pub(crate) fn peek_host_usage_with_io(
     })
 }
 
+/* ===== 主机级镜像重置（reset / purge 命令的数据层）===== */
+
+/// 主机用量镜像重置的删除计数（serde camelCase，前端展示「已清理 N 条」）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetUsageSummary {
+    /// 明细行数（`proxy_request_logs.data_source = 'ssh:<hostId>'`）
+    pub deleted_details: usize,
+    /// 日聚合行数（`usage_daily_rollups.host_id = '<hostId>'`）
+    pub deleted_rollups: usize,
+    /// 同步游标行数（`session_log_sync.file_path LIKE 'ssh:<hostId>/%'`）
+    pub deleted_cursors: usize,
+    /// 去重台账行数（`session_usage_dedup.data_source = 'ssh:<hostId>'`）
+    pub deleted_dedup: usize,
+}
+
+/// 清空一台远程主机的用量镜像：明细 / 日聚合 / 同步游标 / 去重台账
+/// 四表同一事务原子删除——部分失败整体回滚，不留「游标已删、明细还在」
+/// 之类的中间态。本机行（`data_source` 非 `ssh:` 前缀 / `host_id = ''` /
+/// 非 `ssh:` 游标键）与其它主机的行原样保留。
+///
+/// 「游标已推进但明细未入库」的脏状态（异常同步残留）由此归零，下一轮
+/// 同步回到首扫路径重放全量。
+pub fn reset_host_usage(db: &Database, host_id: &str) -> Result<ResetUsageSummary, AppError> {
+    // hostId 由命令层 validate_host_id 把关（UUID 字符集：字母数字与连字符，
+    // 无引号 / LIKE 通配符），等值与前缀谓词直接绑定参数即无注入面
+    let data_source = remote_data_source(host_id);
+    let cursor_prefix = format!("ssh:{host_id}/%");
+    let conn = lock_conn!(db.conn);
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::Database(format!("启动主机用量重置事务失败: {e}")))?;
+    let deleted_details = tx
+        .execute(
+            "DELETE FROM proxy_request_logs WHERE data_source = ?1",
+            [&data_source],
+        )
+        .map_err(|e| AppError::Database(format!("删除主机用量明细失败: {e}")))?;
+    let deleted_rollups = tx
+        .execute(
+            "DELETE FROM usage_daily_rollups WHERE host_id = ?1",
+            [host_id],
+        )
+        .map_err(|e| AppError::Database(format!("删除主机用量汇总失败: {e}")))?;
+    let deleted_cursors = tx
+        .execute(
+            "DELETE FROM session_log_sync WHERE file_path LIKE ?1",
+            [&cursor_prefix],
+        )
+        .map_err(|e| AppError::Database(format!("删除主机同步游标失败: {e}")))?;
+    let deleted_dedup = tx
+        .execute(
+            "DELETE FROM session_usage_dedup WHERE data_source = ?1",
+            [&data_source],
+        )
+        .map_err(|e| AppError::Database(format!("删除主机去重台账失败: {e}")))?;
+    tx.commit()
+        .map_err(|e| AppError::Database(format!("提交主机用量重置事务失败: {e}")))?;
+    log::info!(
+        "[REMOTE-USAGE] 已重置主机 {host_id} 用量镜像：明细 {deleted_details} / 汇总 \
+         {deleted_rollups} / 游标 {deleted_cursors} / 去重 {deleted_dedup}"
+    );
+    Ok(ResetUsageSummary {
+        deleted_details,
+        deleted_rollups,
+        deleted_cursors,
+        deleted_dedup,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1643,5 +1713,233 @@ mod tests {
             .expect("残留标志不应拦截下一轮");
         assert_eq!(second.done_files, 1, "下一轮应正常处理文件");
         assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
+    }
+
+    /* ===== 主机用量镜像重置（reset / purge 命令的数据层）===== */
+
+    /// 无参 COUNT 标量查询（测试内 SQL 为固定字面量，无拼接来源）
+    fn scalar(db: &Database, sql: &str) -> i64 {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// 手动落一行明细（h2 / 本机对照组；rollup 引擎不产、dedup 远程侧不产，
+    /// 均按需手动构造，谓词隔离断言不依赖引擎写入路径）
+    fn insert_detail_row(db: &Database, request_id: &str, data_source: &str) {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO proxy_request_logs
+             (request_id, provider_id, app_type, model, latency_ms, status_code, created_at, data_source)
+             VALUES (?1, '_session', 'claude', 'm', 0, 200, 1000, ?2)",
+            rusqlite::params![request_id, data_source],
+        )
+        .unwrap();
+    }
+
+    fn insert_rollup_row(db: &Database, host_id: &str) {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO usage_daily_rollups
+             (date, app_type, provider_id, model, request_model, pricing_model, host_id, request_count)
+             VALUES ('2026-11-08', 'claude', '_session', 'm', '', '', ?1, 1)",
+            [host_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_cursor_row(db: &Database, file_path: &str) {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO session_log_sync
+             (file_path, last_modified, last_line_offset, last_synced_at)
+             VALUES (?1, 1, 0, 1)",
+            [file_path],
+        )
+        .unwrap();
+    }
+
+    fn insert_dedup_row(db: &Database, data_source: &str, request_id: &str) {
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO session_usage_dedup (data_source, request_id, semantic_id, has_entry_id)
+             VALUES (?1, ?2, ?2, 0)",
+            rusqlite::params![data_source, request_id],
+        )
+        .unwrap();
+    }
+
+    // reset：四表只删目标主机行（h1），h2 远程与本机对照组原样保留
+    #[test]
+    #[serial]
+    fn reset_clears_only_target_host_mirror() {
+        let db = Database::memory().unwrap();
+        let mut io = FakeRemote::new();
+        io.upsert(
+            &claude_path("a"),
+            claude_line("m1", 100).as_bytes(),
+            fresh_mtime(),
+        );
+        sync(&db, &mut io, true);
+
+        // 对照组：h2 远程 / 本机四表各一行；h1 的 rollup 与 dedup 引擎不产，
+        // 手动构造使四表删除计数都可断言
+        insert_detail_row(&db, "r-h2", "ssh:h2");
+        insert_detail_row(&db, "r-local", "session_log");
+        insert_rollup_row(&db, HOST_ID);
+        insert_rollup_row(&db, "h2");
+        insert_rollup_row(&db, "");
+        insert_cursor_row(&db, "ssh:h2/root/b.jsonl");
+        insert_cursor_row(&db, "/home/local/c.jsonl");
+        insert_dedup_row(&db, "ssh:h1", "d-h1");
+        insert_dedup_row(&db, "ssh:h2", "d-h2");
+        insert_dedup_row(&db, "session_log", "d-local");
+
+        let summary = reset_host_usage(&db, HOST_ID).expect("重置应成功");
+
+        // h1 四表各删一行：明细与游标来自引擎首扫，rollup 与 dedup 手动构造
+        assert_eq!(
+            summary,
+            ResetUsageSummary {
+                deleted_details: 1,
+                deleted_rollups: 1,
+                deleted_cursors: 1,
+                deleted_dedup: 1,
+            }
+        );
+
+        // h1 镜像清零
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'ssh:h1'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM usage_daily_rollups WHERE host_id = 'h1'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_log_sync WHERE file_path LIKE 'ssh:h1/%'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'ssh:h1'"
+            ),
+            0
+        );
+
+        // h2 远程行原样
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'ssh:h2'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM usage_daily_rollups WHERE host_id = 'h2'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_log_sync WHERE file_path LIKE 'ssh:h2/%'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'ssh:h2'"
+            ),
+            1
+        );
+
+        // 本机行原样（data_source 非 ssh 前缀 / host_id='' / 本机游标键）
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'session_log'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM usage_daily_rollups WHERE host_id = ''"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_log_sync WHERE file_path = '/home/local/c.jsonl'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'session_log'"
+            ),
+            1
+        );
+    }
+
+    // reset 后引擎回归首扫态：游标归零 → 轻同步把无游标文件按首扫重新
+    // 拉取入库（「游标已推进但明细未入库」脏状态的修复路径）
+    #[test]
+    #[serial]
+    fn reset_returns_engine_to_first_scan_state() {
+        let db = Database::memory().unwrap();
+        let path = claude_path("rescan");
+        let mut io = FakeRemote::new();
+        io.upsert(&path, claude_line("m_rs", 100).as_bytes(), fresh_mtime());
+        sync(&db, &mut io, true);
+        let key = remote_cursor_key(HOST_ID, &path);
+        assert!(cursor_of(&db, &key).is_some(), "首扫后应有游标");
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1);
+
+        reset_host_usage(&db, HOST_ID).expect("重置应成功");
+        assert!(cursor_of(&db, &key).is_none(), "重置后游标归零");
+        assert!(rows_with_source(&db, "ssh:h1").is_empty(), "重置后明细清空");
+
+        // 轻同步（force=false）：无游标 → 文件按自动首扫纳入，全量重放
+        let ranges_before = io.range_calls_for(&path).len();
+        let status = sync(&db, &mut io, false);
+        assert_eq!(status.done_files, 1, "重置后文件回到首扫路径");
+        assert_eq!(
+            io.range_calls_for(&path).len(),
+            ranges_before + 1,
+            "无游标文件应重新全量拉取"
+        );
+        assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1, "明细重新入库");
     }
 }

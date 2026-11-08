@@ -501,6 +501,12 @@ impl SshScanRegistry {
             .is_some_and(|entries| entries.remove(path).is_some())
     }
 
+    /// 整机摘除：移除该主机的整份清单（purge 远程主机数据时调用，下一轮
+    /// 扫描按需重建）；返回清单原本是否存在
+    pub(crate) fn remove_host(&self, host_id: &str) -> bool {
+        self.lock_write().remove(host_id).is_some()
+    }
+
     /// 取读锁；锁中毒时直接恢复数据继续用（清单为可重建的缓存态，无不变量需保护）
     fn lock_read(
         &self,

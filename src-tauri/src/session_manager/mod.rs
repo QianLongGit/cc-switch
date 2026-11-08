@@ -183,6 +183,31 @@ fn remote_parse_cache(host_id: &str) -> Arc<FileParseCache> {
         .clone()
 }
 
+/// 从 [`REMOTE_PARSE_CACHES`] 摘除某主机的解析缓存实例（purge 远程主机
+/// 数据时调用）；返回条目原本是否存在。正在进行的扫描可能仍持有旧实例
+/// 的 Arc，写回的条目随实例一起丢弃，不影响正确性。
+fn remove_remote_parse_cache(host_id: &str) -> bool {
+    REMOTE_PARSE_CACHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(host_id)
+        .is_some()
+}
+
+/// 清空一台 SSH 主机的全部会话侧内存缓存：扫描清单、远程解析缓存、
+/// 会话正文缓存。三者都是可重建的缓存态（下一轮扫描 / 打开即按需重建），
+/// 清理不可失败，也无需失败阻断——用量镜像的删除由
+/// [`crate::services::usage_remote::reset_host_usage`] 的事务保证。
+pub fn purge_host_session_caches(host_id: &str) {
+    // 扫描清单：validate / fingerprint / 远程删除的白名单来源
+    ssh::SshScanRegistry::global().remove_host(host_id);
+    // 远程解析缓存：per-host FileParseCache 整实例丢弃。本地各 provider 的
+    // PARSE_CACHE 键是本地文件系统路径，永不携带 `ssh:` 前缀，无需清理
+    remove_remote_parse_cache(host_id);
+    // 会话正文缓存：按 `ssh:<hostId>/` 源路径前缀清除，本机条目不动
+    cache::global().remove_source_prefix(&format!("ssh:{host_id}/"));
+}
+
 /// 扫描 SSH 远程主机的 claude / codex 会话（spec §5.4）：
 ///
 /// 1. 一条命令解析远端 HOME 下的三个会话根目录
@@ -1027,6 +1052,114 @@ mod tests {
         assert_eq!(
             outcomes[2].error.as_deref(),
             Some("Session was not deleted")
+        );
+    }
+
+    /* ===== 远程主机数据 purge：会话侧缓存清理 ===== */
+
+    /// purge 只清目标主机的三处会话侧缓存（扫描清单 / 远程解析缓存 /
+    /// 会话正文缓存），其它主机与本机条目不动。触碰三个进程级单例，
+    /// `#[serial]` 与其它全局缓存测试互斥。
+    #[test]
+    #[serial_test::serial]
+    fn purge_host_session_caches_clears_only_target_host() {
+        let (h1, h2) = ("t-purge-h1", "t-purge-h2");
+
+        // 1. 扫描清单：两台主机各一条
+        let reg = ssh::SshScanRegistry::global();
+        reg.replace_manifest(
+            h1,
+            HashMap::from([(
+                "/root/a.jsonl".to_string(),
+                ssh::RemoteFileMeta {
+                    len: 10,
+                    mtime_ms: 1,
+                },
+            )]),
+        );
+        reg.replace_manifest(
+            h2,
+            HashMap::from([(
+                "/root/b.jsonl".to_string(),
+                ssh::RemoteFileMeta {
+                    len: 20,
+                    mtime_ms: 2,
+                },
+            )]),
+        );
+
+        // 2. 远程解析缓存：per-host FileParseCache 实例各注入一条
+        let h1_files = vec![(
+            PathBuf::from("/root/a.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            10u64,
+        )];
+        let h2_files = vec![(
+            PathBuf::from("/root/b.jsonl"),
+            Some(SystemTime::UNIX_EPOCH),
+            20u64,
+        )];
+        remote_parse_cache(h1).scan_remote(h1_files.clone(), |_| Ok(None));
+        remote_parse_cache(h2).scan_remote(h2_files.clone(), |_| Ok(None));
+        assert_eq!(
+            remote_parse_cache(h1).cached_fresh(&h1_files).len(),
+            1,
+            "前置：h1 解析缓存已有条目"
+        );
+
+        // 3. 会话正文缓存：h1 远程 / h2 远程 / 本机各一条
+        let fp = cache::Fingerprint {
+            modified: Some(SystemTime::UNIX_EPOCH),
+            len: 10,
+        };
+        let h1_key = ("claude".to_string(), format!("ssh:{h1}/root/a.jsonl"));
+        let h2_key = ("claude".to_string(), format!("ssh:{h2}/root/b.jsonl"));
+        let local_key = ("claude".to_string(), "/local/x.jsonl".to_string());
+        for key in [&h1_key, &h2_key, &local_key] {
+            cache::global().insert(
+                key.clone(),
+                fp,
+                Arc::new(cache::Transcript::new(Vec::new())),
+            );
+        }
+        assert!(
+            cache::global().get(&h1_key, fp).is_some(),
+            "前置：h1 正文已缓存"
+        );
+
+        purge_host_session_caches(h1);
+
+        // 清单：h1 整主机摘除、h2 原样
+        assert!(reg.manifest(h1).is_none(), "h1 清单应被整体移除");
+        assert_eq!(
+            reg.manifest(h2).map(|manifest| manifest.len()),
+            Some(1),
+            "h2 清单不受影响"
+        );
+
+        // 解析缓存：h1 实例整体丢弃（重新获取为空实例）、h2 命中原样
+        assert!(
+            remote_parse_cache(h1).cached_fresh(&h1_files).is_empty(),
+            "h1 解析缓存实例应被丢弃"
+        );
+        assert_eq!(
+            remote_parse_cache(h2).cached_fresh(&h2_files).len(),
+            1,
+            "h2 解析缓存不受影响"
+        );
+
+        // 正文缓存：h1 前缀条目清除、h2 与本机不动
+        assert!(
+            cache::global().get(&h1_key, fp).is_none(),
+            "h1 远程正文条目应被清除"
+        );
+        assert!(
+            cache::global().get(&h2_key, fp).is_some(),
+            "h2 远程正文条目不受影响"
+        );
+        assert!(
+            cache::global().get(&local_key, fp).is_some(),
+            "本机正文条目不受影响"
         );
     }
 }
