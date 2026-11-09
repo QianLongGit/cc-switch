@@ -9,7 +9,9 @@
 //! 引擎（sync_host_usage_with_io）── 清单 diff 三态 + 消失态 + 90 天窗口
 //!                                   + 32MB 上限 + 取消 + per-host 串行
 //! 入库（claude/codex 分支）── data_source = "ssh:<hostId>"，rollup 按
-//!                             data_source 前缀分账到 host_id 列（v27）
+//!                             data_source 前缀分账到 host_id 列（v27）；
+//!                             request_id 同样带 hostId 维度（见
+//!                             sync_claude_remote_file 的兼容性论证）
 //! ```
 //!
 //! 游标键 = `ssh:<hostId>/<远端路径>` 源路径形态，与本机游标天然隔离；
@@ -371,8 +373,8 @@ pub(crate) fn sync_host_usage_with_io(
         }
 
         let outcome = match provider {
-            "claude" => sync_claude_remote_file(db, io, entry, cursor, &key, &data_source),
-            _ => sync_codex_remote_file(db, io, entry, cursor, &key, &data_source),
+            "claude" => sync_claude_remote_file(db, io, entry, cursor, &key, host_id, &data_source),
+            _ => sync_codex_remote_file(db, io, entry, cursor, &key, host_id, &data_source),
         };
         match outcome {
             Ok(FileSyncOutcome::Synced { fetched_bytes }) => {
@@ -453,6 +455,7 @@ fn sync_claude_remote_file(
     entry: &RemoteFileEntry,
     cursor: Option<&SyncCursor>,
     key: &str,
+    host_id: &str,
     data_source: &str,
 ) -> Result<FileSyncOutcome, AppError> {
     let size = entry.size;
@@ -525,7 +528,22 @@ fn sync_claude_remote_file(
         if !has_billable_tokens {
             continue;
         }
-        let request_id = format!("{SESSION_REQUEST_ID_PREFIX}{}", msg.message_id);
+        /* ── request_id 主机维度（跨主机去重吞噬修复）──────────────────
+         *
+         * 旧格式 `session:{message_id}` 不含主机维度，而 proxy_request_logs
+         * 的 request_id 是全局主键：同一远端主机被删除后重新添加（hostId
+         * 变化）重扫时，同一 message_id 已被旧 hostId 名下的行占用主键，
+         * INSERT OR IGNORE 静默跳过——新主机名下数据缺失且无提示。
+         *
+         * 新格式 `session:ssh:{hostId}:{message_id}` 的兼容性论证：
+         * - 不与旧远程行冲突：旧格式行仍挂在 data_source = ssh:<旧hostId>
+         *   名下，主机已删、UI 不可见（无害残留），reset/purge 可清理；
+         * - 不与本机行冲突：本机路径保持 `session:{message_id}` 且
+         *   data_source = session_log，两维均不同，永不相撞；
+         * - 完整恢复：修复后重扫当前主机，全部历史 message 以新键插入，
+         *   与旧主键占用完全解耦（含曾挂在旧 hostId 名下的 message）。
+         * ──────────────────────────────────────────────────────────── */
+        let request_id = format!("{SESSION_REQUEST_ID_PREFIX}ssh:{host_id}:{}", msg.message_id);
         // 插入失败只跳过该条（本机同行为），不断整个文件
         if let Err(error) = upsert_session_log_entry_on_conn(
             &tx,
@@ -605,6 +623,7 @@ fn sync_codex_remote_file(
     entry: &RemoteFileEntry,
     cursor: Option<&SyncCursor>,
     key: &str,
+    host_id: &str,
     data_source: &str,
 ) -> Result<FileSyncOutcome, AppError> {
     let size = entry.size;
@@ -717,7 +736,12 @@ fn sync_codex_remote_file(
                             suffix: &str,
                             event: &crate::services::session_usage_codex::ParsedTokenEvent|
      -> Result<(), AppError> {
-        let request_id = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{suffix}");
+        // 主机维度同 claude 分支（完整兼容性论证见 sync_claude_remote_file）：
+        // 旧格式 `codex_session:thread-v1:{thread}:{suffix}` 会被已删主机
+        // 的同名 rollout 残留行占用全局主键而静默吞噬，新格式插入
+        // `codex_session:thread-v1:ssh:{hostId}:{thread}:{suffix}` 与之解耦
+        let request_id =
+            format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:ssh:{host_id}:{root_thread_id}:{suffix}");
         // 插入失败只跳过该条（本机同行为），不断整个文件
         if let Err(error) = insert_codex_session_entry_on_conn(
             tx,
@@ -1473,6 +1497,71 @@ mod tests {
         sync(&db, &mut io, true);
 
         assert_eq!(rows_with_source(&db, "ssh:h1").len(), 1, "不重复计数");
+    }
+
+    /* ===== request_id 主机维度（防回退：跨主机去重吞噬） ===== */
+
+    // claude：旧格式主键残留（模拟已删主机）不得吞掉当前主机的行——
+    // 修复前 `session:{msg}` 全局主键被旧行占用，INSERT OR IGNORE 静默跳过，
+    // 新主机名下数据隐形缺失；修复后两行共存、data_source 各自正确
+    #[test]
+    #[serial]
+    fn claude_request_id_host_dimension_survives_legacy_row() {
+        let db = Database::memory().unwrap();
+        let path = claude_path("host-dim");
+        let mut io = FakeRemote::new();
+        io.upsert(&path, claude_line("msg_legacy", 5).as_bytes(), fresh_mtime());
+
+        // 模拟已删主机的旧格式残留行：占用 `session:msg_legacy` 全局主键
+        insert_detail_row(&db, "session:msg_legacy", "ssh:old-host");
+
+        sync(&db, &mut io, true);
+
+        // 当前主机名下必须成功入库，request_id 带主机维度
+        let rows = rows_with_source(&db, "ssh:h1");
+        assert_eq!(rows.len(), 1, "旧行占用主键不得吞掉当前主机入库: {rows:?}");
+        assert_eq!(
+            rows[0].0, "session:ssh:h1:msg_legacy",
+            "request_id 必须是 session:ssh:<hostId>:<messageId> 形态"
+        );
+        // 旧格式行原样保留（挂在已删主机名下，不可见无害，待 reset/purge 清理）
+        let legacy = rows_with_source(&db, "ssh:old-host");
+        assert_eq!(legacy.len(), 1, "旧格式残留行不受影响");
+        assert_eq!(legacy[0].0, "session:msg_legacy");
+    }
+
+    // codex：同场景——旧格式 thread 主键残留不得吞掉当前主机的行
+    #[test]
+    #[serial]
+    fn codex_request_id_host_dimension_survives_legacy_row() {
+        let db = Database::memory().unwrap();
+        let path = codex_path(&format!("rollout-{CODEX_THREAD_ID}"));
+        let body = format!(
+            "{}\n{}\n",
+            codex_meta_line(),
+            codex_token_count_line(100, 40)
+        );
+        let mut io = FakeRemote::new();
+        io.upsert(&path, body.as_bytes(), fresh_mtime());
+
+        // 模拟已删主机的旧格式残留行：占用旧 thread 主键
+        insert_detail_row(
+            &db,
+            &format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CODEX_THREAD_ID}:1"),
+            "ssh:old-host",
+        );
+
+        sync(&db, &mut io, true);
+
+        let rows = rows_with_source(&db, "ssh:h1");
+        assert_eq!(rows.len(), 1, "旧行占用主键不得吞掉当前主机入库: {rows:?}");
+        assert_eq!(
+            rows[0].0,
+            format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:ssh:h1:{CODEX_THREAD_ID}:1"),
+            "codex request_id 必须带主机维度"
+        );
+        // 旧格式行原样保留（已删主机名下，不可见无害）
+        assert_eq!(rows_with_source(&db, "ssh:old-host").len(), 1);
     }
 
     /* ===== codex 增量 ===== */
